@@ -2287,8 +2287,15 @@ class Engine:
         external_host = f"{advertise_host}:{port}"
 
         try:
+            app_name = self.config.asterisk.app_name or "asterisk-ai-voice-agent"
+            if not app_name:
+                logger.error("🎯 EXTERNAL MEDIA - App name is empty, using default", app_name=app_name)
+                app_name = "asterisk-ai-voice-agent"
+            
+            logger.info("🎯 EXTERNAL MEDIA - Creating channel", app_name=app_name, external_host=external_host)
+
             response = await self.ari_client.create_external_media_channel(
-                app=self.config.asterisk.app_name,
+                app=app_name,
                 external_host=external_host,
                 format=codec,
                 direction=direction,

@@ -30,16 +30,19 @@ services:
     # Container runs as appuser (member of asterisk group via Dockerfile)
     # Files inherit group ownership from setgid directory (set up by preflight.sh)
     user: "appuser"
-    network_mode: host
+    # network_mode: host
+    ports:
+      - "8090:8090"
+      - "15000:15000"
     volumes:
-      - ./src:/app/src
-      - ./main.py:/app/main.py
-      - ./config:/app/config
-      - ./scripts:/app/scripts
-      - ./models:/app/models
-      - ./asterisk_media:/mnt/asterisk_media
-      - ./data:/app/data
-      - ./secrets:/app/project/secrets  # Vertex AI service account credentials
+      - ${HOST_PROJECT_ROOT:-.}/src:/app/src
+      - ${HOST_PROJECT_ROOT:-.}/main.py:/app/main.py
+      - ${HOST_PROJECT_ROOT:-.}/config:/app/config
+      - ${HOST_PROJECT_ROOT:-.}/scripts:/app/scripts
+      - ${HOST_PROJECT_ROOT:-.}/models:/app/models
+      - ${HOST_PROJECT_ROOT:-.}/asterisk_media:/mnt/asterisk_media
+      - ${HOST_PROJECT_ROOT:-.}/data:/app/data
+      - ${HOST_PROJECT_ROOT:-.}/secrets:/app/project/secrets  # Vertex AI service account credentials
     env_file:
       - .env
     environment:
@@ -73,12 +76,14 @@ services:
         - INCLUDE_LLAMA=${INCLUDE_LLAMA:-true}
         - INCLUDE_KROKO_EMBEDDED=${INCLUDE_KROKO_EMBEDDED:-false}
     container_name: local_ai_server
-    network_mode: host
+    # network_mode: host
+    ports:
+      - "8765:8765"
     env_file:
       - .env
     volumes:
-      - ./models:/app/models
-      - ./data:/app/data
+      - ${HOST_PROJECT_ROOT:-.}/models:/app/models
+      - ${HOST_PROJECT_ROOT:-.}/data:/app/data
     environment:
       - PYTHONUNBUFFERED=1
       # Note: All LOCAL_* variables are loaded from .env via env_file directive above
@@ -154,7 +159,8 @@ services:
       dockerfile: Dockerfile
       network: host
     container_name: admin_ui
-    network_mode: host
+    ports:
+      - "${UVICORN_PORT:-3003}:${UVICORN_PORT:-3003}"
     # Grant docker socket access to non-root user (appuser runs as UID 1000)
     # Docker socket is typically owned by group 'docker' (GID varies by distro/host).
     # Override DOCKER_GID in .env if your system uses a different GID.
@@ -180,3 +186,29 @@ services:
       # Note: UVICORN_HOST, UVICORN_PORT, JWT_SECRET, TZ are loaded from .env via env_file
       # Do NOT add them here with ${VAR:-default} - it prevents UI env changes from taking effect
     restart: unless-stopped
+
+  freepbx:
+    image: tiredofit/freepbx:latest
+    container_name: freepbx
+    platform: linux/amd64
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+      - "8443:443"
+      - "8088:8088"
+      - "5060:5060/udp"
+      - "5060:5060/tcp"
+      - "5160:5160/udp"
+      - "18000-18100:18000-18100/udp"
+    environment:
+      - DB_EMBEDDED=TRUE
+      - ADMIN_PASSWORD=admin
+      - RTP_START=18000
+      - RTP_FINISH=18100
+    volumes:
+      - freepbx_data:/data
+      - freepbx_db:/var/lib/mysql
+
+volumes:
+  freepbx_data:
+  freepbx_db:

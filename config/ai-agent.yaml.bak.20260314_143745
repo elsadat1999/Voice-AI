@@ -1,7 +1,7 @@
 active_pipeline: null
 asterisk:
   app_name: asterisk-ai-voice-agent
-audio_transport: externalmedia
+audio_transport: audiosocket
 audiosocket:
   format: slin
   host: 0.0.0.0
@@ -40,7 +40,7 @@ contexts:
       CALL ENDING:
       - When the caller indicates they are done, say a brief farewell, then use the hangup_call tool to end the call.
       - NEVER mention tools or the word "hangup_call" to the caller.
-    provider: google_live
+    provider: local
     tools:
       - hangup_call
   Tool_Example:
@@ -1196,13 +1196,9 @@ external_media:
   direction: both
   format: slin16
   port_range: '18080:18099'
-  rtp_host: 0.0.0.0
+  rtp_host: 127.0.0.1
   rtp_port: 18080
-  advertise_host: ${EXTERNAL_MEDIA_ADVERTISE_HOST}
   sample_rate: 16000
-  allowed_remote_hosts:
-    - 172.23.0.2
-    - 127.0.0.1
 llm:
   initial_greeting: Hello, how can I help you today?
   prompt: Voice assistant. Answer in 5-8 words. Be direct. Expand only if asked.

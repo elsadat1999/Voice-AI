@@ -1,0 +1,17 @@
+services:
+  admin_ui:
+    network_mode: bridge
+    ports:
+      - "${UVICORN_PORT:-3003}:3003"
+
+  ai_engine:
+    network_mode: bridge
+    ports:
+      - "15000:15000"
+      - "8090:8090"
+
+  local_ai_server:
+    network_mode: bridge
+    ports:
+      - "${LOCAL_WS_PORT:-8765}:8765"
+      - "8100:8100"

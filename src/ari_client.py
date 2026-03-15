@@ -980,16 +980,19 @@ class ARIClient:
             Channel information dict or None if failed
         """
         try:
+            # Asterisk ARI expects these as query parameters, not JSON body
+            params = {
+                "app": app,
+                "external_host": external_host,
+                "format": format,
+                "direction": direction,
+                "encapsulation": encapsulation
+            }
+            
             response = await self.send_command(
                 "POST",
                 "channels/externalMedia",
-                data={
-                    "app": app,
-                    "external_host": external_host,
-                    "format": format,
-                    "direction": direction,
-                    "encapsulation": encapsulation
-                }
+                params=params
             )
             
             if response and response.get("id"):

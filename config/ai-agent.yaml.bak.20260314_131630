@@ -1,10 +1,10 @@
 active_pipeline: null
 asterisk:
   app_name: asterisk-ai-voice-agent
-audio_transport: externalmedia
+audio_transport: audiosocket
 audiosocket:
   format: slin
-  host: 0.0.0.0
+  host: 127.0.0.1
   port: 8090
 barge_in:
   enabled: true
@@ -40,7 +40,7 @@ contexts:
       CALL ENDING:
       - When the caller indicates they are done, say a brief farewell, then use the hangup_call tool to end the call.
       - NEVER mention tools or the word "hangup_call" to the caller.
-    provider: google_live
+    provider: local
     tools:
       - hangup_call
   Tool_Example:
@@ -1196,13 +1196,9 @@ external_media:
   direction: both
   format: slin16
   port_range: '18080:18099'
-  rtp_host: 0.0.0.0
+  rtp_host: 127.0.0.1
   rtp_port: 18080
-  advertise_host: ${EXTERNAL_MEDIA_ADVERTISE_HOST}
   sample_rate: 16000
-  allowed_remote_hosts:
-    - 172.23.0.2
-    - 127.0.0.1
 llm:
   initial_greeting: Hello, how can I help you today?
   prompt: Voice assistant. Answer in 5-8 words. Be direct. Expand only if asked.
@@ -1387,7 +1383,7 @@ providers:
   local:
     # Local AI Server WebSocket URL. Default deployment uses host networking, so 127.0.0.1 is correct.
     # If you run containers on a user-defined bridge network (no host networking), use ws://local_ai_server:8765.
-    base_url: ${LOCAL_WS_URL:-ws://local_ai_server:8765}
+    base_url: ${LOCAL_WS_URL:-ws://127.0.0.1:8765}
     auth_token: ${LOCAL_WS_AUTH_TOKEN:-}
     capabilities:
       - stt
@@ -1396,7 +1392,7 @@ providers:
     chunk_ms: ${LOCAL_WS_CHUNK_MS:=320}
     connect_timeout_sec: ${LOCAL_WS_CONNECT_TIMEOUT:=2.0}
     continuous_input: true
-    enabled: true
+    enabled: false
     farewell_mode: ${LOCAL_FAREWELL_MODE:=asterisk}
     farewell_timeout_sec: ${LOCAL_FAREWELL_TIMEOUT:=30.0}
     tool_call_policy: ${LOCAL_TOOL_CALL_POLICY:=auto}
@@ -1424,7 +1420,7 @@ providers:
     temperature: 0.4
     type: local
     # Uses LOCAL_WS_URL (see providers.local.base_url note above).
-    ws_url: ${LOCAL_WS_URL:-ws://local_ai_server:8765}
+    ws_url: ${LOCAL_WS_URL:-ws://127.0.0.1:8765}
   local_stt:
     auth_token: ${LOCAL_WS_AUTH_TOKEN:-}
     capabilities:
@@ -1437,7 +1433,7 @@ providers:
     stt_model: models/stt/vosk-model-en-us-0.22
     type: local
     # Uses LOCAL_WS_URL (see providers.local.base_url note above).
-    ws_url: ${LOCAL_WS_URL:-ws://local_ai_server:8765}
+    ws_url: ${LOCAL_WS_URL:-ws://127.0.0.1:8765}
   local_tts:
     auth_token: ${LOCAL_WS_AUTH_TOKEN:-}
     capabilities:
@@ -1447,7 +1443,7 @@ providers:
     tts_voice: models/tts/en_US-lessac-medium.onnx
     type: local
     # Uses LOCAL_WS_URL (see providers.local.base_url note above).
-    ws_url: ${LOCAL_WS_URL:-ws://local_ai_server:8765}
+    ws_url: ${LOCAL_WS_URL:-ws://127.0.0.1:8765}
   openai_llm:
     capabilities:
       - llm

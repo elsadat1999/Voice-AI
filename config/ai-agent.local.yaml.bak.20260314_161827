@@ -1,0 +1,12 @@
+contexts:
+  default:
+    prompt: You are Asterisk Agent, a Helpful Assistant. Be helpful and concise.
+    provider: google_live
+default_provider: google_live
+pipelines:
+  local_hybrid:
+    tools: null
+providers:
+  google_live:
+    greeting: Hello
+    instructions: You are Asterisk Agent, a Helpful Assistant. Be helpful and concise.
