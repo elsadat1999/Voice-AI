@@ -8289,13 +8289,15 @@ class Engine:
                         self._provider_bytes[call_id] = int(self._provider_bytes.get(call_id, 0)) + (len(chunk) if isinstance(chunk, (bytes, bytearray)) else sum(len(f) for f in (out_chunk if isinstance(out_chunk, list) else [out_chunk])))
                         if isinstance(out_chunk, list):
                             for frame in out_chunk:
-                                q.put_nowait(frame)
+                                await q.put(frame)
                                 self._enqueued_bytes[call_id] = int(self._enqueued_bytes.get(call_id, 0)) + len(frame)
                         else:
-                            q.put_nowait(out_chunk)
+                            await q.put(out_chunk)
                             self._enqueued_bytes[call_id] = int(self._enqueued_bytes.get(call_id, 0)) + len(out_chunk)
-                    except asyncio.QueueFull:
-                        logger.debug("Provider streaming queue full; dropping chunk", call_id=call_id)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.debug("Provider streaming enqueue failed", call_id=call_id, exc_info=True)
             elif etype == "AgentAudioDone":
                 # If we were suppressing output due to barge-in, end suppression at a segment boundary.
                 # This prevents cutting into the next (new) response once the provider finishes the interrupted one.
@@ -8354,9 +8356,11 @@ class Engine:
                     if q is not None:
                         # Signal end of stream (per-segment mode)
                         try:
-                            q.put_nowait(None)  # sentinel for StreamingPlaybackManager
-                        except asyncio.QueueFull:
-                            asyncio.create_task(q.put(None))
+                            await q.put(None)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            logger.debug("Provider queue sentinel enqueue failed", call_id=call_id, exc_info=True)
                         # Clear queue reference so next chunk creates new queue/stream
                         self._provider_stream_queues.pop(call_id, None)
                     else:
