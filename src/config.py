@@ -1142,13 +1142,10 @@ def validate_production_config(config: AppConfig) -> tuple[list[str], list[str]]
                         except Exception:
                             asterisk_host_is_ip = False
 
-                        # If `asterisk.host` is a hostname, we cannot safely auto-allowlist (DNS changes / ambiguity).
-                        # Require explicit IP allowlist to prevent first-packet hijack.
+                        # In Docker environments, RTP often comes from the gateway IP, not the hostname's resolved IP.
+                        # We relax the strict requirement here to allow dynamic bonding (lock_remote_endpoint).
                         if not asterisk_host_is_ip and not allowed_list:
-                            errors.append(
-                                "external_media.allowed_remote_hosts is required when asterisk.host is a hostname; "
-                                "set it to one or more IP addresses allowed to send RTP (e.g., your Asterisk server IP)."
-                            )
+                            logger.warning("asterisk.host is a hostname and allowed_remote_hosts is empty. Relying on lock_remote_endpoint.")
 
                         # Validate allowlist entries are IP literals (RTP source address is always an IP).
                         for entry in allowed_list:
