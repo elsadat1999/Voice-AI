@@ -1200,9 +1200,6 @@ external_media:
   rtp_port: 18080
   advertise_host: ${EXTERNAL_MEDIA_ADVERTISE_HOST}
   sample_rate: 16000
-  allowed_remote_hosts:
-    - 172.23.0.2
-    - 127.0.0.1
 llm:
   initial_greeting: Hello, how can I help you today?
   prompt: Voice assistant. Answer in 5-8 words. Be direct. Expand only if asked.

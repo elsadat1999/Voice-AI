@@ -1,8 +1,6 @@
 contexts:
   default:
-    prompt: You are Asterisk Agent, a Helpful Assistant. Be helpful and concise.
-    provider: local
-    tools: null
+    prompt: ''
 default_provider: local
 external_media:
   allowed_remote_hosts:
@@ -16,7 +14,7 @@ providers:
     llm_max_output_tokens: 1024
     instructions: You are Asterisk Agent, a Helpful Assistant. Be helpful and concise.
   local:
+    enabled: false
     greeting: Hello
     instructions: You are Asterisk Agent, a Helpful Assistant. Be helpful and concise.
-  openai_realtime:
-    enabled: true
+    name: local
