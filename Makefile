@@ -6,6 +6,7 @@ SERVER_HOST := your-server.example.com
 PROJECT_PATH := /root/Asterisk-Agent-Develop
 SERVICE ?= ai_engine
 provider ?= local
+AUTO_SYNC_FREEPBX_IP ?= 1
 
 # ------------------------------------------------------------------------------
 # Localhost vs Remote operation
@@ -55,6 +56,16 @@ build:
 ## up: Start all services in the background
 up:
 	$(COMPOSE) up -d
+	@if [ "$(AUTO_SYNC_FREEPBX_IP)" = "1" ]; then \
+		echo "--> Auto-syncing FreePBX media address to current host IP..."; \
+		./scripts/sync_freepbx_media_address.sh; \
+	else \
+		echo "--> Skipping FreePBX media-address sync (AUTO_SYNC_FREEPBX_IP=$(AUTO_SYNC_FREEPBX_IP))"; \
+	fi
+
+## sync-freepbx-ip: Sync FreePBX media/signaling address with current host IP
+sync-freepbx-ip:
+	./scripts/sync_freepbx_media_address.sh
 
 ## down: Stop and remove all services
 down:
@@ -512,4 +523,4 @@ help:
 	@echo "Targets:"
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
 
-.PHONY: build up down logs logs-all ps deploy deploy-safe deploy-force deploy-full deploy-no-cache server-logs server-logs-snapshot server-status server-clear-logs server-health test-local test-integration test-ari test-externalmedia verify-deployment verify-remote-sync verify-server-commit verify-config monitor-externalmedia monitor-externalmedia-once monitor-up monitor-down monitor-logs monitor-status cli-build cli-build-all cli-checksums cli-test cli-install cli-clean cli-release help
+.PHONY: build up down logs logs-all ps sync-freepbx-ip deploy deploy-safe deploy-force deploy-full deploy-no-cache server-logs server-logs-snapshot server-status server-clear-logs server-health test-local test-integration test-ari test-externalmedia verify-deployment verify-remote-sync verify-server-commit verify-config monitor-externalmedia monitor-externalmedia-once monitor-up monitor-down monitor-logs monitor-status cli-build cli-build-all cli-checksums cli-test cli-install cli-clean cli-release help
