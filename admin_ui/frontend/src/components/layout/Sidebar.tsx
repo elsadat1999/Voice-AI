@@ -66,14 +66,16 @@ const Sidebar = () => {
         <aside className="w-64 border-r border-border bg-card/50 backdrop-blur flex flex-col h-full">
             <div className="p-6 border-b border-border/50">
                 <div className="flex items-center gap-3 font-bold text-xl tracking-tight">
-                    <img
-                        src="/mascot_transparent.png"
-                        alt="AVA Mascot"
-                        className="w-11 h-11 object-contain"
+                    <img 
+                        src="/logo.png" 
+                        alt="Voice-AI Logo" 
+                        className="h-8 w-8 object-contain"
                     />
-                    <div className="flex flex-col leading-none">
-                        <span>AVA</span>
-                        <span className="text-[10px] text-muted-foreground font-medium uppercase tracking-wider mt-1">AI Voice Agent for Asterisk</span>
+                    <div className="flex flex-col">
+                        <span className="font-bold text-lg tracking-tight leading-none text-foreground">
+                            Voice-AI
+                        </span>
+                        <span className="text-[10px] text-muted-foreground font-medium uppercase tracking-wider mt-1">AI Voice Agent</span>
                     </div>
                 </div>
             </div>

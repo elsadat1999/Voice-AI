@@ -81,7 +81,7 @@ const Wizard = () => {
         deepgram_key: '',
         google_key: '',
         greeting: 'Hello, how can I help you today?',
-        ai_name: 'Asterisk Agent',
+        ai_name: 'Voice-AI',
         ai_role: 'Helpful Assistant',
         hybrid_llm_provider: 'groq',
         // Defaults
@@ -1077,7 +1077,7 @@ exten => s,1,NoOp(AI Agent Call)
                 {step === 1 && (
                     <div className="space-y-6">
                         <div className="prose dark:prose-invert">
-                            <p className="text-lg">Welcome to the Asterisk AI Voice Agent setup.</p>
+                            <p className="text-lg">Welcome to the Voice-AI setup.</p>
                             <p>This wizard will help you configure the essential settings to get your agent up and running in minutes.</p>
                             <div className="bg-muted p-4 rounded-lg">
                                 <h3 className="font-medium mb-2">You will need:</h3>

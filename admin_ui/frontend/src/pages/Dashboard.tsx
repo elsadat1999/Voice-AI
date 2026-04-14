@@ -337,7 +337,7 @@ const Dashboard = () => {
                             </div>
                             <div className="flex items-center gap-1.5">
                                 <Tag className="w-3.5 h-3.5 text-muted-foreground" />
-                                <span className="text-muted-foreground">AAVA:</span>
+                                <span className="text-muted-foreground">Voice-AI:</span>
                                 <span className="font-medium">{platformData?.platform?.project?.version || '--'}</span>
                             </div>
                             <div className="flex items-center gap-1.5">

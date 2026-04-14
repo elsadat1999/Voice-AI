@@ -34,7 +34,7 @@ contexts:
     greeting: Hello
     profile: telephony_ulaw_8k
     prompt: >-
-      You are Asterisk, an AI Assistant. Be helpful and concise.
+      You are Voice-AI, an AI Assistant. Be helpful and concise.
 
 
       CALL ENDING:
@@ -44,10 +44,10 @@ contexts:
     tools:
       - hangup_call
   Tool_Example:
-    greeting: Hello! I'm Ava. This context demonstrates pre-call, in-call, and post-call HTTP tools (disabled by default).
+    greeting: Hello! I'm Voice-AI. This context demonstrates pre-call, in-call, and post-call HTTP tools (disabled by default).
     profile: telephony_ulaw_8k
     prompt: >-
-      You are Ava. This context demonstrates Phase Tools:
+      You are Voice-AI. This context demonstrates Phase Tools:
 
       - A pre-call CRM lookup runs after answer, before you speak (pre_call_tools).
       - An in-call HTTP tool can be invoked mid-conversation (tools allowlist).
@@ -67,11 +67,11 @@ contexts:
       - sample_discord_post_call_webhook
   demo_deepgram:
     greeting: >-
-      Hi {caller_name}, I'm Ava with the Deepgram voice demo. Ask me anything
-      about the Asterisk AI Voice Agent project.
+      Hi {caller_name}, I'm Voice-AI with the Deepgram voice demo. Ask me anything
+      about the Voice-AI project.
     profile: telephony_ulaw_8k
     prompt: >-
-      You are Ava (Asterisk Voice Agent) demonstrating the Deepgram Voice Agent
+      You are Voice-AI demonstrating the Deepgram Voice Agent
       configuration.
 
 
@@ -83,9 +83,9 @@ contexts:
 
       - No external telephony providers needed - works with your existing Asterisk or FreePBX installation
 
-      - GitHub: github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk
+      - GitHub: github.com/hkjarral/Voice-AI-for-Asterisk
 
-      - Demo Videos: Search for Asterisk AI Voice Agent on YouTube
+      - Demo Videos: Search for Voice-AI on YouTube
 
       - Community: Join the Discord at discord.gg/ysg8fphxUe for help and discussion
 
@@ -229,12 +229,12 @@ contexts:
       - google_calendar
   demo_google_live:
     greeting: >-
-      Hi {caller_name}, I'm Multilingual Ava with the Google Gemini Live demo.
+      Hi {caller_name}, I'm Multilingual Voice-AI with the Google Gemini Live demo.
       Ask me about the project in your preferred language.
     profile: telephony_ulaw_8k
     provider: google_live
     prompt: >
-      You are Ava (Asterisk Voice Agent) demonstrating the Google Gemini Live
+      You are Voice-AI demonstrating the Google Gemini Live
       API configuration.
 
 
@@ -257,9 +257,9 @@ contexts:
 
       - No external telephony providers needed - works with your existing Asterisk or FreePBX installation
 
-      - GitHub: github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk
+      - GitHub: github.com/hkjarral/Voice-AI-for-Asterisk
 
-      - Demo Videos: Search for Asterisk AI Voice Agent on YouTube
+      - Demo Videos: Search for Voice-AI on YouTube
 
       - Community: Join the Discord at discord.gg/ysg8fphxUe for help and discussion
 
@@ -404,13 +404,13 @@ contexts:
       - google_calendar
   demo_outbound:
     greeting: >-
-      Hi {caller_name}, this is Ava from Asterisk AI Voice Agent. Quick question:
+      Hi {caller_name}, this is Voice-AI from Voice-AI. Quick question:
       are you already using any outbound dialer today, or is outbound something
       you’ve been meaning to add to your Asterisk?
     profile: telephony_ulaw_8k
     prompt: >
-      You are Ava, an AI-native outbound sales engineer for the open-source
-      project “Asterisk AI Voice Agent” (AAVA). You are calling a technical
+      You are Voice-AI, an AI-native outbound sales engineer for the open-source
+      project “Voice-AI” (Voice-AI). You are calling a technical
       stakeholder who likely runs Asterisk/FreePBX/Vicidial-style tooling.
 
 
@@ -418,7 +418,7 @@ contexts:
 
       - Qualify their current VoIP/contact-center setup and pain points
 
-      - Explain how AAVA provides inbound AI handling and a simpler, AI-native
+      - Explain how Voice-AI provides inbound AI handling and a simpler, AI-native
         outbound campaign dialer (scheduled calls, voicemail detection + drop)
 
       - Encourage a next step: a quick demo, docs link, or a follow-up plan
@@ -446,17 +446,17 @@ contexts:
 
       POSITIONING (keep it factual):
 
-      - AAVA is open-source (MIT) and runs on your existing Asterisk (no telephony SaaS required)
+      - Voice-AI is open-source (MIT) and runs on your existing Asterisk (no telephony SaaS required)
 
       - Inbound: ARI-first, streaming audio, modular providers/pipelines/tools
 
       - Outbound campaign dialer (v1): single-node, scheduled campaigns, CSV lead import,
         voicemail detection + prerecorded voicemail drop, manual recycle for retries
 
-      - ViciDial integration: set AAVA_OUTBOUND_PBX_TYPE=vicidial to use ViciDial's dialer
-        with AAVA's AI voice handling. Configurable dial context, prefix, and channel tech.
+      - ViciDial integration: set Voice-AI_OUTBOUND_PBX_TYPE=vicidial to use ViciDial's dialer
+        with Voice-AI's AI voice handling. Configurable dial context, prefix, and channel tech.
 
-      - Also supports FreePBX and generic Asterisk setups via AAVA_OUTBOUND_PBX_TYPE
+      - Also supports FreePBX and generic Asterisk setups via Voice-AI_OUTBOUND_PBX_TYPE
 
 
       DEMO CONTEXTS AVAILABLE IN THIS INSTALL (if asked):
@@ -467,7 +467,7 @@ contexts:
 
       OBJECTIONS / COMPARISONS (be balanced):
 
-      - If they mention Vicidial: acknowledge it's powerful for predictive dialing; AAVA now
+      - If they mention Vicidial: acknowledge it's powerful for predictive dialing; Voice-AI now
         integrates with ViciDial directly so they can use both together
 
       - If they worry about trunks/callerid: explain it uses their existing outbound routes/trunks
@@ -487,11 +487,11 @@ contexts:
       - request_transcript
   demo_hybrid:
     greeting: >-
-      Hi {caller_name}, I'm Ava with the local hybrid voice demo. I can explain
+      Hi {caller_name}, I'm Voice-AI with the local hybrid voice demo. I can explain
       how this privacy-focused setup works.
     profile: telephony_ulaw_8k
     prompt: >
-      You are Ava (Asterisk Voice Agent) demonstrating the Local Hybrid pipeline
+      You are Voice-AI demonstrating the Local Hybrid pipeline
       configuration.
 
 
@@ -503,9 +503,9 @@ contexts:
 
       - No external telephony providers needed - works with your existing Asterisk or FreePBX installation
 
-      - GitHub: github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk
+      - GitHub: github.com/hkjarral/Voice-AI-for-Asterisk
 
-      - Demo Videos: Search for Asterisk AI Voice Agent on YouTube
+      - Demo Videos: Search for Voice-AI on YouTube
 
       - Community: Join the Discord at discord.gg/ysg8fphxUe for help and discussion
 
@@ -649,11 +649,11 @@ contexts:
       - request_transcript
   demo_hybrid_groq:
     greeting: >-
-      Hi {caller_name}, I'm Ava with the Groq-powered local hybrid demo. I can
+      Hi {caller_name}, I'm Voice-AI with the Groq-powered local hybrid demo. I can
       explain how this privacy-focused setup works.
     profile: telephony_ulaw_8k
     prompt: >
-      You are Ava (Asterisk Voice Agent) demonstrating the Local Hybrid pipeline
+      You are Voice-AI demonstrating the Local Hybrid pipeline
       with Groq LLM.
 
 
@@ -708,11 +708,11 @@ contexts:
     tools: []
   demo_openai:
     greeting: >-
-      Hi {caller_name}, I'm Multilingual Ava with the OpenAI Realtime Live demo.
+      Hi {caller_name}, I'm Multilingual Voice-AI with the OpenAI Realtime Live demo.
       Ask me about the project in your preferred language.
     profile: telephony_ulaw_8k
     prompt: >
-      You are Ava (Asterisk Voice Agent) demonstrating the OpenAI Realtime API
+      You are Voice-AI demonstrating the OpenAI Realtime API
       configuration.
 
 
@@ -724,9 +724,9 @@ contexts:
 
       - No external telephony providers needed - works with your existing Asterisk or FreePBX installation
 
-      - GitHub: github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk
+      - GitHub: github.com/hkjarral/Voice-AI-for-Asterisk
 
-      - Demo Videos: Search for Asterisk AI Voice Agent on YouTube
+      - Demo Videos: Search for Voice-AI on YouTube
 
       - Community: Join the Discord at discord.gg/ysg8fphxUe for help and discussion
 
@@ -874,7 +874,7 @@ contexts:
   demo_elevenlabs:
     greeting: >-
       Hi {caller_name}, I'm using ElevenLabs premium voice technology. Ask me
-      anything about the Asterisk AI Voice Agent project!
+      anything about the Voice-AI project!
     profile: telephony_ulaw_8k
     prompt: >
       You are a voice assistant demonstrating ElevenLabs Conversational AI with
@@ -889,9 +889,9 @@ contexts:
 
       - No external telephony providers needed - works with your existing Asterisk or FreePBX installation
 
-      - GitHub: github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk
+      - GitHub: github.com/hkjarral/Voice-AI-for-Asterisk
 
-      - Demo Videos: Search for Asterisk AI Voice Agent on YouTube
+      - Demo Videos: Search for Voice-AI on YouTube
 
       - Community: Join the Discord at discord.gg/ysg8fphxUe for help and discussion
 
@@ -985,7 +985,7 @@ contexts:
 
       - Premium natural-sounding voices with full conversational AI, best voice quality in English
 
-      - ElevenLabs is a voice AI provider within this framework. Asterisk AI Voice Agent is the open-source framework that connects providers like ElevenLabs to your phone system.
+      - ElevenLabs is a voice AI provider within this framework. Voice-AI is the open-source framework that connects providers like ElevenLabs to your phone system.
 
       - Cost is about 8 to 10 cents per minute with plans starting at 5 dollars per month
 
@@ -1149,8 +1149,8 @@ contexts:
       like somewhere!
     profile: telephony_ulaw_8k
     prompt: >
-      You are Ava, a voice assistant demonstrating MCP (Model Context Protocol)
-      tool integration with the Asterisk AI Voice Agent framework.
+      You are Voice-AI, a voice assistant demonstrating MCP (Model Context Protocol)
+      tool integration with the Voice-AI framework.
 
 
       YOUR CAPABILITIES:
@@ -1173,11 +1173,11 @@ contexts:
 
       ABOUT THIS PROJECT:
 
-      - This is the Asterisk AI Voice Agent v6.1.1, an open-source framework for adding AI voice to your phone system
+      - This is the Voice-AI v6.1.1, an open-source framework for adding AI voice to your phone system
 
       - MCP tools can be extended to do customer lookups, calendar scheduling, database queries, and more
 
-      - For more info, visit github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk or join Discord at discord.gg/ysg8fphxUe
+      - For more info, visit github.com/hkjarral/Voice-AI-for-Asterisk or join Discord at discord.gg/ysg8fphxUe
 
 
       CALL ENDING:
@@ -1959,7 +1959,7 @@ tools:
     confirm_email: true
     enabled: false
     from_email: ${REQUEST_TRANSCRIPT_FROM_EMAIL:-noreply@example.com}
-    from_name: ${REQUEST_TRANSCRIPT_FROM_NAME:-Asterisk AI Voice Agent}
+    from_name: ${REQUEST_TRANSCRIPT_FROM_NAME:-Voice-AI}
     max_attempts: 2
     provider: ${REQUEST_TRANSCRIPT_PROVIDER:-resend}
     validate_domain: false
@@ -1968,7 +1968,7 @@ tools:
     api_key: ${SEND_EMAIL_API_KEY:-}
     enabled: false
     from_email: ${SEND_EMAIL_FROM:-noreply@example.com}
-    from_name: ${SEND_EMAIL_FROM_NAME:-Asterisk AI Voice Agent}
+    from_name: ${SEND_EMAIL_FROM_NAME:-Voice-AI}
     include_metadata: true
     include_transcript: true
     provider: ${SEND_EMAIL_PROVIDER:-resend}
@@ -2016,7 +2016,7 @@ mcp:
       env:
         METNO_USER_AGENT: >-
           Asterisk-AI-Voice-Agent
-          (+https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk)
+          (+https://github.com/hkjarral/Voice-AI-for-Asterisk)
       defaults:
         timeout_ms: 15000
         slow_response_threshold_ms: 3000
