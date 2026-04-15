@@ -51,7 +51,7 @@ RUN if [ "$INCLUDE_VOSK" = "true" ]; then \
 
 RUN if [ "$INCLUDE_SHERPA" = "true" ]; then \
         echo "📦 Installing Sherpa-ONNX STT..." && \
-        pip install --no-cache-dir sherpa-onnx==1.12.19; \
+        pip install --no-cache-dir sherpa-onnx==1.12.26; \
     fi
 
 RUN if [ "$INCLUDE_FASTER_WHISPER" = "true" ]; then \

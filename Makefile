@@ -1,4 +1,4 @@
-# Makefile for the Asterisk AI Voice Agent
+# Makefile for the Voice-AI
 
 # Default values - can be overridden from the command line
 SERVER_USER := root

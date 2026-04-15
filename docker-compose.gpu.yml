@@ -1,6 +1,6 @@
 # docker-compose.gpu.yml - NVIDIA GPU Support Override
 #
-# AAVA-140: GPU passthrough for Local AI Server LLM acceleration
+# Voice-AI-140: GPU passthrough for Local AI Server LLM acceleration
 #
 # Usage (only needed when using GPU for inference):
 #   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build local_ai_server
