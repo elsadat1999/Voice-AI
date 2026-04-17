@@ -216,7 +216,7 @@ def _safe_container_image_name(container) -> str:
 
 
 @router.get("/containers")
-async def get_containers():
+def get_containers():
     try:
         from datetime import datetime, timezone
         
@@ -2816,7 +2816,7 @@ def _build_checks(os_info, docker_info, compose_info, selinux_info, dir_info, as
 
 
 @router.get("/platform")
-async def get_platform():
+def get_platform():
     """
     Get platform detection and check results.
     AAVA-126: Cross-Platform Support

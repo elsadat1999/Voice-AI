@@ -84,10 +84,14 @@ main() {
 
   echo "Updating FreePBX container: ${FREEPBX_CONTAINER}"
 
+  # Update newer FreePBX versions (kvstore_Sipsettings)
   docker exec "$FREEPBX_CONTAINER" bash -lc "mysql -u root -e 'USE asterisk;
 UPDATE kvstore_Sipsettings SET val=\"${host_ip}\" WHERE \`key\`=\"externip\";
-UPDATE kvstore_Sipsettings SET val=\"${host_ip}\" WHERE \`key\`=\"externip.val\";
-UPDATE sipsettings SET data=\"${host_ip}\" WHERE keyword=\"externip_val\";'"
+UPDATE kvstore_Sipsettings SET val=\"${host_ip}\" WHERE \`key\`=\"externip.val\";' 2>/dev/null || true"
+
+  # Update older FreePBX versions (sipsettings), ignore if table doesn't exist
+  docker exec "$FREEPBX_CONTAINER" bash -lc "mysql -u root -e 'USE asterisk;
+UPDATE sipsettings SET data=\"${host_ip}\" WHERE keyword=\"externip_val\";' 2>/dev/null || true"
 
   docker cp "$TMP_OVERRIDES" "${FREEPBX_CONTAINER}:/etc/asterisk/pjsip.endpoint_custom.conf"
 

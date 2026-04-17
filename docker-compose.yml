@@ -182,7 +182,7 @@ services:
       - PROJECT_ROOT=/app/project
       # HOST_PROJECT_ROOT is the actual host filesystem path for docker compose operations.
       # This is critical because Docker (via socket) resolves volume mounts on the HOST, not inside this container.
-      - HOST_PROJECT_ROOT=${HOST_PROJECT_ROOT:-/Users/mohamedelsadat/Desktop/projects/AVA-AI-Voice-Agent-for-Asterisk}
+      - HOST_PROJECT_ROOT=${HOST_PROJECT_ROOT:-.}
       # Use container names for bridge network (not localhost)
       - HEALTH_CHECK_AI_ENGINE_URL=http://ai_engine:15000/health
       - HEALTH_CHECK_LOCAL_AI_URL=ws://local_ai_server:8765
