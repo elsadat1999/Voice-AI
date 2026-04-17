@@ -8,16 +8,25 @@ COLOR_RESET='\033[0m'
 print_info() { echo -e "${COLOR_BLUE}INFO: $1${COLOR_RESET}"; }
 print_success() { echo -e "${COLOR_GREEN}SUCCESS: $1${COLOR_RESET}"; }
 
+# Guard: Ensure we are on Linux (the deployment target)
+if [ "$(uname)" != "Linux" ]; then
+    echo -e "${COLOR_RED}ERROR: This script is intended for the REMOTE LINUX SERVER, not your local Mac.${COLOR_RESET}"
+    echo "Please rsync the files to the server and run this script there via SSH."
+    exit 1
+fi
+
 # 1. Ensure preflight checks pass (Install Docker/Compose)
 print_info "Running preflight checks and installing dependencies..."
 chmod +x preflight.sh install.sh
-sudo ./preflight.sh --apply-fixes
+./preflight.sh --apply-fixes
 
 # 2. Detect Public IP
 print_info "Detecting Public IP..."
-PUBLIC_IP=$(curl -s ifconfig.me)
+# Try curl first, then fall back to hostname
+PUBLIC_IP=$(curl -s ifconfig.me || curl -s icanhazip.com || hostname -I | awk '{print $1}')
 if [ -z "$PUBLIC_IP" ]; then
-    PUBLIC_IP=$(hostname -I | awk '{print $1}')
+    echo -e "${COLOR_RED}ERROR: Could not detect Public IP.${COLOR_RESET}"
+    exit 1
 fi
 print_success "Detected IP: $PUBLIC_IP"
 
@@ -26,7 +35,7 @@ if [ ! -f .env ]; then
     cp .env.example .env
 fi
 
-# Update IP-related variables in .env
+# Update IP-related variables in .env (using GNU sed syntax for Linux)
 sed -i "s|^EXTERNAL_MEDIA_ADVERTISE_HOST=.*|EXTERNAL_MEDIA_ADVERTISE_HOST=$PUBLIC_IP|" .env
 # Also add it if it doesn't exist
 if ! grep -q "EXTERNAL_MEDIA_ADVERTISE_HOST" .env; then
