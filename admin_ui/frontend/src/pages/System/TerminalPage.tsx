@@ -3,7 +3,7 @@ import { Terminal as TerminalIcon, Send } from 'lucide-react';
 import axios from 'axios';
 
 const TerminalPage = () => {
-    const [history, setHistory] = useState<string[]>(['Welcome to Asterisk AI Admin Terminal', 'Type "help" for available commands.']);
+    const [history, setHistory] = useState<string[]>(['Welcome to PBX System AI Admin Terminal', 'Type "help" for available commands.']);
     const [input, setInput] = useState('');
     const [loading, setLoading] = useState(false);
     const endRef = useRef<HTMLDivElement>(null);
@@ -55,7 +55,7 @@ const TerminalPage = () => {
                     ];
 
                 case 'version':
-                    return ['Asterisk AI Agent v1.0.0 (Admin UI)'];
+                    return ['PBX System AI Agent v1.0.0 (Admin UI)'];
 
                 case 'clear':
                     setHistory([]);

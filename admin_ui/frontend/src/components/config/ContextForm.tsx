@@ -457,7 +457,7 @@ const ContextForm = ({ config, providers, pipelines, availableTools, toolEnabled
                             value={config.background_music || 'default'}
                             onChange={(e) => updateConfig('background_music', e.target.value || 'default')}
                             placeholder="default"
-                            tooltip="Music On Hold class name from Asterisk's musiconhold.conf"
+                            tooltip="Music On Hold class name from PBX System's musiconhold.conf"
                         />
                         <div className="text-xs text-muted-foreground bg-muted/50 p-3 rounded-md space-y-2">
                             <p className="font-medium text-foreground">📁 How to configure Music On Hold:</p>

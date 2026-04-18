@@ -500,7 +500,7 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                                 <option value="linear16">Linear16</option>
                             </select>
                             <p className="text-xs text-muted-foreground">
-                                Audio format from Asterisk. Use μ-law for standard telephony.
+                                Audio format from PBX System. Use μ-law for standard telephony.
                             </p>
                         </div>
                         <div className="space-y-2">
@@ -512,7 +512,7 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                                 onChange={(e) => handleChange('input_sample_rate_hz', parseInt(e.target.value))}
                             />
                             <p className="text-xs text-muted-foreground">
-                                Sample rate from Asterisk. Standard telephony uses 8000 Hz.
+                                Sample rate from PBX System. Standard telephony uses 8000 Hz.
                             </p>
                         </div>
                         <div className="space-y-2">
@@ -554,7 +554,7 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                                 <option value="linear16">Linear16</option>
                             </select>
                             <p className="text-xs text-muted-foreground">
-                                Final format for playback to caller. Match your Asterisk codec.
+                                Final format for playback to caller. Match your PBX System codec.
                             </p>
                         </div>
                         <div className="space-y-2">

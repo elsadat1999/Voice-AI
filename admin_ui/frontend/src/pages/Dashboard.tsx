@@ -382,14 +382,14 @@ const Dashboard = () => {
                         <div
                             className="flex items-center gap-3 cursor-pointer hover:opacity-80 transition-opacity flex-1 min-w-0"
                             onClick={() => navigate('/asterisk')}
-                            title="View Asterisk Setup"
+                            title="View PBX System Setup"
                         >
                             <Phone className={`w-5 h-5 flex-shrink-0 ${
                                 ariConnected === true ? 'text-green-500' :
                                 ariConnected === false ? 'text-red-500' : 'text-muted-foreground'
                             }`} />
                             <div className="min-w-0">
-                                <div className="text-xs text-muted-foreground">Asterisk</div>
+                                <div className="text-xs text-muted-foreground">PBX System</div>
                                 <div className={`text-sm font-semibold ${
                                     ariConnected === true ? 'text-green-500' :
                                     ariConnected === false ? 'text-red-500' : 'text-muted-foreground'

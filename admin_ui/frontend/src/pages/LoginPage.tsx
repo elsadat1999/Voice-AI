@@ -32,11 +32,11 @@ const LoginPage: React.FC = () => {
         <div className="min-h-screen flex items-center justify-center bg-background p-4">
             <div className="w-full max-w-md space-y-8 bg-card p-8 rounded-lg border border-border shadow-lg">
                 <div className="flex flex-col items-center justify-center space-y-4 relative z-10">
-                    <img 
+                    {/* <img 
                         src="/logo.png" 
                         alt="Voice-AI Logo" 
                         className="h-24 w-24 object-contain animate-in fade-in zoom-in duration-500"
-                    />
+                    /> */}
                     <h2 className="text-3xl font-bold text-foreground relative z-0">Voice-AI</h2>
                     <p className="text-muted-foreground text-center max-w-sm">
                         Sign in to manage your AI Voice Agent

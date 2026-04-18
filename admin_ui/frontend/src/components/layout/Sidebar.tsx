@@ -66,11 +66,11 @@ const Sidebar = () => {
         <aside className="w-64 border-r border-border bg-card/50 backdrop-blur flex flex-col h-full">
             <div className="p-6 border-b border-border/50">
                 <div className="flex items-center gap-3 font-bold text-xl tracking-tight">
-                    <img 
+                    {/* <img 
                         src="/logo.png" 
                         alt="Voice-AI Logo" 
                         className="h-8 w-8 object-contain"
-                    />
+                    /> */}
                     <div className="flex flex-col">
                         <span className="font-bold text-lg tracking-tight leading-none text-foreground">
                             Voice-AI
@@ -108,7 +108,7 @@ const Sidebar = () => {
                 <SidebarGroup title="System">
                     <SidebarItem to="/env" icon={Globe} label="Environment" />
                     <SidebarItem to="/docker" icon={Container} label="Docker Services" />
-                    <SidebarItem to="/asterisk" icon={Phone} label="Asterisk" />
+                    <SidebarItem to="/asterisk" icon={Phone} label="PBX System" />
                     <SidebarItem to="/models" icon={HardDrive} label="Models" />
                     <SidebarItem to="/updates" icon={ArrowUpCircle} label="Updates" />
                     <SidebarItem to="/logs" icon={FileText} label="Logs" />

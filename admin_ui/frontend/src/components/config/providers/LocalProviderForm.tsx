@@ -356,7 +356,7 @@ const LocalProviderForm: React.FC<LocalProviderFormProps> = ({ config, onChange 
                             value={config.farewell_mode || 'asterisk'}
                             onChange={(e) => handleChange('farewell_mode', e.target.value)}
                         >
-                            <option value="asterisk">Asterisk Sound (Reliable)</option>
+                            <option value="asterisk">PBX System Sound (Reliable)</option>
                             <option value="tts">Local TTS (Fast Hardware)</option>
                         </select>
                         <p className="text-xs text-muted-foreground">

@@ -277,7 +277,7 @@ const OpenAIProviderForm: React.FC<OpenAIProviderFormProps> = ({ config, onChang
                                 <option value="linear16">Linear16</option>
                             </select>
                             <p className="text-xs text-muted-foreground">
-                                Final format for playback. Match your Asterisk codec.
+                                Final format for playback. Match your PBX System codec.
                             </p>
                         </div>
                         <div className="space-y-2">

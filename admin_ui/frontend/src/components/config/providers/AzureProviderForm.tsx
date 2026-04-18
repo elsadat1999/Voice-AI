@@ -220,7 +220,7 @@ const AzureProviderForm: React.FC<AzureProviderFormProps> = ({ config, onChange 
                                         value={config.vad_silence_timeout_ms ?? 300}
                                         onChange={(e) => handleChange('vad_silence_timeout_ms', parseInt(e.target.value))}
                                     />
-                                    <p className="text-xs text-muted-foreground">Azure SDK end silence timeout. Default is 300ms since Asterisk handles primary TalkDetect.</p>
+                                    <p className="text-xs text-muted-foreground">Azure SDK end silence timeout. Default is 300ms since PBX System handles primary TalkDetect.</p>
                                 </div>
                                 <div className="space-y-2">
                                     <label className="text-sm font-medium">Real-Time VAD Initial Silence Timeout (ms)</label>
@@ -354,7 +354,7 @@ const AzureProviderForm: React.FC<AzureProviderFormProps> = ({ config, onChange 
                                     <option value="pcm">PCM 16-bit LE</option>
                                     <option value="slin16">SLIN 16 kHz</option>
                                 </select>
-                                <p className="text-xs text-muted-foreground">Encoding the Asterisk channel expects.</p>
+                                <p className="text-xs text-muted-foreground">Encoding the PBX System channel expects.</p>
                             </div>
                             <div className="space-y-2">
                                 <label className="text-sm font-medium">Target Sample Rate (Hz)</label>

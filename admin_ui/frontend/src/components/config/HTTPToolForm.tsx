@@ -619,7 +619,7 @@ const HTTPToolForm = ({ config, onChange, phase, contexts }: HTTPToolFormProps) 
                                     value={toolForm.hold_audio_file || ''}
                                     onChange={(e) => setToolForm({ ...toolForm, hold_audio_file: e.target.value })}
                                     placeholder="custom/please-wait"
-                                    tooltip="Asterisk sound file to play while waiting for lookup"
+                                    tooltip="PBX System sound file to play while waiting for lookup"
                                 />
                                 <FormInput
                                     label="Hold Audio Threshold (ms)"
@@ -966,7 +966,7 @@ const HTTPToolForm = ({ config, onChange, phase, contexts }: HTTPToolFormProps) 
                                     value={toolForm.hold_audio_file || ''}
                                     onChange={(e) => setToolForm({ ...toolForm, hold_audio_file: e.target.value })}
                                     placeholder="custom/please-wait"
-                                    tooltip="Asterisk sound file to play while waiting for response"
+                                    tooltip="PBX System sound file to play while waiting for response"
                                 />
                                 <FormInput
                                     label="Hold Audio Threshold (ms)"

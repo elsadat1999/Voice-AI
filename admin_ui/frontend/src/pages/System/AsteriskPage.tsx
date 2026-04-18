@@ -170,7 +170,7 @@ const AsteriskPage = () => {
                 <div className="flex items-center gap-3">
                     <Server className="w-6 h-6 text-primary" />
                     <div>
-                        <h1 className="text-2xl font-bold tracking-tight">Asterisk Setup</h1>
+                        <h1 className="text-2xl font-bold tracking-tight">PBX System Setup</h1>
                         <p className="text-sm text-muted-foreground">
                             Configuration status and connectivity checks
                         </p>
@@ -201,7 +201,7 @@ const AsteriskPage = () => {
             </div>
 
             {/* Connection Card */}
-            <ConfigSection title="ARI Connection" description="Live connection status to Asterisk REST Interface">
+            <ConfigSection title="ARI Connection" description="Live connection status to PBX System REST Interface">
                 <ConfigCard>
                     <div className="flex items-center gap-3 mb-4">
                         {live?.ari_reachable ? (
@@ -242,7 +242,7 @@ const AsteriskPage = () => {
             </ConfigSection>
 
             {/* Modules Checklist */}
-            <ConfigSection title="Required Modules" description="Asterisk modules needed for the AI Voice Agent">
+            <ConfigSection title="Required Modules" description="PBX System modules needed for the AI Voice Agent">
                 <ConfigCard>
                     {live?.ari_reachable && Object.keys(live.modules).length > 0 ? (
                         <div className="divide-y divide-border">
@@ -272,7 +272,7 @@ const AsteriskPage = () => {
                     ) : (
                         <div className="flex items-center gap-2 text-sm text-muted-foreground">
                             <AlertCircle className="w-4 h-4" />
-                            No module data returned from Asterisk
+                            No module data returned from PBX System
                         </div>
                     )}
                 </ConfigCard>
@@ -297,7 +297,7 @@ const AsteriskPage = () => {
                     </div>
                     {live?.ari_reachable && !live?.app_registered && (
                         <div className="mt-3 p-3 rounded-md bg-amber-500/5 border border-amber-500/20 text-sm text-amber-600 dark:text-amber-400">
-                            The AI Engine must be running and connected to Asterisk for the app to be registered.
+                            The AI Engine must be running and connected to PBX System for the app to be registered.
                             Start the ai_engine container to register the application.
                         </div>
                     )}
@@ -305,7 +305,7 @@ const AsteriskPage = () => {
             </ConfigSection>
 
             {/* Configuration Checklist (from manifest) */}
-            <ConfigSection title="Configuration Checklist" description="Asterisk config file checks from the last preflight run">
+            <ConfigSection title="Configuration Checklist" description="PBX System config file checks from the last preflight run">
                 <ConfigCard>
                     {manifest && manifest.checks && Object.keys(manifest.checks).length > 0 ? (
                         <div className="divide-y divide-border">

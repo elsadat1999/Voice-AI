@@ -469,7 +469,7 @@ exten => s,1,NoOp(AI Agent Call)
             if (!res.data.valid) {
                 throw new Error(res.data.error || 'Connection failed');
             }
-            showToast(res.data.message || 'Successfully connected to Asterisk!', 'success');
+            showToast(res.data.message || 'Successfully connected to PBX System!', 'success');
         } catch (err: any) {
             showToast('Connection failed: ' + (err.response?.data?.error || err.message), 'error');
         } finally {
@@ -767,13 +767,13 @@ exten => s,1,NoOp(AI Agent Call)
         // Basic required-field validation for non-technical users
         if (step === 4) {
             const missing: string[] = [];
-            if (!config.asterisk_host) missing.push('Asterisk host');
+            if (!config.asterisk_host) missing.push('PBX System host');
             if (!config.asterisk_username) missing.push('ARI username');
             if (!config.asterisk_password) missing.push('ARI password');
 
             // Require server IP when using hostname (for RTP security)
             if (isUsingHostname && !config.asterisk_server_ip) {
-                missing.push('Asterisk Server IP (required when using hostname)');
+                missing.push('PBX System Server IP (required when using hostname)');
             }
 
             if (missing.length) {
@@ -783,7 +783,7 @@ exten => s,1,NoOp(AI Agent Call)
 
             // Validate server IP format if provided
             if (config.asterisk_server_ip && !isIPAddress(config.asterisk_server_ip)) {
-                showToast('Asterisk Server IP must be a valid IP address (e.g., 192.168.1.100)', 'error');
+                showToast('PBX System Server IP must be a valid IP address (e.g., 192.168.1.100)', 'error');
                 return;
             }
 
@@ -947,7 +947,7 @@ exten => s,1,NoOp(AI Agent Call)
         } else if (step === 4) {
             // Validate ARI fields
             if (!config.asterisk_host) {
-                showToast('Asterisk Host is required', 'error');
+                showToast('PBX System Host is required', 'error');
                 return;
             }
             if (!config.asterisk_username) {
@@ -1083,7 +1083,7 @@ exten => s,1,NoOp(AI Agent Call)
                                 <h3 className="font-medium mb-2">You will need:</h3>
                                 <ul className="list-disc list-inside space-y-1">
                                     <li>API Keys (OpenAI, Deepgram, or Google)</li>
-                                    <li>Asterisk Connection Details (Host, Username, Password)</li>
+                                    <li>PBX System Connection Details (Host, Username, Password)</li>
                                 </ul>
                             </div>
                         </div>
@@ -2263,7 +2263,7 @@ exten => s,1,NoOp(AI Agent Call)
                         <h2 className="text-xl font-semibold mb-4">Agent Configuration</h2>
                         <div className="grid grid-cols-2 gap-4">
                             <div className="space-y-2">
-                                <label className="text-sm font-medium">Asterisk Host</label>
+                                <label className="text-sm font-medium">PBX System Host</label>
                                 <input
                                     type="text"
                                     className="w-full p-2 rounded-md border border-input bg-background"
