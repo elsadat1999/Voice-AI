@@ -442,7 +442,16 @@ const EnvPage = () => {
         // Hidden/Internal (added to suppress from Other)
         'COMPOSE_PROJECT_NAME', 'GREETING', 'AI_GREETING', 'AI_NAME', 'AI_ROLE', 'HOST_PROJECT_ROOT', 'PROJECT_ROOT', 'GPU_AVAILABLE', 'INCLUDE_WHISPER_CPP',
         // Deprecated/Legacy
-        'CARTESIA_API_KEY', 'LOCAL_FASTER_WHISPER_COMPUTE'
+        'CARTESIA_API_KEY', 'LOCAL_FASTER_WHISPER_COMPUTE',
+        // Local AI Server - Sherpa offline/VAD
+        'SHERPA_MODEL_TYPE', 'SHERPA_VAD_MODEL_PATH', 'SHERPA_VAD_THRESHOLD',
+        'SHERPA_VAD_MIN_SILENCE_MS', 'SHERPA_VAD_MIN_SPEECH_MS', 'SHERPA_OFFLINE_PREROLL_MS',
+        'SHERPA_OFFLINE_DEBUG_SEGMENTS',
+        // Local AI Server - Tone STT
+        'TONE_MODEL_PATH', 'TONE_DECODER_TYPE', 'TONE_KENLM_PATH', 'INCLUDE_TONE',
+        // Local AI Server - Silero TTS
+        'INCLUDE_SILERO', 'SILERO_SPEAKER', 'SILERO_LANGUAGE', 'SILERO_MODEL_ID',
+        'SILERO_SAMPLE_RATE', 'SILERO_MODEL_PATH'
     ];
 
     const otherSettings = Object.keys(env).filter(k => !knownKeys.includes(k));
@@ -1143,6 +1152,7 @@ const EnvPage = () => {
                                 { value: 'vosk', label: 'Vosk (Local)' },
                                 { value: 'kroko', label: 'Kroko (Cloud/Embedded)' },
                                 { value: 'sherpa', label: 'Sherpa-ONNX (Local)' },
+                                { value: 'tone', label: `T-one${localCaps && !localCaps.stt?.tone?.available ? ' (requires rebuild)' : ''}` },
                                 { value: 'faster_whisper', label: `Faster Whisper${localCaps && !localCaps.stt?.faster_whisper?.available ? ' (requires rebuild)' : ''}` },
                                 { value: 'whisper_cpp', label: `Whisper.cpp (GGML)${localCaps && !localCaps.stt?.whisper_cpp?.available ? ' (requires rebuild)' : ''}` },
                             ]}
@@ -1279,12 +1289,104 @@ const EnvPage = () => {
 
                         {/* Sherpa Settings */}
                         {sttBackend === 'sherpa' && (
-                            <FormInput
-                                label="Sherpa Model Path"
-                                value={env['SHERPA_MODEL_PATH'] || '/app/models/stt/sherpa-onnx-streaming-zipformer-en-2023-06-26'}
-                                onChange={(e) => updateEnv('SHERPA_MODEL_PATH', e.target.value)}
-                                tooltip="Path to the Sherpa ONNX streaming model directory."
-                            />
+                            <>
+                                <FormSelect
+                                    label="Sherpa Model Type"
+                                    value={env['SHERPA_MODEL_TYPE'] || 'online'}
+                                    onChange={(e) => {
+                                        const newType = e.target.value;
+                                        const oldType = env['SHERPA_MODEL_TYPE'] || 'online';
+                                        updateEnv('SHERPA_MODEL_TYPE', newType);
+                                        // Reset model path to the new type's default if it still matches the old type's default
+                                        const offlineDefault = '/app/models/stt/sherpa-onnx-zipformer-en-2023-06-26';
+                                        const onlineDefault = '/app/models/stt/sherpa-onnx-streaming-zipformer-en-2023-06-26';
+                                        const currentPath = env['SHERPA_MODEL_PATH'] || (oldType === 'offline' ? offlineDefault : onlineDefault);
+                                        if (newType === 'offline' && currentPath === onlineDefault) {
+                                            updateEnv('SHERPA_MODEL_PATH', offlineDefault);
+                                        } else if (newType === 'online' && currentPath === offlineDefault) {
+                                            updateEnv('SHERPA_MODEL_PATH', onlineDefault);
+                                        }
+                                    }}
+                                    options={[
+                                        { value: 'online', label: 'Online (Streaming)' },
+                                        { value: 'offline', label: 'Offline (VAD-Gated)' },
+                                    ]}
+                                    tooltip="Offline mode requires a non-streaming Sherpa transducer model. Streaming models must stay on online mode."
+                                />
+                                <FormInput
+                                    label="Sherpa Model Path"
+                                    value={env['SHERPA_MODEL_PATH'] || ((env['SHERPA_MODEL_TYPE'] || 'online') === 'offline'
+                                        ? '/app/models/stt/sherpa-onnx-zipformer-en-2023-06-26'
+                                        : '/app/models/stt/sherpa-onnx-streaming-zipformer-en-2023-06-26')}
+                                    onChange={(e) => updateEnv('SHERPA_MODEL_PATH', e.target.value)}
+                                    tooltip={(env['SHERPA_MODEL_TYPE'] || 'online') === 'offline'
+                                        ? 'Path to a non-streaming Sherpa transducer model directory such as sherpa-onnx-zipformer-en-2023-06-26.'
+                                        : 'Path to a streaming Sherpa model directory.'}
+                                />
+                                {(env['SHERPA_MODEL_TYPE'] || 'online') === 'offline' && (
+                                    <>
+                                        <FormInput
+                                            label="Sherpa VAD Model Path"
+                                            value={env['SHERPA_VAD_MODEL_PATH'] || '/app/models/vad/silero_vad.onnx'}
+                                            onChange={(e) => updateEnv('SHERPA_VAD_MODEL_PATH', e.target.value)}
+                                            tooltip="Path to the Silero VAD ONNX model used to segment speech before offline decoding."
+                                        />
+                                        <FormInput
+                                            label="Sherpa VAD Threshold"
+                                            value={env['SHERPA_VAD_THRESHOLD'] || '0.35'}
+                                            onChange={(e) => updateEnv('SHERPA_VAD_THRESHOLD', e.target.value)}
+                                            tooltip="Speech sensitivity for Sherpa offline Silero VAD. Lower values hear softer speech earlier but can admit more noise."
+                                        />
+                                        <FormInput
+                                            label="Sherpa Min Silence (ms)"
+                                            value={env['SHERPA_VAD_MIN_SILENCE_MS'] || '700'}
+                                            onChange={(e) => updateEnv('SHERPA_VAD_MIN_SILENCE_MS', e.target.value)}
+                                            tooltip="Silence required before Sherpa offline closes a segment. Higher values reduce short-phrase fragmentation."
+                                        />
+                                        <FormInput
+                                            label="Sherpa Min Speech (ms)"
+                                            value={env['SHERPA_VAD_MIN_SPEECH_MS'] || '200'}
+                                            onChange={(e) => updateEnv('SHERPA_VAD_MIN_SPEECH_MS', e.target.value)}
+                                            tooltip="Minimum voiced duration before Sherpa offline accepts a speech segment."
+                                        />
+                                        <FormInput
+                                            label="Sherpa Offline Preroll (ms)"
+                                            value={env['SHERPA_OFFLINE_PREROLL_MS'] || '350'}
+                                            onChange={(e) => updateEnv('SHERPA_OFFLINE_PREROLL_MS', e.target.value)}
+                                            tooltip="Audio padding retained before VAD start so Sherpa offline does not clip the beginning of utterances."
+                                        />
+                                    </>
+                                )}
+                            </>
+                        )}
+
+                        {sttBackend === 'tone' && (
+                            <>
+                                <FormInput
+                                    label="T-one Model Path"
+                                    value={env['TONE_MODEL_PATH'] || '/app/models/stt/t-one'}
+                                    onChange={(e) => updateEnv('TONE_MODEL_PATH', e.target.value)}
+                                    tooltip="Path to the T-one model directory containing model.onnx."
+                                />
+                                <FormSelect
+                                    label="T-one Decoder"
+                                    value={env['TONE_DECODER_TYPE'] || 'beam_search'}
+                                    onChange={(e) => updateEnv('TONE_DECODER_TYPE', e.target.value)}
+                                    options={[
+                                        { value: 'beam_search', label: 'Beam Search' },
+                                        { value: 'greedy', label: 'Greedy' },
+                                    ]}
+                                    tooltip="Beam search uses KenLM and is recommended for Russian quality. Greedy is lighter but less accurate."
+                                />
+                                {(env['TONE_DECODER_TYPE'] || 'beam_search') === 'beam_search' && (
+                                    <FormInput
+                                        label="T-one KenLM Path"
+                                        value={env['TONE_KENLM_PATH'] || '/app/models/stt/t-one/kenlm.bin'}
+                                        onChange={(e) => updateEnv('TONE_KENLM_PATH', e.target.value)}
+                                        tooltip="Path to kenlm.bin used for beam search decoding."
+                                    />
+                                )}
+                            </>
                         )}
 
                         {/* Faster Whisper Settings */}
@@ -1931,6 +2033,13 @@ const EnvPage = () => {
                                         description="Whisper.cpp STT (requires local ggml .bin model file)"
                                         checked={isTrue(env['INCLUDE_WHISPER_CPP'])}
                                         onChange={(e) => updateEnv('INCLUDE_WHISPER_CPP', e.target.checked ? 'true' : 'false')}
+                                    />
+                                    <FormSwitch
+                                        id="include-tone"
+                                        label="T-one"
+                                        description="Russian telephony STT with ONNX + pyctcdecode + KenLM"
+                                        checked={isTrue(env['INCLUDE_TONE'])}
+                                        onChange={(e) => updateEnv('INCLUDE_TONE', e.target.checked ? 'true' : 'false')}
                                     />
                                 </div>
                                 

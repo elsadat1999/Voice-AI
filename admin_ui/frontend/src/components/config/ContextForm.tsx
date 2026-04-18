@@ -1,7 +1,7 @@
 import { FormInput, FormSelect, FormLabel } from '../ui/FormComponents';
 import { isFullAgentProvider } from '../../utils/providerNaming';
 import { ChevronDown, ChevronRight, Search, Phone, Webhook, Lock } from 'lucide-react';
-import { useState } from 'react';
+import { useState, useMemo } from 'react';
 import HelpTooltip from '../ui/HelpTooltip';
 
 interface ContextFormProps {
@@ -37,10 +37,18 @@ const ContextForm = ({ config, providers, pipelines, availableTools, toolEnabled
         onChange({ ...config, ...patch });
     };
 
+    const matchesHttpToolPhase = (tool: any, phase: 'pre_call' | 'post_call' | 'in_call') => {
+        if (!tool || typeof tool !== 'object' || !tool.kind) return false;
+        if (phase === 'in_call') {
+            return tool.phase === 'in_call' || (!tool.phase && tool.kind === 'in_call_http_lookup');
+        }
+        return tool.phase === phase;
+    };
+
     const getHttpToolsByPhase = (phase: 'pre_call' | 'post_call' | 'in_call') => {
         if (!httpTools) return [];
         return Object.entries(httpTools)
-            .filter(([_, tool]) => tool?.phase === phase && tool?.enabled !== false)
+            .filter(([_, tool]) => matchesHttpToolPhase(tool, phase) && tool?.enabled !== false)
             .map(([name, tool]) => ({ name, ...tool }));
     };
 
@@ -118,6 +126,19 @@ const ContextForm = ({ config, providers, pipelines, availableTools, toolEnabled
         return toolEnabledMap[tool] === false;
     };
 
+    const estimatedTokens = useMemo(() => {
+        const text = config.prompt || '';
+        if (!text.trim()) return 0;
+        const words = text.trim().split(/\s+/).length;
+        return Math.round(words * 1.3);
+    }, [config.prompt]);
+
+    const tokenCountColor = useMemo(() => {
+        if (estimatedTokens >= 8000) return 'text-red-500';
+        if (estimatedTokens >= 4000) return 'text-yellow-500';
+        return 'text-muted-foreground';
+    }, [estimatedTokens]);
+
     const pipelineOptions = Object.entries(pipelines || {}).map(([name, _]: [string, any]) => ({
         value: `pipeline:${name}`,
         label: `[Pipeline] ${name}`,
@@ -174,6 +195,13 @@ const ContextForm = ({ config, providers, pipelines, availableTools, toolEnabled
                     onChange={(e) => updateConfig('prompt', e.target.value)}
                     placeholder="You are a helpful voice assistant..."
                 />
+                <div className="flex justify-end mt-1">
+                    <span className={`text-xs ${tokenCountColor}`}>
+                        ~{estimatedTokens.toLocaleString()} tokens estimated
+                        {estimatedTokens >= 8000 && ' (exceeds 8K limit)'}
+                        {estimatedTokens >= 4000 && estimatedTokens < 8000 && ' (approaching 8K limit)'}
+                    </span>
+                </div>
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">

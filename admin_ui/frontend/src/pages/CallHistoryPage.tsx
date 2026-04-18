@@ -4,10 +4,11 @@ import {
     ChevronLeft, ChevronRight, RefreshCw, X, MessageSquare,
     Wrench, AlertCircle, CheckCircle, ArrowRightLeft, PhoneOff,
     BarChart3, Users, Timer, Activity, TrendingUp, Zap, PieChart,
-    Play, Pause, Volume2, FileAudio
+    Play, Pause, Volume2, FileAudio, Search
 } from 'lucide-react';
 import axios from 'axios';
 import { toast } from 'sonner';
+import { FullscreenPanel } from '../components/ui/FullscreenPanel';
 import { useConfirmDialog } from '../hooks/useConfirmDialog';
 import { useLocation } from 'react-router-dom';
 
@@ -31,7 +32,7 @@ interface CallRecordSummary {
 
 interface CallRecordDetail extends CallRecordSummary {
     pipeline_components: Record<string, string>;
-    conversation_history: Array<{ role: string; content: string; timestamp?: string }>;
+    conversation_history: Array<{ role: string; content: string; timestamp?: number | string }>;
     transfer_destination: string | null;
     tool_calls: Array<{ name: string; params: any; result: string; message?: string; timestamp: string; duration_ms: number }>;
     max_turn_latency_ms: number;
@@ -159,6 +160,42 @@ const CallHistoryPage = () => {
     });
     const [showFilters, setShowFilters] = useState(false);
 
+    // Transcript search with debounce
+    const [transcriptSearchInput, setTranscriptSearchInput] = useState('');
+    const [transcriptSearch, setTranscriptSearch] = useState('');
+    const transcriptSearchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+    const clearTranscriptSearch = useCallback(() => {
+        if (transcriptSearchTimer.current) {
+            clearTimeout(transcriptSearchTimer.current);
+            transcriptSearchTimer.current = null;
+        }
+        setTranscriptSearchInput('');
+        setTranscriptSearch('');
+        setPage(1);
+    }, []);
+
+    const handleTranscriptSearchChange = useCallback((value: string) => {
+        setTranscriptSearchInput(value);
+        if (transcriptSearchTimer.current) clearTimeout(transcriptSearchTimer.current);
+        if (value === '') {
+            transcriptSearchTimer.current = null;
+            setTranscriptSearch('');
+            setPage(1);
+            return;
+        }
+        transcriptSearchTimer.current = setTimeout(() => {
+            setTranscriptSearch(value);
+            setPage(1);
+        }, 300);
+    }, []);
+
+    useEffect(() => {
+        return () => {
+            if (transcriptSearchTimer.current) clearTimeout(transcriptSearchTimer.current);
+        };
+    }, []);
+
     const fetchCalls = useCallback(async () => {
         try {
             setLoading(true);
@@ -173,7 +210,8 @@ const CallHistoryPage = () => {
             Object.entries(filters).forEach(([key, value]) => {
                 if (value) params[key] = value;
             });
-            
+            if (transcriptSearch) params.transcript_search = transcriptSearch;
+
             const res = await axios.get('/api/calls', { params });
             setCalls(res.data.calls);
             setTotal(res.data.total);
@@ -184,7 +222,7 @@ const CallHistoryPage = () => {
         } finally {
             setLoading(false);
         }
-    }, [page, pageSize, filters]);
+    }, [page, pageSize, filters, transcriptSearch]);
 
     const fetchStats = useCallback(async () => {
         try {
@@ -210,9 +248,15 @@ const CallHistoryPage = () => {
 
     useEffect(() => {
         fetchCalls();
+    }, [fetchCalls]);
+
+    useEffect(() => {
         fetchStats();
+    }, [fetchStats]);
+
+    useEffect(() => {
         fetchFilterOptions();
-    }, [fetchCalls, fetchStats, fetchFilterOptions]);
+    }, [fetchFilterOptions]);
 
     const cleanupAudio = useCallback(() => {
         if (audioRef.current) {
@@ -414,6 +458,7 @@ const CallHistoryPage = () => {
     };
 
     const clearFilters = () => {
+        clearTranscriptSearch();
         setFilters({
             caller_number: '',
             caller_name: '',
@@ -424,10 +469,9 @@ const CallHistoryPage = () => {
             start_date: '',
             end_date: '',
         });
-        setPage(1);
     };
 
-    const hasActiveFilters = Object.values(filters).some(v => v !== '');
+    const hasActiveFilters = Object.values(filters).some(v => v !== '') || transcriptSearch !== '';
     const modalCall = selectedCall ?? selectedCallSummary;
 
     return (
@@ -436,6 +480,27 @@ const CallHistoryPage = () => {
             <div className="flex items-center justify-between">
                 <h1 className="text-3xl font-bold">Call History</h1>
                 <div className="flex items-center gap-2">
+                    <div className="relative">
+                        <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+                        <input
+                            type="text"
+                            value={transcriptSearchInput}
+                            onChange={(e) => handleTranscriptSearchChange(e.target.value)}
+                            placeholder="Search transcripts..."
+                            aria-label="Search transcripts"
+                            className="pl-9 pr-8 py-2 bg-background border rounded-lg text-sm w-56 focus:outline-none focus:ring-1 focus:ring-ring"
+                        />
+                        {transcriptSearchInput && (
+                            <button
+                                onClick={clearTranscriptSearch}
+                                aria-label="Clear transcript search"
+                                title="Clear transcript search"
+                                className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                            >
+                                <X className="w-4 h-4" />
+                            </button>
+                        )}
+                    </div>
                     <button
                         onClick={() => setShowStats(!showStats)}
                         className={`p-2 rounded-lg border transition-colors ${showStats ? 'bg-primary text-primary-foreground' : 'hover:bg-muted'}`}
@@ -495,62 +560,64 @@ const CallHistoryPage = () => {
 
             {/* Stats Dashboard */}
             {showStats && stats && (
-                <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
-                    <div className="bg-card border rounded-lg p-4">
-                        <div className="flex items-center gap-2 text-muted-foreground text-sm">
-                            <Phone className="w-4 h-4" />
-                            Total Calls
+                <FullscreenPanel title="Call Statistics">
+                    <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
+                        <div className="bg-card border rounded-lg p-4">
+                            <div className="flex items-center gap-2 text-muted-foreground text-sm">
+                                <Phone className="w-4 h-4" />
+                                Total Calls
+                            </div>
+                            <div className="text-2xl font-bold mt-1">{stats.total_calls}</div>
                         </div>
-                        <div className="text-2xl font-bold mt-1">{stats.total_calls}</div>
+                        <div className="bg-card border rounded-lg p-4">
+                            <div className="flex items-center gap-2 text-muted-foreground text-sm">
+                                <PieChart className="w-4 h-4" />
+                                Success / Failed
+                            </div>
+                            <div className="text-2xl font-bold mt-1">
+                                {stats.outcomes?.completed || 0} / {stats.outcomes?.error || 0}
+                            </div>
+                            <div className="text-xs text-muted-foreground">
+                                {stats.total_calls > 0
+                                    ? Math.round(((stats.outcomes?.completed || 0) / stats.total_calls) * 100)
+                                    : 0}% success rate
+                            </div>
+                        </div>
+                        <div className="bg-card border rounded-lg p-4">
+                            <div className="flex items-center gap-2 text-muted-foreground text-sm">
+                                <Activity className="w-4 h-4" />
+                                Active Calls
+                            </div>
+                            <div className="text-2xl font-bold mt-1">{stats.active_calls || 0}</div>
+                        </div>
+                        <div className="bg-card border rounded-lg p-4">
+                            <div className="flex items-center gap-2 text-muted-foreground text-sm">
+                                <Timer className="w-4 h-4" />
+                                Avg Duration
+                            </div>
+                            <div className="text-2xl font-bold mt-1">{formatDuration(stats.avg_duration_seconds)}</div>
+                        </div>
+                        <div className="bg-card border rounded-lg p-4">
+                            <div className="flex items-center gap-2 text-muted-foreground text-sm">
+                                <TrendingUp className="w-4 h-4" />
+                                Top Provider
+                            </div>
+                            <div className="text-lg font-bold mt-1 truncate">
+                                {Object.entries(stats.providers || {}).sort((a, b) => b[1] - a[1])[0]?.[0] || '-'}
+                            </div>
+                        </div>
+                        <div className="bg-card border rounded-lg p-4">
+                            <div className="flex items-center gap-2 text-muted-foreground text-sm">
+                                <Wrench className="w-4 h-4" />
+                                Top Tool
+                            </div>
+                            <div className="text-lg font-bold mt-1 truncate">
+                                {Object.entries(stats.top_tools || {}).sort((a, b) => b[1] - a[1])[0]?.[0] || '-'}
+                            </div>
+                            <div className="text-xs text-muted-foreground">{stats.calls_with_tools} calls used tools</div>
+                        </div>
                     </div>
-                    <div className="bg-card border rounded-lg p-4">
-                        <div className="flex items-center gap-2 text-muted-foreground text-sm">
-                            <PieChart className="w-4 h-4" />
-                            Success / Failed
-                        </div>
-                        <div className="text-2xl font-bold mt-1">
-                            {stats.outcomes?.completed || 0} / {stats.outcomes?.error || 0}
-                        </div>
-                        <div className="text-xs text-muted-foreground">
-                            {stats.total_calls > 0 
-                                ? Math.round(((stats.outcomes?.completed || 0) / stats.total_calls) * 100) 
-                                : 0}% success rate
-                        </div>
-                    </div>
-                    <div className="bg-card border rounded-lg p-4">
-                        <div className="flex items-center gap-2 text-muted-foreground text-sm">
-                            <Activity className="w-4 h-4" />
-                            Active Calls
-                        </div>
-                        <div className="text-2xl font-bold mt-1">{stats.active_calls || 0}</div>
-                    </div>
-                    <div className="bg-card border rounded-lg p-4">
-                        <div className="flex items-center gap-2 text-muted-foreground text-sm">
-                            <Timer className="w-4 h-4" />
-                            Avg Duration
-                        </div>
-                        <div className="text-2xl font-bold mt-1">{formatDuration(stats.avg_duration_seconds)}</div>
-                    </div>
-                    <div className="bg-card border rounded-lg p-4">
-                        <div className="flex items-center gap-2 text-muted-foreground text-sm">
-                            <TrendingUp className="w-4 h-4" />
-                            Top Provider
-                        </div>
-                        <div className="text-lg font-bold mt-1 truncate">
-                            {Object.entries(stats.providers || {}).sort((a, b) => b[1] - a[1])[0]?.[0] || '-'}
-                        </div>
-                    </div>
-                    <div className="bg-card border rounded-lg p-4">
-                        <div className="flex items-center gap-2 text-muted-foreground text-sm">
-                            <Wrench className="w-4 h-4" />
-                            Top Tool
-                        </div>
-                        <div className="text-lg font-bold mt-1 truncate">
-                            {Object.entries(stats.top_tools || {}).sort((a, b) => b[1] - a[1])[0]?.[0] || '-'}
-                        </div>
-                        <div className="text-xs text-muted-foreground">{stats.calls_with_tools} calls used tools</div>
-                    </div>
-                </div>
+                </FullscreenPanel>
             )}
 
             {/* Filters Panel */}
@@ -690,7 +757,7 @@ const CallHistoryPage = () => {
 
             {/* Call List */}
             {!loading && !error && calls.length > 0 && (
-                <>
+                <FullscreenPanel title="Call History">
                     <div className="bg-card border rounded-lg overflow-x-auto">
                         <table className="w-full min-w-[1000px]">
                             <thead className="bg-muted/50">
@@ -773,7 +840,7 @@ const CallHistoryPage = () => {
                             </button>
                         </div>
                     </div>
-                </>
+                </FullscreenPanel>
             )}
 
             {/* Call Detail Modal */}
@@ -905,6 +972,12 @@ const CallHistoryPage = () => {
                                     <div className="text-sm text-muted-foreground">Avg Latency</div>
                                     <div className="font-medium">{(modalCall.avg_turn_latency_ms / 1000).toFixed(2)}s</div>
                                 </div>
+                                {selectedCall?.max_turn_latency_ms != null && (
+                                    <div>
+                                        <div className="text-sm text-muted-foreground">Max Latency</div>
+                                        <div className="font-medium">{(selectedCall.max_turn_latency_ms / 1000).toFixed(2)}s</div>
+                                    </div>
+                                )}
                                 <div>
                                     <div className="text-sm text-muted-foreground">Barge-ins</div>
                                     <div className="font-medium">{modalCall.barge_in_count}</div>
@@ -980,7 +1053,12 @@ const CallHistoryPage = () => {
                                                         <div className="text-sm">{msg.content}</div>
                                                         {msg.timestamp && (
                                                             <div className="text-xs text-muted-foreground mt-1">
-                                                                {new Date(msg.timestamp).toLocaleTimeString()}
+                                                                {(() => {
+                                                                    const raw = msg.timestamp!;
+                                                                    const n = typeof raw === 'number' ? raw : (typeof raw === 'string' && /^\d+(\.\d+)?$/.test(raw) ? Number(raw) : NaN);
+                                                                    const ms = !isNaN(n) && n < 1e12 ? n * 1000 : (!isNaN(n) ? n : raw);
+                                                                    return new Date(ms).toLocaleTimeString();
+                                                                })()}
                                                             </div>
                                                         )}
                                                     </div>

@@ -114,12 +114,49 @@ def _resolve_transfer_destination_extension(
     return ext, dict(dest), "config.transfer.destinations"
 
 
+def _allowed_configured_extensions(
+    *,
+    extensions_config: Dict[str, Any],
+    destinations: Dict[str, Any],
+) -> List[str]:
+    allowed: set[str] = set()
+
+    if isinstance(extensions_config, dict):
+        for key, cfg in extensions_config.items():
+            extension = str(key or "").strip()
+            if not _looks_like_extension_number(extension):
+                continue
+            if isinstance(cfg, dict) and cfg.get("transfer") is False:
+                continue
+            allowed.add(extension)
+
+    if isinstance(destinations, dict):
+        for cfg in destinations.values():
+            if not isinstance(cfg, dict):
+                continue
+            if str(cfg.get("type", "") or "").strip().lower() != "extension":
+                continue
+            extension = str(cfg.get("target", "") or "").strip()
+            if _looks_like_extension_number(extension):
+                allowed.add(extension)
+
+    return sorted(allowed)
+
+
+def _extract_extension_from_device_state_id(device_state_id: str) -> str:
+    raw = str(device_state_id or "").strip()
+    if "/" not in raw:
+        return ""
+    return raw.split("/", 1)[1].strip()
+
+
 def _resolve_device_state_id(
     *,
     extension: str,
     extensions_config: Dict[str, Any],
     tech: str = "",
     device_state_id: str = "",
+    default_technology: str = "",
 ) -> Tuple[str, str]:
     """
     Resolve the ARI deviceStateName to query.
@@ -167,6 +204,9 @@ def _resolve_device_state_id(
     if tech:
         return f"{tech.upper()}/{extension}", "parameter.tech"
 
+    if default_technology and _looks_like_extension_number(extension):
+        return f"{str(default_technology).upper()}/{extension}", "config.transfer.technology"
+
     return "", ""
 
 
@@ -210,6 +250,44 @@ async def _probe_endpoint(
     return resp
 
 
+async def _list_device_states(
+    *,
+    context: ToolExecutionContext,
+) -> List[Dict[str, Any]]:
+    if not context.ari_client:
+        return []
+    try:
+        resp = await context.ari_client.send_command(
+            method="GET",
+            resource="deviceStates",
+        )
+    except Exception:
+        logger.debug("ARI device states list failed", exc_info=True)
+        return []
+    if not isinstance(resp, list):
+        return []
+    return [item for item in resp if isinstance(item, dict)]
+
+
+async def _list_endpoints(
+    *,
+    context: ToolExecutionContext,
+) -> List[Dict[str, Any]]:
+    if not context.ari_client:
+        return []
+    try:
+        resp = await context.ari_client.send_command(
+            method="GET",
+            resource="endpoints",
+        )
+    except Exception:
+        logger.debug("ARI endpoints list failed", exc_info=True)
+        return []
+    if not isinstance(resp, list):
+        return []
+    return [item for item in resp if isinstance(item, dict)]
+
+
 class CheckExtensionStatusTool(Tool):
     @property
     def definition(self) -> ToolDefinition:
@@ -217,7 +295,8 @@ class CheckExtensionStatusTool(Tool):
             name="check_extension_status",
             description=(
                 "Check if an internal extension is available by querying Asterisk device state. "
-                "Use this before attempting a transfer to a live agent."
+                "Use this before attempting a transfer to a live agent. "
+                "Only check extension numbers configured under Tools unless the guardrail is explicitly disabled."
             ),
             category=ToolCategory.TELEPHONY,
             phase=ToolPhase.IN_CALL,
@@ -256,8 +335,15 @@ class CheckExtensionStatusTool(Tool):
         tech = str(parameters.get("tech", "") or "").strip()
         device_state_id = str(parameters.get("device_state_id", "") or "").strip()
 
+        tool_cfg = context.get_config_value("tools.check_extension_status", {}) or {}
         extensions_cfg = context.get_config_value("tools.extensions.internal", {}) or {}
         transfer_destinations = context.get_config_value("tools.transfer.destinations", {}) or {}
+        transfer_cfg = context.get_config_value("tools.transfer", {}) or {}
+        restrict_to_configured = bool(tool_cfg.get("restrict_to_configured_extensions", True))
+        allowed_extensions = _allowed_configured_extensions(
+            extensions_config=extensions_cfg,
+            destinations=transfer_destinations,
+        )
 
         # Resolve what the caller/model provided into a real extension number.
         resolved_ext = ""
@@ -283,12 +369,96 @@ class CheckExtensionStatusTool(Tool):
 
         extension = resolved_ext or target
 
+        if restrict_to_configured:
+            normalized_extension = str(extension or "").strip()
+            extension_for_guardrail = normalized_extension
+            if device_state_id:
+                extracted_extension = _extract_extension_from_device_state_id(device_state_id)
+                if extracted_extension:
+                    extension_for_guardrail = extracted_extension
+
+            if not allowed_extensions:
+                logger.warning(
+                    "Blocked status check because no configured extensions are available",
+                    call_id=context.call_id,
+                    requested_extension=target,
+                    device_state_id=device_state_id,
+                )
+                return {
+                    "status": "failed",
+                    "message": "No configured extensions are available for status checks.",
+                    "extension": extension_for_guardrail or normalized_extension or target,
+                    "available": False,
+                    "guardrail_blocked": True,
+                    "allowed_extensions": allowed_extensions,
+                }
+
+            if _looks_like_extension_number(extension_for_guardrail) and extension_for_guardrail not in allowed_extensions:
+                logger.warning(
+                    "Blocked status check for unconfigured extension",
+                    call_id=context.call_id,
+                    requested_extension=target,
+                    resolved_extension=extension_for_guardrail,
+                    device_state_id=device_state_id or None,
+                    allowed_extensions=allowed_extensions,
+                )
+                return {
+                    "status": "failed",
+                    "message": (
+                        f"Extension {extension_for_guardrail} is not configured. "
+                        f"Allowed extensions: {', '.join(allowed_extensions)}."
+                    ),
+                    "extension": extension_for_guardrail,
+                    "available": False,
+                    "guardrail_blocked": True,
+                    "allowed_extensions": allowed_extensions,
+                }
+            if device_state_id and not _looks_like_extension_number(extension_for_guardrail):
+                logger.warning(
+                    "Blocked status check for non-numeric device_state_id while configured-only guardrail is enabled",
+                    call_id=context.call_id,
+                    requested_extension=target,
+                    device_state_id=device_state_id,
+                    allowed_extensions=allowed_extensions,
+                )
+                return {
+                    "status": "failed",
+                    "message": (
+                        f"Device state id '{device_state_id}' is not allowed. "
+                        f"Allowed extensions: {', '.join(allowed_extensions)}."
+                    ),
+                    "extension": extension_for_guardrail or normalized_extension or target,
+                    "available": False,
+                    "guardrail_blocked": True,
+                    "allowed_extensions": allowed_extensions,
+                }
+            if not device_state_id and not resolved_ext and not _looks_like_extension_number(normalized_extension):
+                logger.warning(
+                    "Blocked status check for unresolved configured-only target",
+                    call_id=context.call_id,
+                    requested_extension=target,
+                    resolved_extension=normalized_extension,
+                    allowed_extensions=allowed_extensions,
+                )
+                return {
+                    "status": "failed",
+                    "message": (
+                        f"Extension target '{normalized_extension or target}' is not configured. "
+                        f"Allowed extensions: {', '.join(allowed_extensions)}."
+                    ),
+                    "extension": normalized_extension or target,
+                    "available": False,
+                    "guardrail_blocked": True,
+                    "allowed_extensions": allowed_extensions,
+                }
+
         # Resolve device_state_id/tech using config + parameters.
         resolved_id, source = _resolve_device_state_id(
             extension=extension,
             extensions_config=extensions_cfg,
             tech=tech,
             device_state_id=device_state_id,
+            default_technology=str((transfer_cfg or {}).get("technology", "") or "").strip(),
         )
 
         # If not resolvable via config/params, attempt auto-tech detection via ARI endpoints.
@@ -324,6 +494,17 @@ class CheckExtensionStatusTool(Tool):
                 if endpoint:
                     endpoint_info = endpoint
                     used_tech = inferred_tech
+                else:
+                    for item in await _list_endpoints(context=context):
+                        if (
+                            str(item.get("technology", "") or "").upper() == inferred_tech.upper()
+                            and str(item.get("resource", "") or "") == extension
+                        ):
+                            endpoint_info = item
+                            used_tech = inferred_tech
+                            if not source:
+                                source = "ari.endpoints.list"
+                            break
 
         if not resolved_id and not endpoint_info:
             logger.warning(
@@ -356,13 +537,21 @@ class CheckExtensionStatusTool(Tool):
         except Exception as exc:
             device_state_error = str(exc)
             logger.warning(
-                "ARI device state query failed; will fall back to endpoint state if available",
+                "ARI device state query failed; will fall back to list lookup if available",
                 call_id=context.call_id,
                 target=target,
                 extension=extension,
                 device_state_id=resolved_id,
                 error=device_state_error,
             )
+
+        if encoded and (not isinstance(device_state_resp, dict) or "state" not in device_state_resp):
+            for item in await _list_device_states(context=context):
+                if str(item.get("name", "") or "") == resolved_id:
+                    device_state_resp = item
+                    if not source:
+                        source = "ari.deviceStates.list"
+                    break
 
         # Common ARI response: {"name":"PJSIP/2765","state":"NOT_INUSE"}
         state = ""
@@ -396,6 +585,11 @@ class CheckExtensionStatusTool(Tool):
                             exc_info=True,
                         )
                         continue
+                    if not isinstance(candidate_resp, dict) or "state" not in candidate_resp:
+                        for item in await _list_device_states(context=context):
+                            if str(item.get("name", "") or "") == candidate_id:
+                                candidate_resp = item
+                                break
                     if isinstance(candidate_resp, dict):
                         cstate = str(candidate_resp.get("state", "") or "").strip().upper()
                         if cstate and cstate != "INVALID":

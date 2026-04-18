@@ -146,12 +146,19 @@ class SwitchModelRequest(BaseModel):
     model_path: Optional[str] = None  # For models with paths
     voice: Optional[str] = None  # For Kokoro TTS
     language: Optional[str] = None  # For Kroko STT
+    faster_whisper_language: Optional[str] = None  # Language code for Faster-Whisper (e.g., en, ru)
+    whisper_cpp_language: Optional[str] = None  # Language code for Whisper.cpp (e.g., en, ru)
+    tone_model_path: Optional[str] = None
+    tone_decoder_type: Optional[str] = None  # beam_search | greedy
+    tone_kenlm_path: Optional[str] = None
     # Kroko embedded tuning (optional)
     kroko_embedded: Optional[bool] = None
     kroko_port: Optional[int] = None
     kroko_url: Optional[str] = None
     # Sherpa explicit path (optional; preferred over model_path)
     sherpa_model_path: Optional[str] = None
+    sherpa_model_type: Optional[str] = None  # online (streaming) | offline (VAD-gated)
+    sherpa_vad_model_path: Optional[str] = None  # Required when sherpa_model_type=offline
     # Whisper.cpp explicit path (optional; preferred over model_path)
     whisper_cpp_model_path: Optional[str] = None
     # Kokoro mode/model controls (optional)
@@ -160,6 +167,10 @@ class SwitchModelRequest(BaseModel):
     kokoro_api_base_url: Optional[str] = None
     kokoro_api_key: Optional[str] = None
     kokoro_api_model: Optional[str] = None
+    # Silero TTS controls (optional)
+    silero_speaker: Optional[str] = None
+    silero_language: Optional[str] = None
+    silero_model_id: Optional[str] = None
     # LLM tuning (optional)
     llm_context: Optional[int] = None
     llm_max_tokens: Optional[int] = None
@@ -269,15 +280,38 @@ def _build_local_ai_env_and_yaml_updates(request: SwitchModelRequest) -> tuple[D
                 if sherpa_path:
                     env_updates["SHERPA_MODEL_PATH"] = sherpa_path
                     yaml_updates["sherpa_model_path"] = sherpa_path
+                if request.sherpa_model_type:
+                    env_updates["SHERPA_MODEL_TYPE"] = request.sherpa_model_type
+                    yaml_updates["sherpa_model_type"] = request.sherpa_model_type
+                if request.sherpa_vad_model_path:
+                    env_updates["SHERPA_VAD_MODEL_PATH"] = request.sherpa_vad_model_path
+                    yaml_updates["sherpa_vad_model_path"] = request.sherpa_vad_model_path
             elif request.backend == "whisper_cpp":
                 whisper_path = request.whisper_cpp_model_path or request.model_path
                 if whisper_path:
                     env_updates["WHISPER_CPP_MODEL_PATH"] = whisper_path
                     yaml_updates["whisper_cpp_model_path"] = whisper_path
+                if request.whisper_cpp_language:
+                    env_updates["WHISPER_CPP_LANGUAGE"] = request.whisper_cpp_language
+                    yaml_updates["whisper_cpp_language"] = request.whisper_cpp_language
+            elif request.backend == "tone":
+                tone_path = request.tone_model_path or request.model_path
+                if tone_path:
+                    env_updates["TONE_MODEL_PATH"] = tone_path
+                    yaml_updates["tone_model_path"] = tone_path
+                if request.tone_decoder_type:
+                    env_updates["TONE_DECODER_TYPE"] = request.tone_decoder_type
+                    yaml_updates["tone_decoder_type"] = request.tone_decoder_type
+                if request.tone_kenlm_path:
+                    env_updates["TONE_KENLM_PATH"] = request.tone_kenlm_path
+                    yaml_updates["tone_kenlm_path"] = request.tone_kenlm_path
             elif request.backend == "faster_whisper":
                 if request.model_path:
                     env_updates["FASTER_WHISPER_MODEL"] = request.model_path
                     yaml_updates["stt_model"] = request.model_path
+                if request.faster_whisper_language:
+                    env_updates["FASTER_WHISPER_LANGUAGE"] = request.faster_whisper_language
+                    yaml_updates["faster_whisper_language"] = request.faster_whisper_language
 
     elif request.model_type == "tts":
         if request.backend:
@@ -291,6 +325,21 @@ def _build_local_ai_env_and_yaml_updates(request: SwitchModelRequest) -> tuple[D
                 if request.model_path:
                     env_updates["MELOTTS_VOICE"] = request.model_path
                     yaml_updates["tts_voice"] = request.model_path
+            elif request.backend == "silero":
+                if request.silero_speaker:
+                    env_updates["SILERO_SPEAKER"] = request.silero_speaker
+                    yaml_updates["silero_speaker"] = request.silero_speaker
+                if request.silero_language:
+                    env_updates["SILERO_LANGUAGE"] = request.silero_language
+                    yaml_updates["silero_language"] = request.silero_language
+                if request.silero_model_id:
+                    env_updates["SILERO_MODEL_ID"] = request.silero_model_id
+                    yaml_updates["silero_model_id"] = request.silero_model_id
+                # SILERO_MODEL_PATH is the torch.hub cache directory, not the
+                # speaker:model_id path from the dropdown. Only set if explicitly
+                # provided as a real filesystem path.
+                if request.model_path and request.model_path.startswith("/"):
+                    env_updates["SILERO_MODEL_PATH"] = request.model_path
             elif request.backend == "kokoro":
                 if request.kokoro_mode:
                     env_updates["KOKORO_MODE"] = request.kokoro_mode
@@ -310,6 +359,25 @@ def _build_local_ai_env_and_yaml_updates(request: SwitchModelRequest) -> tuple[D
                 if kokoro_model_path:
                     env_updates["KOKORO_MODEL_PATH"] = kokoro_model_path
                     yaml_updates["kokoro_model_path"] = kokoro_model_path
+            elif request.backend == "matcha":
+                if request.model_path:
+                    env_updates["MATCHA_MODEL_PATH"] = request.model_path
+                    yaml_updates["matcha_model_path"] = request.model_path
+                    # Auto-detect vocoder in the same directory
+                    model_dir = os.path.dirname(request.model_path)
+                    for voc_name in ("hifigan_v2.onnx", "vocos.onnx"):
+                        voc_path = os.path.join(model_dir, voc_name)
+                        if os.path.isfile(voc_path):
+                            env_updates["MATCHA_VOCODER_PATH"] = voc_path
+                            yaml_updates["matcha_vocoder_path"] = voc_path
+                            break
+                    else:
+                        # Fallback: assume hifigan_v2 (container path)
+                        fallback_voc = os.path.join(
+                            os.path.dirname(request.model_path), "hifigan_v2.onnx"
+                        )
+                        env_updates["MATCHA_VOCODER_PATH"] = fallback_voc
+                        yaml_updates["matcha_vocoder_path"] = fallback_voc
 
     elif request.model_type == "llm":
         if request.model_path:
@@ -341,12 +409,29 @@ def _build_local_ai_ws_switch_payload(request: SwitchModelRequest) -> Optional[D
             sherpa_path = request.sherpa_model_path or request.model_path
             if sherpa_path:
                 payload["sherpa_model_path"] = sherpa_path
+            if request.sherpa_model_type:
+                payload["sherpa_model_type"] = request.sherpa_model_type
+            if request.sherpa_vad_model_path:
+                payload["sherpa_vad_model_path"] = request.sherpa_vad_model_path
         if request.backend == "whisper_cpp":
             whisper_path = request.whisper_cpp_model_path or request.model_path
             if whisper_path:
                 payload["stt_model_path"] = whisper_path
-        if request.backend == "faster_whisper" and request.model_path:
-            payload["stt_config"] = {"model": request.model_path}
+            if request.whisper_cpp_language:
+                payload["whisper_cpp_language"] = request.whisper_cpp_language
+        if request.backend == "tone":
+            tone_path = request.tone_model_path or request.model_path
+            if tone_path:
+                payload["tone_model_path"] = tone_path
+            if request.tone_decoder_type:
+                payload["tone_decoder_type"] = request.tone_decoder_type
+            if request.tone_kenlm_path:
+                payload["tone_kenlm_path"] = request.tone_kenlm_path
+        if request.backend == "faster_whisper":
+            if request.model_path:
+                payload["stt_config"] = {"model": request.model_path}
+            if request.faster_whisper_language:
+                payload["faster_whisper_language"] = request.faster_whisper_language
         if request.backend == "kroko":
             effective_embedded = _infer_kroko_embedded(
                 backend="kroko",
@@ -371,6 +456,18 @@ def _build_local_ai_ws_switch_payload(request: SwitchModelRequest) -> Optional[D
         payload["tts_model_path"] = request.model_path
     if request.backend == "melotts" and request.model_path:
         payload["tts_config"] = {"voice": request.model_path}
+    if request.backend == "silero":
+        if request.silero_speaker:
+            payload["silero_speaker"] = request.silero_speaker
+        if request.silero_language:
+            payload["silero_language"] = request.silero_language
+        if request.silero_model_id:
+            payload["silero_model_id"] = request.silero_model_id
+        # Only send silero_model_path if it's a real filesystem path.
+        # The dropdown value (e.g. "xenia:v3_1_ru") is NOT a path —
+        # sending it would corrupt torch.hub.set_dir().
+        if request.model_path and request.model_path.startswith("/"):
+            payload["silero_model_path"] = request.model_path
     if request.backend == "kokoro":
         if request.voice:
             payload["kokoro_voice"] = request.voice
@@ -385,6 +482,18 @@ def _build_local_ai_ws_switch_payload(request: SwitchModelRequest) -> Optional[D
             payload["kokoro_api_key"] = request.kokoro_api_key
         if request.kokoro_api_model:
             payload["kokoro_api_model"] = request.kokoro_api_model
+    if request.backend == "matcha":
+        if request.model_path:
+            payload["matcha_model_path"] = request.model_path
+            # Auto-detect vocoder in the same directory (check existence)
+            model_dir = os.path.dirname(request.model_path)
+            voc_resolved = None
+            for voc_name in ("hifigan_v2.onnx", "vocos.onnx"):
+                voc_path = os.path.join(model_dir, voc_name)
+                if os.path.isfile(voc_path):
+                    voc_resolved = voc_path
+                    break
+            payload["matcha_vocoder_path"] = voc_resolved or os.path.join(model_dir, "hifigan_v2.onnx")
     return payload
 
 
@@ -428,13 +537,16 @@ async def list_available_models():
         "vosk": [],
         "sherpa": [],
         "kroko": [],
+        "tone": [],
         "faster_whisper": [],
         "whisper_cpp": [],
     }
     tts_models: Dict[str, List[ModelInfo]] = {
         "piper": [],
         "kokoro": [],
-        "melotts": []
+        "melotts": [],
+        "silero": [],
+        "matcha": []
     }
     llm_models: List[ModelInfo] = []
     
@@ -460,6 +572,15 @@ async def list_available_models():
                         path=f"/app/models/stt/{item}",
                         type="stt",
                         backend="sherpa",
+                        size_mb=get_dir_size_mb(item_path)
+                    ))
+                elif item.lower() in {"t-one", "tone"} or item.lower().startswith("t-one"):
+                    stt_models["tone"].append(ModelInfo(
+                        id=f"tone_{item}",
+                        name=f"T-one ({item})",
+                        path=f"/app/models/stt/{item}",
+                        type="stt",
+                        backend="tone",
                         size_mb=get_dir_size_mb(item_path)
                     ))
                 elif "kroko" in item.lower():
@@ -529,7 +650,7 @@ async def list_available_models():
                         if voice.endswith(".pt"):
                             voice_name = voice.replace(".pt", "")
                             voice_files[voice_name] = voice
-                            
+
                 tts_models["kokoro"].append(ModelInfo(
                     id="kokoro_82m",
                     name="Kokoro v0.19 (82M)",
@@ -539,7 +660,46 @@ async def list_available_models():
                     size_mb=get_dir_size_mb(item_path),
                     voice_files=voice_files
                 ))
+
+    # Silero models are virtual (auto-downloaded via torch.hub at runtime),
+    # so populate from catalog instead of filesystem scanning.
+    # Path format: "<speaker>:<model_id>" — no "silero:" prefix since
+    # the dropdown value is already "silero:<path>" via parseSelection().
+    from api.models_catalog import SILERO_TTS_MODELS
+    for entry in SILERO_TTS_MODELS:
+        tts_models["silero"].append(ModelInfo(
+            id=entry["id"],
+            name=entry["name"],
+            path=f"{entry['speaker']}:{entry.get('silero_model_id', 'v3_1_ru')}",
+            type="tts",
+            backend="silero",
+            size_mb=entry.get("size_mb", 100),
+        ))
     
+    # Scan Matcha TTS models (directories matching matcha-icefall-*)
+    if os.path.exists(tts_dir):
+        for item in os.listdir(tts_dir):
+            item_path = os.path.join(tts_dir, item)
+            if os.path.isdir(item_path) and item.startswith("matcha-icefall-"):
+                # Find the acoustic model ONNX file
+                model_onnx = None
+                for f in os.listdir(item_path):
+                    if f.endswith(".onnx") and "model" in f.lower():
+                        model_onnx = f
+                        break
+                if model_onnx:
+                    from api.models_catalog import MATCHA_TTS_MODELS
+                    catalog_match = next((m for m in MATCHA_TTS_MODELS if m.get("path", "").endswith(item)), None)
+                    display_name = catalog_match["name"] if catalog_match else f"Matcha ({item})"
+                    tts_models["matcha"].append(ModelInfo(
+                        id=f"matcha_{item}",
+                        name=display_name,
+                        path=f"/app/models/tts/{item}/{model_onnx}",
+                        type="tts",
+                        backend="matcha",
+                        size_mb=get_dir_size_mb(item_path)
+                    ))
+
     # Scan LLM models — enrich with chat_format from catalog
     from api.models_catalog import LLM_MODELS as _LLM_CATALOG
     _catalog_by_path = {m.get("model_path", ""): m for m in _LLM_CATALOG if m.get("model_path")}
@@ -588,13 +748,15 @@ async def get_backend_capabilities():
             "sherpa": {"available": False, "reason": ""},
             "kroko_embedded": {"available": False, "reason": ""},
             "kroko_cloud": {"available": True, "reason": "Cloud API (requires KROKO_API_KEY)"},
+            "tone": {"available": False, "reason": ""},
             "faster_whisper": {"available": False, "reason": ""},
             "whisper_cpp": {"available": False, "reason": ""},
         },
         "tts": {
             "piper": {"available": False, "reason": ""},
             "kokoro": {"available": False, "reason": ""},
-            "melotts": {"available": False, "reason": ""}
+            "melotts": {"available": False, "reason": ""},
+            "silero": {"available": False, "reason": ""}
         },
         "llm": {"available": False, "reason": ""}
     }
@@ -630,6 +792,10 @@ async def get_backend_capabilities():
                     capabilities["stt"]["kroko_embedded"] = {"available": True, "reason": "Kroko binary installed"}
                 else:
                     capabilities["stt"]["kroko_embedded"]["reason"] = "Rebuild with INCLUDE_KROKO_EMBEDDED=true"
+                if server_caps.get("tone"):
+                    capabilities["stt"]["tone"] = {"available": True, "reason": "T-one installed"}
+                else:
+                    capabilities["stt"]["tone"]["reason"] = "Rebuild with INCLUDE_TONE=true"
                 if server_caps.get("faster_whisper"):
                     capabilities["stt"]["faster_whisper"] = {"available": True, "reason": "Faster-Whisper installed"}
                 else:
@@ -648,7 +814,11 @@ async def get_backend_capabilities():
                     capabilities["tts"]["melotts"] = {"available": True, "reason": "MeloTTS installed"}
                 else:
                     capabilities["tts"]["melotts"]["reason"] = "Rebuild with INCLUDE_MELOTTS=true"
-                
+                if server_caps.get("silero"):
+                    capabilities["tts"]["silero"] = {"available": True, "reason": "Silero TTS installed"}
+                else:
+                    capabilities["tts"]["silero"]["reason"] = "Rebuild with INCLUDE_SILERO=true"
+
                 # LLM
                 if server_caps.get("llama"):
                     capabilities["llm"] = {"available": True, "reason": "llama-cpp-python installed"}
@@ -842,6 +1012,9 @@ async def switch_model(request: SwitchModelRequest):
             if request.backend == "whisper_cpp":
                 expected = request.whisper_cpp_model_path or request.model_path
                 return (not expected) or stt.get("path") == expected
+            if request.backend == "tone":
+                expected = request.tone_model_path or request.model_path
+                return (not expected) or stt.get("path") == expected
             if request.backend == "kroko":
                 if request.kroko_embedded is not None and bool(kroko.get("embedded")) != bool(request.kroko_embedded):
                     return False
@@ -865,6 +1038,15 @@ async def switch_model(request: SwitchModelRequest):
                 return tts.get("path") == request.model_path
             if request.backend == "melotts" and request.model_path:
                 return tts.get("path") == request.model_path
+            if request.backend == "silero":
+                silero = data.get("silero") or {}
+                if request.silero_speaker and silero.get("speaker") != request.silero_speaker:
+                    return False
+                if request.silero_language and silero.get("language") != request.silero_language:
+                    return False
+                if request.silero_model_id and silero.get("model_id") != request.silero_model_id:
+                    return False
+                return True
             if request.backend == "kokoro":
                 if request.kokoro_mode and (kokoro.get("mode") or "").lower() != request.kokoro_mode.lower():
                     return False
@@ -920,9 +1102,14 @@ async def switch_model(request: SwitchModelRequest):
         "LOCAL_STT_BACKEND", "LOCAL_STT_MODEL_PATH", "SHERPA_MODEL_PATH", "WHISPER_CPP_MODEL_PATH",
         "KROKO_LANGUAGE", "KROKO_EMBEDDED", "KROKO_PORT", "KROKO_URL", "KROKO_MODEL_PATH",
         "LOCAL_TTS_BACKEND", "LOCAL_TTS_MODEL_PATH",
+        "SILERO_SPEAKER", "SILERO_LANGUAGE", "SILERO_MODEL_ID", "SILERO_SAMPLE_RATE", "SILERO_MODEL_PATH",
         "KOKORO_MODE", "KOKORO_VOICE", "KOKORO_MODEL_PATH",
         "KOKORO_API_BASE_URL", "KOKORO_API_KEY", "KOKORO_API_MODEL",
+        "MATCHA_MODEL_PATH", "MATCHA_VOCODER_PATH",
         "MELOTTS_VOICE", "MELOTTS_DEVICE", "FASTER_WHISPER_MODEL", "FASTER_WHISPER_DEVICE",
+        "TONE_MODEL_PATH", "TONE_DECODER_TYPE", "TONE_KENLM_PATH",
+        "SHERPA_MODEL_TYPE", "SHERPA_VAD_MODEL_PATH",
+        "FASTER_WHISPER_LANGUAGE", "WHISPER_CPP_LANGUAGE",
         "LOCAL_LLM_MODEL_PATH", "LOCAL_LLM_CONTEXT", "LOCAL_LLM_MAX_TOKENS", "GPU_AVAILABLE"
     ])
 
@@ -1205,11 +1392,16 @@ class RebuildRequest(BaseModel):
     include_whisper_cpp: bool = False
     include_melotts: bool = False
     include_kroko_embedded: bool = False
+    include_tone: bool = False
+    include_silero: Optional[bool] = None
     # STT/TTS config to apply after rebuild
     stt_backend: Optional[str] = None
     stt_model: Optional[str] = None
     tts_backend: Optional[str] = None
     tts_voice: Optional[str] = None
+    silero_speaker: Optional[str] = None
+    silero_language: Optional[str] = None
+    silero_model_id: Optional[str] = None
 
 
 class RebuildResponse(BaseModel):
@@ -1252,7 +1444,13 @@ async def rebuild_local_ai_server(request: RebuildRequest):
         if sha:
             build_args.append("--build-arg")
             build_args.append(f"KROKO_SERVER_SHA256={sha}")
-    
+    if request.include_tone:
+        build_args.append("--build-arg")
+        build_args.append("INCLUDE_TONE=true")
+    if request.include_silero:
+        build_args.append("--build-arg")
+        build_args.append("INCLUDE_SILERO=true")
+
     if not build_args:
         return RebuildResponse(
             success=False,
@@ -1281,7 +1479,11 @@ async def rebuild_local_ai_server(request: RebuildRequest):
         env_updates["INCLUDE_MELOTTS"] = "true"
     if request.include_kroko_embedded:
         env_updates["INCLUDE_KROKO_EMBEDDED"] = "true"
-    
+    if request.include_tone:
+        env_updates["INCLUDE_TONE"] = "true"
+    if request.include_silero:
+        env_updates["INCLUDE_SILERO"] = "true"
+
     if request.stt_backend:
         env_updates["LOCAL_STT_BACKEND"] = request.stt_backend
         if request.stt_model:
@@ -1294,6 +1496,8 @@ async def rebuild_local_ai_server(request: RebuildRequest):
                 env_updates["KROKO_MODEL_PATH"] = request.stt_model
             elif request.stt_backend == "sherpa":
                 env_updates["SHERPA_MODEL_PATH"] = request.stt_model
+            elif request.stt_backend == "tone":
+                env_updates["TONE_MODEL_PATH"] = request.stt_model
             elif request.stt_backend == "vosk":
                 env_updates["LOCAL_STT_MODEL_PATH"] = request.stt_model
 
@@ -1312,7 +1516,15 @@ async def rebuild_local_ai_server(request: RebuildRequest):
                     env_updates["KOKORO_VOICE"] = (previous_env.get("KOKORO_VOICE") or "af_heart").strip() or "af_heart"
                 else:
                     env_updates["KOKORO_VOICE"] = request.tts_voice
-    
+            elif request.tts_backend == "silero":
+                if request.silero_speaker:
+                    env_updates["SILERO_SPEAKER"] = request.silero_speaker
+                if request.silero_language:
+                    env_updates["SILERO_LANGUAGE"] = request.silero_language
+                if request.silero_model_id:
+                    env_updates["SILERO_MODEL_ID"] = request.silero_model_id
+                env_updates["INCLUDE_SILERO"] = "true"
+
     if env_updates:
         _update_env_file(env_file, env_updates)
     

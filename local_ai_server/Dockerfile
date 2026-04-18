@@ -11,9 +11,11 @@ ARG INCLUDE_VOSK=true
 ARG INCLUDE_SHERPA=true
 ARG INCLUDE_FASTER_WHISPER=false
 ARG INCLUDE_WHISPER_CPP=false
+ARG INCLUDE_TONE=false
 ARG INCLUDE_PIPER=true
 ARG INCLUDE_KOKORO=true
 ARG INCLUDE_MELOTTS=false
+ARG INCLUDE_SILERO=false
 ARG INCLUDE_LLAMA=true
 ARG MELOTTS_GIT_REF=209145371cff8fc3bd60d7be902ea69cbdb7965a
 
@@ -22,7 +24,7 @@ WORKDIR /usr/src/app
 # Some optional backends require native builds (e.g., llama-cpp-python) or git installs (MeloTTS).
 # Install build tooling only when those backends are enabled to keep CI "ci-min" builds lean.
 RUN apt-get -o Acquire::Retries=5 update && \
-    if [ "$INCLUDE_LLAMA" = "true" ] || [ "$INCLUDE_MELOTTS" = "true" ] || [ "$INCLUDE_WHISPER_CPP" = "true" ]; then \
+    if [ "$INCLUDE_LLAMA" = "true" ] || [ "$INCLUDE_MELOTTS" = "true" ] || [ "$INCLUDE_WHISPER_CPP" = "true" ] || [ "$INCLUDE_TONE" = "true" ]; then \
         apt-get install -y --no-install-recommends \
             build-essential \
             cmake \
@@ -51,7 +53,7 @@ RUN if [ "$INCLUDE_VOSK" = "true" ]; then \
 
 RUN if [ "$INCLUDE_SHERPA" = "true" ]; then \
         echo "📦 Installing Sherpa-ONNX STT..." && \
-        pip install --no-cache-dir sherpa-onnx==1.12.19; \
+        pip install --no-cache-dir sherpa-onnx==1.12.38; \
     fi
 
 RUN if [ "$INCLUDE_FASTER_WHISPER" = "true" ]; then \
@@ -62,6 +64,11 @@ RUN if [ "$INCLUDE_FASTER_WHISPER" = "true" ]; then \
 RUN if [ "$INCLUDE_WHISPER_CPP" = "true" ]; then \
         echo "📦 Installing Whisper.cpp (pywhispercpp)..." && \
         pip install --no-cache-dir pywhispercpp==1.2.0; \
+    fi
+
+RUN if [ "$INCLUDE_TONE" = "true" ]; then \
+        echo "📦 Installing T-one STT..." && \
+        pip install --no-cache-dir "git+https://github.com/voicekit-team/T-one.git@3c5b6c015038173840e62cea99e10cdb1c759116#egg=tone"; \
     fi
 
 RUN if [ "$INCLUDE_PIPER" = "true" ]; then \
@@ -91,6 +98,20 @@ RUN if [ "$INCLUDE_MELOTTS" = "true" ]; then \
         echo "📦 Pre-downloading MeloTTS BERT model (best effort)..." && \
         python -c "from transformers import AutoTokenizer; AutoTokenizer.from_pretrained('bert-base-uncased')" || true && \
         python -c "from melo.api import TTS; print('MeloTTS package ready')"; \
+    fi
+
+# Ensure cache dir exists so COPY --from=builder never fails
+RUN mkdir -p /opt/silero-cache
+
+RUN if [ "$INCLUDE_SILERO" = "true" ]; then \
+        echo "📦 Installing Silero TTS dependencies..." && \
+        if ! python -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('torch') else 1)"; then \
+            pip install --no-cache-dir torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu; \
+        fi && \
+        pip install --no-cache-dir omegaconf && \
+        echo "📦 Pre-caching Silero Russian model (best effort)..." && \
+        python -c "import torch; torch.hub.set_dir('/opt/silero-cache'); torch.hub.load('snakers4/silero-models:v5.5', 'silero_tts', language='ru', speaker='v3_1_ru', trust_repo=True)" || true && \
+        echo "✅ Silero TTS ready"; \
     fi
 
 RUN if [ "$INCLUDE_LLAMA" = "true" ]; then \
@@ -179,6 +200,7 @@ USER appuser
 
 # Copy the virtual environment from builder
 COPY --from=builder /opt/venv /opt/venv
+COPY --from=builder --chown=appuser:appuser /opt/silero-cache /app/models/tts/silero
 
 # Copy application source code
 COPY --chown=appuser:appuser . .

@@ -28,7 +28,7 @@ from services.fs import upsert_env_vars, atomic_write_text
 from api.models_catalog import (
     get_full_catalog, get_models_by_language, get_available_languages,
     LANGUAGE_NAMES, REGION_NAMES, VOSK_STT_MODELS, SHERPA_STT_MODELS,
-    KROKO_STT_MODELS, PIPER_TTS_MODELS, KOKORO_TTS_MODELS, LLM_MODELS
+    KROKO_STT_MODELS, PIPER_TTS_MODELS, KOKORO_TTS_MODELS, SILERO_TTS_MODELS, LLM_MODELS
 )
 from api.rebuild_jobs import (
     start_rebuild_job, get_rebuild_job, get_enabled_backends,
@@ -1118,10 +1118,13 @@ async def get_available_models(language: Optional[str] = None):
             system_recommended = False
             if category == "llm":
                 model_id = model.get("id")
-                if model_id == "tinyllama":
+                if model_id == "qwen25_1_5b":
+                    # Best CPU voice model: fast inference, reliable tool calling
+                    system_recommended = meets_ram and cpu_cores >= 4
+                elif model_id == "tinyllama":
                     system_recommended = meets_ram and cpu_cores >= 2
                 elif model_id == "phi3_mini":
-                    system_recommended = meets_ram and cpu_cores >= 4
+                    system_recommended = meets_ram and cpu_cores >= 4 and gpu_detected
                 elif model_id == "llama32_3b":
                     system_recommended = meets_ram and (gpu_detected or cpu_cores >= 6)
                 elif model_id == "mistral_7b_instruct":
@@ -1327,6 +1330,7 @@ class SingleModelDownload(BaseModel):
     model_path: Optional[str] = None
     config_url: Optional[str] = None  # For TTS models that need JSON config
     voice_files: Optional[Dict[str, str]] = None  # For Kokoro TTS voice files
+    vocoder_url: Optional[str] = None  # For Matcha TTS vocoder
     expected_sha256: Optional[str] = None  # Optional integrity check
 
 
@@ -1467,6 +1471,27 @@ async def download_single_model(request: SingleModelDownload):
                 # Clean up archive file after extraction
                 os.remove(temp_file)
                 _job_output(job.id, "🧹 Cleaned up archive file")
+
+                # Download vocoder for Matcha TTS models
+                if request.vocoder_url and request.type == "tts":
+                    # Security: only allow https:// URLs for vocoder downloads
+                    if not request.vocoder_url.startswith(("https://", "http://")):
+                        _job_output(job.id, f"⚠️ Vocoder URL rejected (invalid scheme): {request.vocoder_url}")
+                    else:
+                        vocoder_dir = os.path.join(target_dir, root_folder) if root_folder else target_dir
+                        vocoder_filename = os.path.basename(request.vocoder_url)
+                        vocoder_dest = os.path.join(vocoder_dir, vocoder_filename)
+                        _job_output(job.id, f"📥 Downloading vocoder: {vocoder_filename}...")
+                        try:
+                            tmp_voc = vocoder_dest + f".{uuid.uuid4().hex}.part"
+                            urllib.request.urlretrieve(request.vocoder_url, tmp_voc)
+                            voc_sha = _sha256_file(tmp_voc)
+                            shutil.move(tmp_voc, vocoder_dest)
+                            _write_sha256_sidecar(vocoder_dest, voc_sha)
+                            _job_output(job.id, f"✅ Vocoder saved to {vocoder_dest}")
+                        except Exception as voc_err:
+                            _job_output(job.id, f"❌ Vocoder download failed: {voc_err}")
+                            _job_output(job.id, "⚠️ Matcha TTS may not work without vocoder")
             else:
                 # Single file - rename to model_path or keep original name
                 # Special handling for Kokoro which uses a directory structure
@@ -1570,6 +1595,9 @@ class ModelSelection(BaseModel):
     kokoro_voice: Optional[str] = "af_heart"
     kokoro_api_base_url: Optional[str] = None
     kokoro_api_key: Optional[str] = None
+    # Silero TTS
+    silero_speaker: Optional[str] = "xenia"
+    silero_language: Optional[str] = "ru"
     # Local Hybrid support: download/apply only STT/TTS (skip LLM model download/config)
     skip_llm_download: Optional[bool] = False
     # New fields for exact model selection
@@ -1944,11 +1972,14 @@ async def download_selected_models(selection: ModelSelection):
             _BACKEND_TO_INCLUDE = {
                 "faster_whisper": "INCLUDE_FASTER_WHISPER",
                 "whisper_cpp":    "INCLUDE_WHISPER_CPP",
+                "tone":           "INCLUDE_TONE",
                 "melotts":        "INCLUDE_MELOTTS",
                 "sherpa":         "INCLUDE_SHERPA",
                 "vosk":           "INCLUDE_VOSK",
+                "llama":          "INCLUDE_LLAMA",
                 "piper":          "INCLUDE_PIPER",
                 "kokoro":         "INCLUDE_KOKORO",
+                "silero":         "INCLUDE_SILERO",
             }
             for backend_key, include_flag in _BACKEND_TO_INCLUDE.items():
                 if resolved_stt_backend == backend_key or resolved_tts_backend == backend_key:
@@ -1970,6 +2001,7 @@ async def download_selected_models(selection: ModelSelection):
                 if stt_backend == "sherpa":
                     stt_path = _safe_join_under_dir("/app/models/stt", stt_model["model_path"])
                     env_updates.append(f"SHERPA_MODEL_PATH={stt_path}")
+                    env_updates.append(f"SHERPA_MODEL_TYPE={stt_model.get('model_type', 'online')}")
                 elif stt_backend == "kroko":
                     if selection.kroko_embedded:
                         stt_path = _safe_join_under_dir("/app/models/kroko", stt_model["model_path"])
@@ -1991,9 +2023,23 @@ async def download_selected_models(selection: ModelSelection):
                     env_updates.append(f"KOKORO_MODEL_PATH={tts_path}")
                 elif tts_backend == "melotts":
                     env_updates.append(f"MELOTTS_VOICE={tts_model['model_path']}")
+                elif tts_backend == "silero":
+                    # Silero models auto-download via torch.hub; set speaker/language config
+                    pass
                 elif tts_model.get("download_url"):
                     tts_path = _safe_join_under_dir("/app/models/tts", tts_model["model_path"])
                     env_updates.append(f"LOCAL_TTS_MODEL_PATH={tts_path}")
+
+            # Silero config: speaker + language + model_id
+            if (tts_model.get("backend") or selection.tts) == "silero":
+                _SILERO_MODEL_IDS = {"ru": "v3_1_ru", "en": "v3_en", "de": "v3_de", "es": "v3_es", "fr": "v3_fr", "ua": "v3_ua"}
+                silero_speaker = tts_model.get("speaker") or selection.silero_speaker or "xenia"
+                silero_lang = selection.silero_language or "ru"
+                # Prefer catalog entry's model_id (authoritative), fall back to language lookup
+                silero_model_id = tts_model.get("silero_model_id") or _SILERO_MODEL_IDS.get(silero_lang, "v3_1_ru")
+                env_updates.append(f"SILERO_SPEAKER={silero_speaker}")
+                env_updates.append(f"SILERO_LANGUAGE={silero_lang}")
+                env_updates.append(f"SILERO_MODEL_ID={silero_model_id}")
 
             # Kokoro mode: local vs api/hf (no local files required)
             if (tts_model.get("backend") or selection.tts) == "kokoro":
@@ -2410,11 +2456,17 @@ async def get_local_server_logs():
         ready = "Enhanced Local AI Server started" in all_logs or \
                 "All models loaded successfully" in all_logs or \
                 "models loaded" in all_logs.lower()
-        
+
+        # Detect first-run HuggingFace model downloads so the frontend can extend
+        # its polling timeout beyond the normal 2-minute window.
+        _DOWNLOAD_MARKERS = ("Downloading ", "huggingface_hub", "from_pretrained", "fetching model")
+        downloading = (not ready) and any(m.lower() in all_logs.lower() for m in _DOWNLOAD_MARKERS)
+
         return {
             "logs": lines[-20:],
             "ready": ready,
-            "phase": "running" if ready else "starting"
+            "phase": "running" if ready else ("downloading" if downloading else "starting"),
+            "downloading": downloading,
         }
     except subprocess.TimeoutExpired:
         return {"logs": [], "ready": False, "error": "Timeout getting logs"}
@@ -2738,7 +2790,33 @@ async def validate_api_key(validation: ApiKeyValidation):
                         return {"valid": False, "error": error_msg}
                     else:
                         return {"valid": False, "error": f"API error: HTTP {response.status_code}"}
-            
+
+            elif provider == "cambai":
+                # Validate CAMB AI key by performing a tiny TTS request.
+                # The /tts-stream endpoint returns 200 + audio bytes for a valid key,
+                # 401/403 for invalid keys.
+                response = await client.post(
+                    "https://client.camb.ai/apis/tts-stream",
+                    headers={
+                        "x-api-key": api_key,
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "text": "test",
+                        "voice_id": 147320,
+                        "language": "en-us",
+                        "speech_model": "mars-flash",
+                        "output_configuration": {"format": "pcm_s16le"},
+                    },
+                    timeout=15.0,
+                )
+                if response.status_code == 200:
+                    return {"valid": True, "message": "CAMB AI API key is valid"}
+                elif response.status_code in (401, 403):
+                    return {"valid": False, "error": "Invalid API key"}
+                else:
+                    return {"valid": False, "error": f"API error: HTTP {response.status_code}"}
+
             else:
                 return {"valid": False, "error": f"Unknown provider: {provider}"}
                 
@@ -2852,6 +2930,7 @@ class SetupConfig(BaseModel):
     elevenlabs_key: Optional[str] = None
     elevenlabs_agent_id: Optional[str] = None
     cartesia_key: Optional[str] = None
+    camb_key: Optional[str] = None
     greeting: str
     ai_name: str
     ai_role: str
@@ -2866,6 +2945,8 @@ class SetupConfig(BaseModel):
     kokoro_voice: Optional[str] = "af_heart"
     kokoro_api_key: Optional[str] = None
     kokoro_api_base_url: Optional[str] = None
+    silero_speaker: Optional[str] = "xenia"
+    silero_language: Optional[str] = "ru"
     local_llm_model: Optional[str] = None
     local_llm_custom_url: Optional[str] = None
     local_llm_custom_filename: Optional[str] = None
@@ -2897,6 +2978,13 @@ async def save_setup_config(config: SetupConfig):
             raise HTTPException(status_code=400, detail="ElevenLabs API Key is required for ElevenLabs Conversational provider")
         if not config.elevenlabs_agent_id:
             raise HTTPException(status_code=400, detail="ElevenLabs Agent ID is required for ElevenLabs Conversational provider")
+    if config.provider == "cambai":
+        if not config.camb_key:
+            raise HTTPException(status_code=400, detail="CAMB AI API Key is required for CAMB AI provider")
+        if not config.deepgram_key:
+            raise HTTPException(status_code=400, detail="Deepgram API Key is required for CAMB AI pipeline (STT)")
+        if not config.openai_key:
+            raise HTTPException(status_code=400, detail="OpenAI API Key is required for CAMB AI pipeline (LLM)")
 
     try:
         import shutil
@@ -2938,6 +3026,8 @@ async def save_setup_config(config: SetupConfig):
             env_updates["ELEVENLABS_AGENT_ID"] = config.elevenlabs_agent_id
         if config.cartesia_key:
             env_updates["CARTESIA_API_KEY"] = config.cartesia_key
+        if config.camb_key:
+            env_updates["CAMB_API_KEY"] = config.camb_key
 
         if config.provider in ("local", "local_hybrid"):
             catalog = get_full_catalog()
@@ -2968,11 +3058,14 @@ async def save_setup_config(config: SetupConfig):
             _BACKEND_INCLUDE_MAP = {
                 "faster_whisper": "INCLUDE_FASTER_WHISPER",
                 "whisper_cpp": "INCLUDE_WHISPER_CPP",
+                "tone": "INCLUDE_TONE",
                 "melotts": "INCLUDE_MELOTTS",
                 "sherpa": "INCLUDE_SHERPA",
                 "vosk": "INCLUDE_VOSK",
+                "llama": "INCLUDE_LLAMA",
                 "piper": "INCLUDE_PIPER",
                 "kokoro": "INCLUDE_KOKORO",
+                "silero": "INCLUDE_SILERO",
             }
             for bk, inc_flag in _BACKEND_INCLUDE_MAP.items():
                 if stt_backend == bk or tts_backend == bk:
@@ -2983,6 +3076,7 @@ async def save_setup_config(config: SetupConfig):
             stt_model_path = (stt_model or {}).get("model_path")
             if stt_backend == "sherpa" and stt_model_path:
                 env_updates["SHERPA_MODEL_PATH"] = _safe_join_under_dir("/app/models/stt", stt_model_path)
+                env_updates["SHERPA_MODEL_TYPE"] = (stt_model or {}).get("model_type", "online")
             elif stt_backend == "kroko":
                 env_updates["KROKO_EMBEDDED"] = "1" if config.kroko_embedded else "0"
                 if config.kroko_api_key:
@@ -3011,6 +3105,14 @@ async def save_setup_config(config: SetupConfig):
             elif tts_backend == "melotts":
                 if tts_model_path:
                     env_updates["MELOTTS_VOICE"] = tts_model_path
+            elif tts_backend == "silero":
+                _SILERO_MODEL_IDS = {"ru": "v3_1_ru", "en": "v3_en", "de": "v3_de", "es": "v3_es", "fr": "v3_fr", "ua": "v3_ua"}
+                silero_speaker = (tts_model or {}).get("speaker") or config.silero_speaker or "xenia"
+                silero_lang = config.silero_language or "ru"
+                silero_model_id = (tts_model or {}).get("silero_model_id") or _SILERO_MODEL_IDS.get(silero_lang, "v3_1_ru")
+                env_updates["SILERO_SPEAKER"] = silero_speaker
+                env_updates["SILERO_LANGUAGE"] = silero_lang
+                env_updates["SILERO_MODEL_ID"] = silero_model_id
             elif tts_model_path:
                 env_updates["LOCAL_TTS_MODEL_PATH"] = _safe_join_under_dir("/app/models/tts", tts_model_path)
 
@@ -3248,6 +3350,52 @@ async def save_setup_config(config: SetupConfig):
                     "stt": "local_stt",
                     "llm": llm_component,
                     "tts": "local_tts"
+                }
+
+            elif config.provider == "cambai":
+                # CAMB AI is a TTS-only provider, so it runs as a PIPELINE:
+                # Deepgram STT + OpenAI LLM + CAMB AI TTS
+                pipeline_name = "cambai_pipeline"
+                yaml_config["active_pipeline"] = pipeline_name
+                yaml_config["default_provider"] = pipeline_name
+
+                # Configure CAMB AI TTS provider
+                providers.setdefault("cambai", {})["enabled"] = True
+                if not provider_exists("cambai"):
+                    providers["cambai"].update({
+                        "voice_id": 147320,
+                        "speech_model": "mars-flash",
+                        "language": "en-us",
+                        "output_format": "pcm_s16le",
+                    })
+
+                # Configure Deepgram STT pipeline adapter
+                providers.setdefault("deepgram_stt", {})["enabled"] = True
+                if not provider_exists("deepgram_stt"):
+                    providers["deepgram_stt"].update({
+                        "api_key": "${DEEPGRAM_API_KEY}",
+                        "model": "nova-2-general",
+                        "stt_language": "en-US",
+                        "input_encoding": "linear16",
+                        "input_sample_rate_hz": 8000,
+                    })
+
+                # Configure OpenAI LLM pipeline adapter
+                providers.setdefault("openai_llm", {})["enabled"] = True
+                if not provider_exists("openai_llm"):
+                    providers["openai_llm"].update({
+                        "api_key": "${OPENAI_API_KEY}",
+                        "chat_base_url": "https://api.openai.com/v1",
+                        "chat_model": "gpt-4o-mini",
+                        "type": "openai",
+                        "capabilities": ["llm"],
+                    })
+
+                # Define the pipeline
+                yaml_config.setdefault("pipelines", {})[pipeline_name] = {
+                    "stt": "deepgram_stt",
+                    "llm": "openai_llm",
+                    "tts": "cambai_tts"
                 }
 
             # C6 Fix: Create default context

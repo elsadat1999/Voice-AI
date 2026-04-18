@@ -452,18 +452,48 @@ run_rollback() {
     fi
 
     if [ "${compose_changed}" = "true" ]; then
-      targets=("ai_engine" "local_ai_server")
-      if [ "${include_ui_effective}" = "true" ]; then
-        targets+=("admin_ui")
+      # Scope --no-build to services that are already running to avoid "no such image" failures
+      # for services the operator never built (e.g. local_ai_server on non-Local-AI deployments).
+      mapfile -t running_svcs < <(docker compose ps --services --status running 2>/dev/null \
+        || docker compose ps --services 2>/dev/null \
+        || true)
+      targets=("${running_svcs[@]}")
+      # Add rebuild/restart targets only if they are already running.
+      for svc in "${rebuild_services[@]}" "${restart_services[@]}"; do
+        [[ -z "${svc}" ]] && continue
+        for r in "${running_svcs[@]}"; do
+          if [ "${svc}" = "${r}" ]; then
+            targets+=("${svc}")
+            break
+          fi
+        done
+      done
+      if [ "${include_ui_effective}" != "true" ]; then
+        mapfile -t targets < <(printf '%s\n' "${targets[@]}" | awk 'NF && $0 != "admin_ui" && !seen[$0]++')
+      else
+        mapfile -t targets < <(printf '%s\n' "${targets[@]}" | awk 'NF && !seen[$0]++')
       fi
-      targets+=("${rebuild_services[@]}" "${restart_services[@]}")
-      # De-dup targets
-      mapfile -t targets < <(printf '%s\n' "${targets[@]}" | awk 'NF && !seen[$0]++')
       echo "==> Compose changed; reconciling services (no-build): ${targets[*]:-none}" >&2
       if [ "${#targets[@]}" -gt 0 ]; then
         docker compose up -d --remove-orphans --no-build "${targets[@]}"
       else
-        docker compose up -d --remove-orphans --no-build
+        # Stack is fully stopped. Reconcile the whole project but skip services
+        # whose images were never built (prevents "no such image" failures for
+        # e.g. local_ai_server on non-Local-AI deployments).
+        mapfile -t all_svcs < <(docker compose config --services 2>/dev/null || true)
+        local safe_targets=()
+        for svc in "${all_svcs[@]}"; do
+          [[ -z "${svc}" ]] && continue
+          local img
+          img="$(docker compose images --format json 2>/dev/null | grep -o "\"${svc}\"" || true)"
+          if [ -n "$img" ] || docker image inspect "asterisk-ai-voice-agent-${svc}:latest" &>/dev/null 2>&1; then
+            safe_targets+=("${svc}")
+          fi
+        done
+        if [ "${#safe_targets[@]}" -gt 0 ]; then
+          echo "==> Reconciling stopped services with built images: ${safe_targets[*]}" >&2
+          docker compose up -d --remove-orphans --no-build "${safe_targets[@]}"
+        fi
       fi
     fi
 

@@ -166,6 +166,29 @@ Example events:
 
 If `request_id` is set, the server emits `tts_audio` metadata before the binary audio. If `request_id` is omitted, you will only receive the binary audio bytes.
 
+### Multi-Chunk Streaming TTS (v2 extension)
+
+When `llm_streaming_tts_overlap` is enabled, the server may emit multiple `tts_audio` + binary pairs per utterance instead of a single blob. This allows the client to begin playback while the LLM is still generating.
+
+Additional fields in the `tts_audio` metadata:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `utterance_id` | string | Groups chunks belonging to the same utterance |
+| `chunk_index` | integer | Zero-based chunk sequence number |
+| `is_final` | boolean | `true` on the last chunk of an utterance |
+
+Example (streaming 2-chunk utterance):
+
+```json
+{ "type": "tts_audio", "call_id": "c1", "mode": "full", "request_id": "r1", "encoding": "mulaw", "sample_rate_hz": 8000, "byte_length": 8000, "utterance_id": "utt-c1-1712345678", "chunk_index": 0, "is_final": false }
+<binary: 8000 bytes μ-law audio>
+{ "type": "tts_audio", "call_id": "c1", "mode": "full", "request_id": "r1", "encoding": "mulaw", "sample_rate_hz": 8000, "byte_length": 6400, "utterance_id": "utt-c1-1712345678", "chunk_index": 1, "is_final": true }
+<binary: 6400 bytes μ-law audio>
+```
+
+Backward compatibility: if `utterance_id`, `chunk_index`, and `is_final` are absent, treat as a single-blob response (v1 behavior). Clients should queue chunks for sequential playback and only signal playback completion after receiving `is_final: true`.
+
 ### Binary audio example (stt-only)
 
 1) Set mode:
@@ -366,7 +389,7 @@ Response:
   "type": "status_response",
   "status": "ok",
   "stt_backend": "vosk|kroko|sherpa|faster_whisper|whisper_cpp",
-  "tts_backend": "piper|kokoro|melotts",
+  "tts_backend": "piper|kokoro|melotts|silero",
   "models": {
     "stt": { "loaded": true, "path": "/app/models/stt/...", "display": "vosk-model-en-us-0.22" },
     "llm": {
@@ -443,6 +466,10 @@ Request (examples):
 ```
 
 ```json
+{ "type": "switch_model", "tts_backend": "silero", "silero_speaker": "xenia", "silero_language": "ru", "silero_model_id": "v3_1_ru" }
+```
+
+```json
 { "type": "switch_model", "tts_backend": "kokoro", "kokoro_voice": "af_heart" }
 ```
 
@@ -479,6 +506,27 @@ Request (examples):
 }
 ```
 
+```json
+{ "type": "switch_model", "stt_backend": "faster_whisper", "faster_whisper_language": "ru" }
+```
+
+```json
+{ "type": "switch_model", "stt_backend": "whisper_cpp", "whisper_cpp_language": "ru", "stt_model_path": "/app/models/stt/ggml-base.bin" }
+```
+
+```json
+{ "type": "switch_model", "stt_backend": "sherpa", "sherpa_model_type": "offline", "sherpa_model_path": "/app/models/stt/sherpa-onnx-zipformer-en-2023-06-26", "sherpa_vad_model_path": "/app/models/vad/silero_vad.onnx" }
+```
+
+```json
+{ "type": "switch_model", "stt_backend": "tone", "tone_model_path": "/app/models/stt/t-one", "tone_decoder_type": "beam_search", "tone_kenlm_path": "/app/models/stt/t-one/kenlm.bin" }
+```
+
+Notes:
+- `sherpa_model_type=online` expects a streaming Sherpa model directory such as `sherpa-onnx-streaming-zipformer-en-2023-06-26`
+- `sherpa_model_type=offline` expects a non-streaming Sherpa transducer model directory such as `sherpa-onnx-zipformer-en-2023-06-26`
+- Offline mode will reject streaming Sherpa model directories
+
 Response:
 
 ```json
@@ -491,10 +539,10 @@ Optional fields:
 
 Accepted payload shapes:
 
-- Top-level keys (for compatibility): `stt_backend`, `tts_backend`, `llm_model_path`, `kokoro_*`, `kroko_*`, `sherpa_model_path`, `stt_model_path`, `tts_model_path`.
+- Top-level keys (for compatibility): `stt_backend`, `tts_backend`, `llm_model_path`, `kokoro_*`, `kroko_*`, `sherpa_model_path`, `sherpa_model_type`, `sherpa_vad_model_path`, `tone_model_path`, `tone_decoder_type`, `tone_kenlm_path`, `faster_whisper_language`, `whisper_cpp_language`, `stt_model_path`, `tts_model_path`, `silero_speaker`, `silero_language`, `silero_model_id`, `silero_model_path`.
 - Nested config objects:
-  - `stt_config`: `model`, `device`, `compute_type`, plus Kroko aliases (`url`, `language`, `port`, `embedded`, `model_path`)
-  - `tts_config`: `voice`, `mode`, `lang`, `api_base_url`, `api_key`, `api_model`, `device`, `speed`, `model_path`
+  - `stt_config`: `model`, `device`, `compute_type`, `faster_whisper_language`, `whisper_cpp_language`, `sherpa_model_type`, `sherpa_vad_model_path`, `tone_model_path`, `tone_decoder_type`, `tone_kenlm_path`, plus Kroko aliases (`url`, `language`, `port`, `embedded`, `model_path`)
+  - `tts_config`: `voice`, `mode`, `lang`, `api_base_url`, `api_key`, `api_model`, `device`, `speed`, `model_path`, `silero_speaker`, `silero_language`, `silero_model_id`, `silero_model_path`
   - `llm_config`: `model_path`, `threads`, `context`, `batch`, `max_tokens`, `temperature`, `top_p`, `repeat_penalty`, `gpu_layers`, `system_prompt`, `use_mlock`, `chat_format`
 
 Notes:
@@ -523,11 +571,13 @@ Response:
     "vosk": true,
     "sherpa": true,
     "kroko_embedded": true,
+    "tone": false,
     "faster_whisper": true,
     "whisper_cpp": false,
     "piper": true,
     "kokoro": true,
     "melotts": false,
+    "silero": true,
     "llama": true
   }
 }
@@ -536,7 +586,9 @@ Response:
 Notes:
 
 - `kroko_embedded`: `true` only if `/usr/local/bin/kroko-server` exists (requires `INCLUDE_KROKO_EMBEDDED=true` at build time)
+- `tone`: `true` only if the T-one package is installed (requires `INCLUDE_TONE=true` at build time)
 - `kokoro`: `true` if Kokoro package is installed, or `KOKORO_API_BASE_URL` is set, or model files exist on disk
+- `silero`: `true` if the Silero TTS package is installed
 - `vosk`, `piper`, `llama`: Reported as `true` in default/full Docker images (assumes standard dependencies are installed)
 - Used by Admin UI `/api/local-ai/capabilities` endpoint to filter available options
 
@@ -679,6 +731,14 @@ Server-side (see `local_ai_server/config.py`, `local_ai_server/server.py`):
   - `LOCAL_TOOL_GATEWAY_ENABLED` (default `1`)
 - STT:
   - Backend select: `LOCAL_STT_BACKEND`
+  - Sherpa: `SHERPA_MODEL_PATH`, `SHERPA_MODEL_TYPE`, `SHERPA_VAD_MODEL_PATH`
+  - T-one: `TONE_MODEL_PATH`, `TONE_DECODER_TYPE`, `TONE_KENLM_PATH`
+  - Sherpa offline tuning:
+    - `SHERPA_VAD_THRESHOLD` (default `0.35`)
+    - `SHERPA_VAD_MIN_SILENCE_MS` (default `700`)
+    - `SHERPA_VAD_MIN_SPEECH_MS` (default `200`)
+    - `SHERPA_OFFLINE_PREROLL_MS` (default `350`)
+    - `SHERPA_OFFLINE_DEBUG_SEGMENTS` (default `false`; debug only)
   - Whisper.cpp: `WHISPER_CPP_MODEL_PATH` (legacy alias: `LOCAL_WHISPER_CPP_MODEL_PATH`), `WHISPER_CPP_LANGUAGE`
   - Faster-Whisper: `FASTER_WHISPER_MODEL`, `FASTER_WHISPER_DEVICE`, `FASTER_WHISPER_COMPUTE_TYPE`, `FASTER_WHISPER_LANGUAGE`
   - Kroko: `KROKO_EMBEDDED`, `KROKO_MODEL_PATH`, `KROKO_PORT`, `KROKO_URL`, `KROKO_API_KEY`, `KROKO_LANGUAGE`

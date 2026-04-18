@@ -45,7 +45,7 @@ See the validated configurations in `config/`:
 - `ai-agent.golden-elevenlabs.yaml` - ElevenLabs Agent (monolithic, premium voice)
 - `ai-agent.golden-local-hybrid.yaml` - Local Hybrid (pipeline, privacy-focused)
 
-### Additional Pipeline Providers (v6.3.2+)
+### Additional Pipeline Providers (v6.4.0+)
 - **Azure Speech Service** — Modular STT (`azure_stt`) and TTS (`azure_tts`) pipeline adapters. See [Provider-Azure-Setup.md](Provider-Azure-Setup.md).
 - **MiniMax LLM** — Pipeline LLM adapter (`minimax_llm`). See [Provider-MiniMax-Setup.md](Provider-MiniMax-Setup.md).
 - **Telnyx AI Inference** — Pipeline LLM adapter. See [Provider-Telnyx-Setup.md](Provider-Telnyx-Setup.md).
@@ -58,14 +58,16 @@ Environment variables for selecting local STT/TTS backends:
 
 | Variable | Options | Default | Description |
 |----------|---------|---------|-------------|
-| `LOCAL_STT_BACKEND` | `vosk`, `sherpa`, `kroko`, `faster_whisper` | `vosk` | Speech-to-text engine |
+| `LOCAL_STT_BACKEND` | `vosk`, `sherpa`, `kroko`, `tone`, `faster_whisper`, `whisper_cpp` | `vosk` | Speech-to-text engine |
 | `LOCAL_TTS_BACKEND` | `piper`, `kokoro`, `melotts` | `piper` | Text-to-speech engine |
 
 **STT Backends**:
 - **Vosk**: Offline ASR with good accuracy, multiple language models
 - **Sherpa-ONNX**: Low-latency streaming ASR using ONNX runtime
 - **Kroko**: High-quality streaming ASR with 12+ languages (requires API key for hosted mode)
+- **T-one**: Native Russian telephony STT using the upstream streaming CTC pipeline
 - **Faster-Whisper**: Whisper inference via `faster-whisper` (model IDs like `base`, `small`, etc., or a local model directory depending on your install)
+- **Whisper.cpp**: Local GGML Whisper inference with multilingual language hints
 
 **TTS Backends**:
 - **Piper**: Fast local TTS with multiple voices
