@@ -2,6 +2,61 @@
 
 This guide covers upgrading between major versions of Asterisk AI Voice Agent.
 
+## v6.3.2 to v6.4.0
+
+**No breaking changes.** All new features are additive or opt-in.
+
+```bash
+# Standard upgrade
+git pull
+docker compose -p asterisk-ai-voice-agent up -d --build --force-recreate
+```
+
+New in v6.4.0:
+- Attended transfer streaming & screening modes (`basic_tts`, `ai_briefing`, `caller_recording`)
+- Sherpa offline STT with VAD-gated transducer mode (`SHERPA_MODEL_TYPE=offline`)
+- T-one STT backend for Russian telephony ASR (`LOCAL_STT_BACKEND=tone`)
+- Silero TTS backend with multi-language support (`LOCAL_TTS_BACKEND=silero`)
+- HTTP tool JSONPath `[*]` wildcard array extraction
+- Per-message conversation timestamps in Call Log UI
+- Fullscreen toggle for dashboard panels
+- Provider-agnostic runtime tool guidance for transfer targets
+- Live Agents UI redesign with auto-polling
+
+If you want the new Russian speech backends, rebuild with build args:
+```bash
+# T-one STT (Russian)
+docker compose build --build-arg INCLUDE_TONE=true local_ai_server
+
+# Silero TTS (Russian + multi-language)
+docker compose build --build-arg INCLUDE_SILERO=true local_ai_server
+
+# Both
+docker compose build --build-arg INCLUDE_TONE=true --build-arg INCLUDE_SILERO=true local_ai_server
+```
+
+Deprecated configs (still functional, will be removed in a future release):
+- `tools.attended_transfer.ai_summary` → use `screening_mode: ai_briefing`
+- `tools.attended_transfer.pass_caller_info_to_context` → use `screening_mode: basic_tts`
+- `transfer_call` / `transfer_to_queue` legacy tools → use unified `blind_transfer`
+
+## v6.3.1 to v6.3.2
+
+**No breaking changes.** All new features are additive or opt-in.
+
+```bash
+# Standard upgrade
+git pull
+docker compose -p asterisk-ai-voice-agent up -d --build --force-recreate
+```
+
+New in v6.3.2:
+- Microsoft Azure Speech Service STT & TTS pipeline adapters (REST batch, WebSocket streaming, SSML synthesis)
+- MiniMax LLM M2.7 pipeline adapter via OpenAI-compatible API
+- Call Recording Playback in Admin UI Call Details modal
+- Google Calendar delete() with timezone fixes
+- Azure SSRF prevention, PII logging discipline, input validation hardening
+
 ## v6.2.x to v6.3.1
 
 **No breaking changes.** All new features are additive or opt-in.

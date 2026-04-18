@@ -21,6 +21,8 @@ interface ToolFormProps {
 
 const DEFAULT_ATTENDED_ANNOUNCEMENT_TEMPLATE =
     "Hi, this is Ava. I'm transferring {caller_display} regarding {context_name}.";
+const DEFAULT_ATTENDED_AI_BRIEFING_INTRO_TEMPLATE =
+    "Hi, this is Ava. Here is a short summary of the caller.";
 const DEFAULT_ATTENDED_AGENT_DTMF_PROMPT_TEMPLATE =
     "Press 1 to accept this transfer, or 2 to decline.";
 const DEFAULT_ATTENDED_CALLER_CONNECTED_PROMPT = "Connecting you now.";
@@ -60,10 +62,11 @@ const renderMarkerList = (value: string[] | undefined, fallback: string[]) =>
 
 const hasLiveAgentExpertSettings = (ext: any) => {
     const actionType = String(ext?.action_type || 'transfer').trim() || 'transfer';
+    const deviceStateTech = String(ext?.device_state_tech || 'auto').trim() || 'auto';
     const aliases = Array.isArray(ext?.aliases)
         ? ext.aliases.map((item: any) => String(item || '').trim()).filter(Boolean)
         : [];
-    return actionType !== 'transfer' || Boolean(ext?.pass_caller_info) || aliases.length > 0;
+    return actionType !== 'transfer' || deviceStateTech !== 'auto' || aliases.length > 0;
 };
 
 const ToolForm = ({ config, contexts, hangupUsage, onChange, onSaveNow }: ToolFormProps) => {
@@ -77,6 +80,8 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onSaveNow }: ToolFo
 	        const [templateModalTool, setTemplateModalTool] = useState<'send_email_summary' | 'request_transcript'>('send_email_summary');
 	        const [internalAliasesDraftByRowId, setInternalAliasesDraftByRowId] = useState<Record<string, string>>({});
 	        const internalAliasesCommittedRef = useRef<Record<string, string>>({});
+	        const [internalExtKeyDraftByRowId, setInternalExtKeyDraftByRowId] = useState<Record<string, string>>({});
+	        const internalExtKeyCommittedRef = useRef<Record<string, string>>({});
 	        const [showHangupExpert, setShowHangupExpert] = useState<boolean>(() => {
 	            try {
 	                const v = localStorage.getItem(HANGUP_EXPERT_STORAGE_KEY);
@@ -137,6 +142,34 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onSaveNow }: ToolFo
 
 	                return next ?? prev;
 	            });
+
+	            setInternalExtKeyDraftByRowId((prev) => {
+	                let next: Record<string, string> | null = null;
+	                const ensureNext = () => (next ??= { ...prev });
+
+	                Object.entries(internal).forEach(([key]) => {
+	                    const rowId = getInternalExtRowId(key);
+	                    rowIdsInUse.add(rowId);
+
+	                    const prevCommitted = internalExtKeyCommittedRef.current[rowId];
+	                    const draft = prev[rowId];
+	                    internalExtKeyCommittedRef.current[rowId] = key;
+
+	                    if (draft === undefined || (prevCommitted !== undefined && draft === prevCommitted && draft !== key)) {
+	                        ensureNext()[rowId] = key;
+	                    }
+	                });
+
+	                Object.keys(prev).forEach((rowId) => {
+	                    if (!rowIdsInUse.has(rowId)) {
+	                        ensureNext();
+	                        delete next![rowId];
+	                        delete internalExtKeyCommittedRef.current[rowId];
+	                    }
+	                });
+
+	                return next ?? prev;
+	            });
 	        }, [config?.extensions?.internal]);
 
 	        // Per-context override draft rows
@@ -155,6 +188,8 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onSaveNow }: ToolFo
         const internalExtRowMetaRef = useRef<Record<string, { autoDerivedKey: boolean }>>({});
         const internalExtRenameToastKeyRef = useRef<string>('');
         const [internalExtStatusByRowId, setInternalExtStatusByRowId] = useState<Record<string, any>>({});
+        const internalExtStatusControllersRef = useRef<Record<string, AbortController>>({});
+        const internalExtStatusTimeoutsRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
         const liveAgentsCount = Object.keys(config.extensions?.internal || {}).length;
         const hasLiveAgents = liveAgentsCount > 0;
         const hasLiveAgentDestinationOverride = Boolean((config.transfer?.live_agent_destination_key || '').trim());
@@ -216,6 +251,46 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onSaveNow }: ToolFo
             delete internalExtRowIdsRef.current[k];
         };
 
+        const renameInternalExtensionKey = (fromKey: string, rawNextKey: string) => {
+            const nextKey = (rawNextKey || '').trim();
+            if (!nextKey || nextKey === fromKey) return;
+            if (!isNumericKey(nextKey)) {
+                toast.error('Live Agent extension keys must be numeric.');
+                return;
+            }
+
+            const existing = { ...(config.extensions?.internal || {}) };
+            if (Object.prototype.hasOwnProperty.call(existing, nextKey)) {
+                toast.error(`An extension with key '${nextKey}' already exists.`);
+                return;
+            }
+
+            const rowId = getInternalExtRowId(fromKey);
+            getInternalExtRowMeta(rowId).autoDerivedKey = false;
+
+            const renamed: Record<string, any> = {};
+            Object.entries(existing).forEach(([k, v]) => {
+                if (k === fromKey) renamed[nextKey] = v;
+                else renamed[k] = v;
+            });
+            moveInternalExtRowId(fromKey, nextKey);
+            updateNestedConfig('extensions', 'internal', renamed);
+        };
+
+        const commitInternalExtensionKeyDraft = (rowId: string, fromKey: string) => {
+            const nextKey = String(internalExtKeyDraftByRowId[rowId] ?? fromKey).trim();
+            if (!nextKey || nextKey === fromKey) {
+                setInternalExtKeyDraftByRowId((prev) => ({ ...prev, [rowId]: fromKey }));
+                return;
+            }
+            if (!isNumericKey(nextKey)) {
+                toast.error('Live Agent extension keys must be numeric.');
+                setInternalExtKeyDraftByRowId((prev) => ({ ...prev, [rowId]: fromKey }));
+                return;
+            }
+            renameInternalExtensionKey(fromKey, nextKey);
+        };
+
         const _statusDotClass = (status: string, loading: boolean) => {
             if (loading) return 'bg-muted animate-pulse';
             if (status === 'available') return 'bg-emerald-500';
@@ -237,25 +312,39 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onSaveNow }: ToolFo
             if (status === 'busy') return 'Busy';
             return 'Unknown';
         };
-
-        const checkLiveAgentStatus = async (rowId: string, key: string, ext: any) => {
+        const checkLiveAgentStatus = async (rowId: string, key: string, ext: any, isAuto: boolean = false) => {
             const dialString = String(ext?.dial_string || '');
             const tech = String(ext?.device_state_tech || 'auto');
             const numericKey = isNumericKey(key) ? String(key).trim() : extractNumericExtensionKeyFromDialString(dialString);
             if (!numericKey) {
-                toast.error('Set a numeric extension or dial string (e.g. PJSIP/2765) before checking status.');
+                if (!isAuto) toast.error('Set a numeric extension or dial string (e.g. PJSIP/2765) before checking status.');
                 return;
             }
 
-            setInternalExtStatusByRowId((prev) => ({
-                ...prev,
-                [rowId]: { ...(prev[rowId] || {}), loading: true, error: '' },
-            }));
+            internalExtStatusControllersRef.current[rowId]?.abort();
+            const previousTimeout = internalExtStatusTimeoutsRef.current[rowId];
+            if (previousTimeout) {
+                clearTimeout(previousTimeout);
+                delete internalExtStatusTimeoutsRef.current[rowId];
+            }
+            const controller = new AbortController();
+            internalExtStatusControllersRef.current[rowId] = controller;
+            internalExtStatusTimeoutsRef.current[rowId] = setTimeout(() => controller.abort(), 10000);
+
+            // In auto-mode, skip showing loading to avoid UI flicker
+            if (!isAuto) {
+                setInternalExtStatusByRowId((prev) => ({
+                    ...prev,
+                    [rowId]: { ...(prev[rowId] || {}), loading: true, error: '' },
+                }));
+            }
 
             try {
                 const res = await axios.get('/api/system/ari/extension-status', {
                     params: { key: numericKey, device_state_tech: tech, dial_string: dialString },
+                    signal: controller.signal,
                 });
+                if (internalExtStatusControllersRef.current[rowId] !== controller) return;
                 const data = res?.data || {};
                 setInternalExtStatusByRowId((prev) => ({
                     ...prev,
@@ -269,18 +358,73 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onSaveNow }: ToolFo
                         error: String(data.error || ''),
                     },
                 }));
-                if (!data.success && data.error) {
+                if (!data.success && data.error && !isAuto) {
                     toast.error(String(data.error));
                 }
             } catch (e: any) {
+                if (controller.signal.aborted || e?.name === 'CanceledError' || e?.code === 'ERR_CANCELED' || axios.isCancel?.(e)) {
+                    if (internalExtStatusControllersRef.current[rowId] === controller) {
+                        setInternalExtStatusByRowId((prev) => ({
+                            ...prev,
+                            [rowId]: { ...(prev[rowId] || {}), loading: false },
+                        }));
+                    }
+                    return;
+                }
+                if (internalExtStatusControllersRef.current[rowId] !== controller) return;
                 const err = e?.response?.data?.detail || e?.message || 'Status check failed.';
                 setInternalExtStatusByRowId((prev) => ({
                     ...prev,
                     [rowId]: { ...(prev[rowId] || {}), loading: false, success: false, status: 'unknown', error: String(err) },
                 }));
-                toast.error(String(err));
+                if (!isAuto) {
+                    toast.error(String(err));
+                }
+            } finally {
+                if (internalExtStatusControllersRef.current[rowId] === controller) {
+                    delete internalExtStatusControllersRef.current[rowId];
+                }
+                const timeoutId = internalExtStatusTimeoutsRef.current[rowId];
+                if (timeoutId) {
+                    clearTimeout(timeoutId);
+                    delete internalExtStatusTimeoutsRef.current[rowId];
+                }
             }
         };
+
+        const checkLiveAgentStatusRef = useRef(checkLiveAgentStatus);
+        const internalExtsRef = useRef(config.extensions?.internal || {});
+
+        useEffect(() => {
+            checkLiveAgentStatusRef.current = checkLiveAgentStatus;
+            internalExtsRef.current = config.extensions?.internal || {};
+        });
+
+        useEffect(() => {
+            let mounted = true;
+
+            const poll = () => {
+                if (!mounted) return;
+                const extensions = internalExtsRef.current;
+                Object.entries(extensions).forEach(([key, ext]) => {
+                    const rowId = getInternalExtRowId(key);
+                    checkLiveAgentStatusRef.current(rowId, key, ext, true);
+                });
+            };
+
+            const initialTimer = setTimeout(poll, 1500);
+            const intervalTimer = setInterval(poll, 60000);
+
+            return () => {
+                mounted = false;
+                clearTimeout(initialTimer);
+                clearInterval(intervalTimer);
+                Object.values(internalExtStatusControllersRef.current).forEach((controller) => controller.abort());
+                Object.values(internalExtStatusTimeoutsRef.current).forEach((timeoutId) => clearTimeout(timeoutId));
+                internalExtStatusControllersRef.current = {};
+                internalExtStatusTimeoutsRef.current = {};
+            };
+        }, []);
 
     const updateConfig = (field: string, value: any) => {
         onChange({ ...config, [field]: value });
@@ -488,6 +632,15 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onSaveNow }: ToolFo
             if (next.dial_timeout_seconds == null) next.dial_timeout_seconds = 30;
             if (next.accept_timeout_seconds == null) next.accept_timeout_seconds = 15;
             if (next.tts_timeout_seconds == null) next.tts_timeout_seconds = 8;
+            if (next.delivery_mode == null) next.delivery_mode = 'stream';
+            if (next.stream_fallback_to_file == null) next.stream_fallback_to_file = true;
+            if (next.screening_mode == null) next.screening_mode = 'basic_tts';
+            if (next.ai_briefing_timeout_seconds == null) next.ai_briefing_timeout_seconds = 2;
+            if (next.ai_briefing_language == null) next.ai_briefing_language = '';
+            if (next.ai_briefing_intro_template == null) next.ai_briefing_intro_template = DEFAULT_ATTENDED_AI_BRIEFING_INTRO_TEMPLATE;
+            if (next.caller_screening_prompt == null) next.caller_screening_prompt = 'Before I connect you, please say your name and the reason for your call.';
+            if (next.caller_screening_max_seconds == null) next.caller_screening_max_seconds = 6;
+            if (next.caller_screening_silence_ms == null) next.caller_screening_silence_ms = 1200;
             if (next.accept_digit == null) next.accept_digit = '1';
             if (next.decline_digit == null) next.decline_digit = '2';
             if (next.announcement_template == null) next.announcement_template = DEFAULT_ATTENDED_ANNOUNCEMENT_TEMPLATE;
@@ -530,29 +683,6 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onSaveNow }: ToolFo
         const destinations = { ...(config.transfer?.destinations || {}) };
         delete destinations[key];
         updateNestedConfig('transfer', 'destinations', destinations);
-    };
-
-    const renameInternalExtensionKey = (fromKey: string, toKeyRaw: string) => {
-        const toKey = (toKeyRaw || '').trim();
-        if (!toKey) {
-            toast.error('Extension key cannot be empty.');
-            return;
-        }
-        if (toKey === fromKey) return;
-
-        const existing = { ...(config.extensions?.internal || {}) };
-        if (Object.prototype.hasOwnProperty.call(existing, toKey)) {
-            toast.error(`An extension with key '${toKey}' already exists.`);
-            return;
-        }
-
-        const renamed: Record<string, any> = {};
-        Object.entries(existing).forEach(([k, v]) => {
-            if (k === fromKey) renamed[toKey] = v;
-            else renamed[k] = v;
-        });
-        moveInternalExtRowId(fromKey, toKey);
-        updateNestedConfig('extensions', 'internal', renamed);
     };
 
     return (
@@ -689,7 +819,7 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onSaveNow }: ToolFo
                 <div className="border border-border rounded-lg p-4 bg-card/50">
                     <FormSwitch
                         label="Attended Transfer (Warm)"
-                        description="Warm transfer with MOH, one-way announcement to the agent, and DTMF accept/decline. Requires Local AI Server for TTS."
+                        description="Warm transfer with MOH, one-way announcement to the agent, and DTMF accept/decline. Requires Local AI Server for TTS. AI Briefing is experimental, requires Local AI Server LLM capability, and falls back to Basic TTS when unavailable."
                         checked={config.attended_transfer?.enabled ?? false}
                         onChange={(e) => handleAttendedTransferToggle(e.target.checked)}
                         className="mb-0 border-0 p-0 bg-transparent"
@@ -697,6 +827,27 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onSaveNow }: ToolFo
                     {config.attended_transfer?.enabled && (
                         <div className="mt-4 pl-4 border-l-2 border-border ml-2 space-y-4">
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                <FormSelect
+                                    label="Announcement Delivery"
+                                    value={config.attended_transfer?.delivery_mode || 'stream'}
+                                    onChange={(e) => updateNestedConfig('attended_transfer', 'delivery_mode', e.target.value)}
+                                    options={[
+                                        { value: 'stream', label: 'Stream via ExternalMedia' },
+                                        { value: 'file', label: 'File Playback' },
+                                    ]}
+                                    tooltip="Stream avoids shared-storage dependency for the called extension leg. File playback keeps the legacy behavior."
+                                />
+                                <FormSelect
+                                    label="Screening Mode"
+                                    value={config.attended_transfer?.screening_mode || 'basic_tts'}
+                                    onChange={(e) => updateNestedConfig('attended_transfer', 'screening_mode', e.target.value)}
+                                    options={[
+                                        { value: 'basic_tts', label: 'Basic TTS' },
+                                        { value: 'ai_briefing', label: 'AI Briefing (Experimental)' },
+                                        { value: 'caller_recording', label: 'Caller Recording' },
+                                    ]}
+                                    tooltip="Basic TTS uses caller ID and context. AI Briefing is experimental and generates a short AI-written summary from the live conversation using Local AI Server LLM. Caller Recording asks the caller to state their name and reason, then plays that clip to the destination agent."
+                                />
                                 <FormInput
                                     label="MOH Class"
                                     value={config.attended_transfer?.moh_class || 'default'}
@@ -734,47 +885,118 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onSaveNow }: ToolFo
                                     value={config.attended_transfer?.decline_digit || '2'}
                                     onChange={(e) => updateNestedConfig('attended_transfer', 'decline_digit', e.target.value)}
                                 />
+                                {config.attended_transfer?.screening_mode === 'caller_recording' && (
+                                    <>
+                                        <div className="md:col-span-2 space-y-2">
+                                            <FormLabel tooltip="Spoken to the caller before screening capture begins. The AI/provider speaks this prompt, then the engine records the next caller utterance. Ensure your deployment satisfies any local caller notice or consent requirements before enabling caller recording.">
+                                                Caller Screening Prompt
+                                            </FormLabel>
+                                            <textarea
+                                                className="w-full p-3 rounded-md border border-input bg-transparent text-sm min-h-[80px] focus:outline-none focus:ring-1 focus:ring-ring"
+                                                value={config.attended_transfer?.caller_screening_prompt || 'Before I connect you, please say your name and the reason for your call.'}
+                                                onChange={(e) => updateNestedConfig('attended_transfer', 'caller_screening_prompt', e.target.value)}
+                                                placeholder="Before I connect you, please say your name and the reason for your call."
+                                            />
+                                        </div>
+                                        <FormInput
+                                            label="Max Recording Seconds"
+                                            type="number"
+                                            value={config.attended_transfer?.caller_screening_max_seconds ?? 6}
+                                            onChange={(e) => updateNestedConfig('attended_transfer', 'caller_screening_max_seconds', parseInt(e.target.value) || 6)}
+                                            tooltip="Maximum length of the caller screening clip before it is finalized."
+                                        />
+                                        <FormInput
+                                            label="Silence Timeout (ms)"
+                                            type="number"
+                                            value={config.attended_transfer?.caller_screening_silence_ms ?? 1200}
+                                            onChange={(e) => updateNestedConfig('attended_transfer', 'caller_screening_silence_ms', parseInt(e.target.value) || 1200)}
+                                            tooltip="How much trailing silence ends the screening capture."
+                                        />
+                                    </>
+                                )}
+                                {config.attended_transfer?.screening_mode === 'ai_briefing' && (
+                                    <>
+                                        <div className="md:col-span-2 space-y-2">
+                                            <FormLabel tooltip="Spoken to the destination agent before the AI-generated summary. AI Briefing is experimental, requires Local AI Server LLM capability, and falls back to Basic TTS when summary generation is unavailable.">
+                                                AI Briefing Intro Template (Experimental)
+                                            </FormLabel>
+                                            <textarea
+                                                className="w-full p-3 rounded-md border border-input bg-transparent text-sm min-h-[80px] focus:outline-none focus:ring-1 focus:ring-ring"
+                                                value={config.attended_transfer?.ai_briefing_intro_template ?? DEFAULT_ATTENDED_AI_BRIEFING_INTRO_TEMPLATE}
+                                                onChange={(e) => updateNestedConfig('attended_transfer', 'ai_briefing_intro_template', e.target.value)}
+                                                placeholder={DEFAULT_ATTENDED_AI_BRIEFING_INTRO_TEMPLATE}
+                                            />
+                                        </div>
+                                        <FormInput
+                                            label="Briefing Language"
+                                            type="text"
+                                            value={config.attended_transfer?.ai_briefing_language ?? ''}
+                                            onChange={(e) => updateNestedConfig('attended_transfer', 'ai_briefing_language', e.target.value)}
+                                            placeholder="e.g. German, French, Spanish (leave blank for English)"
+                                            tooltip="Language for the AI-generated briefing text. Must match the language your Local AI Server TTS voice speaks. Leave blank for English."
+                                        />
+                                        <FormInput
+                                            label="AI Briefing Timeout (seconds, Experimental)"
+                                            type="number"
+                                            value={config.attended_transfer?.ai_briefing_timeout_seconds ?? 2}
+                                            onChange={(e) => updateNestedConfig('attended_transfer', 'ai_briefing_timeout_seconds', parseFloat(e.target.value) || 2)}
+                                            tooltip="Maximum time to wait for the experimental Local AI Server LLM briefing before falling back to Basic TTS."
+                                        />
+                                    </>
+                                )}
                             </div>
 
-                            <div className="space-y-2">
-                                <FormLabel tooltip="Spoken to the destination agent (one-way) before requesting DTMF acceptance. Placeholders: {caller_display}, {caller_name}, {caller_number}, {context_name}, {destination_description}.">
-                                    Agent Announcement Template
-                                </FormLabel>
-                                <textarea
-                                    className="w-full p-3 rounded-md border border-input bg-transparent text-sm min-h-[100px] focus:outline-none focus:ring-1 focus:ring-ring"
-                                    value={config.attended_transfer?.announcement_template ?? DEFAULT_ATTENDED_ANNOUNCEMENT_TEMPLATE}
-                                    onChange={(e) => updateNestedConfig('attended_transfer', 'announcement_template', e.target.value)}
-                                    placeholder="Hi, this is Ava. I'm transferring {caller_display} regarding {context_name}."
+                            {config.attended_transfer?.screening_mode === 'basic_tts' && (
+                                <div className="space-y-2">
+                                    <FormLabel tooltip="Spoken to the destination agent (one-way) before requesting DTMF acceptance. Placeholders: {caller_display}, {caller_name}, {caller_number}, {context_name}, {destination_description}, {screening_summary}, {screened_caller_name}, {screened_call_reason}, {screened_caller_display}, {screened_reason_display}.">
+                                        Agent Announcement Template
+                                    </FormLabel>
+                                    <textarea
+                                        className="w-full p-3 rounded-md border border-input bg-transparent text-sm min-h-[100px] focus:outline-none focus:ring-1 focus:ring-ring"
+                                        value={config.attended_transfer?.announcement_template ?? DEFAULT_ATTENDED_ANNOUNCEMENT_TEMPLATE}
+                                        onChange={(e) => updateNestedConfig('attended_transfer', 'announcement_template', e.target.value)}
+                                        placeholder="Hi, this is Ava. I'm transferring {caller_display} regarding {context_name}."
+                                    />
+                                </div>
+                            )}
+
+                            <div className="border border-border rounded-lg p-4 bg-background/40 space-y-4">
+                                <div className="text-sm font-medium">Advanced Prompts</div>
+                                <FormSwitch
+                                    label="Fallback To File Playback"
+                                    description="If helper streaming is unavailable, reuse the legacy file-based playback path for the called extension."
+                                    checked={config.attended_transfer?.stream_fallback_to_file ?? true}
+                                    onChange={(e) => updateNestedConfig('attended_transfer', 'stream_fallback_to_file', e.target.checked)}
+                                    className="mb-0 border-0 p-0 bg-transparent"
+                                />
+                                <div className="space-y-2">
+                                    <FormLabel tooltip="Spoken to the destination agent to request acceptance/decline (DTMF). Supports the same placeholders as the announcement template.">
+                                        Agent DTMF Prompt Template
+                                    </FormLabel>
+                                    <textarea
+                                        className="w-full p-3 rounded-md border border-input bg-transparent text-sm min-h-[80px] focus:outline-none focus:ring-1 focus:ring-ring"
+                                        value={config.attended_transfer?.agent_accept_prompt_template ?? DEFAULT_ATTENDED_AGENT_DTMF_PROMPT_TEMPLATE}
+                                        onChange={(e) => updateNestedConfig('attended_transfer', 'agent_accept_prompt_template', e.target.value)}
+                                        placeholder="Press 1 to accept this transfer, or 2 to decline."
+                                    />
+                                </div>
+
+                                <FormInput
+                                    label="Caller Connected Prompt (Optional)"
+                                    value={config.attended_transfer?.caller_connected_prompt ?? DEFAULT_ATTENDED_CALLER_CONNECTED_PROMPT}
+                                    onChange={(e) => updateNestedConfig('attended_transfer', 'caller_connected_prompt', e.target.value)}
+                                    tooltip="Optional phrase spoken to the caller right before bridging to the destination (e.g., 'Connecting you now.')."
+                                    placeholder="Connecting you now."
+                                />
+
+                                <FormInput
+                                    label="Caller Declined Prompt (Optional)"
+                                    value={config.attended_transfer?.caller_declined_prompt ?? DEFAULT_ATTENDED_CALLER_DECLINED_PROMPT}
+                                    onChange={(e) => updateNestedConfig('attended_transfer', 'caller_declined_prompt', e.target.value)}
+                                    tooltip="Spoken to the caller when the destination declines or the attended transfer times out (keeps the conversation moving)."
+                                    placeholder="I’m not able to complete that transfer right now. Would you like me to take a message?"
                                 />
                             </div>
-
-                            <div className="space-y-2">
-                                <FormLabel tooltip="Spoken to the destination agent to request acceptance/decline (DTMF).">
-                                    Agent DTMF Prompt Template
-                                </FormLabel>
-                                <textarea
-                                    className="w-full p-3 rounded-md border border-input bg-transparent text-sm min-h-[80px] focus:outline-none focus:ring-1 focus:ring-ring"
-                                    value={config.attended_transfer?.agent_accept_prompt_template ?? DEFAULT_ATTENDED_AGENT_DTMF_PROMPT_TEMPLATE}
-                                    onChange={(e) => updateNestedConfig('attended_transfer', 'agent_accept_prompt_template', e.target.value)}
-                                    placeholder="Press 1 to accept this transfer, or 2 to decline."
-                                />
-                            </div>
-
-                            <FormInput
-                                label="Caller Connected Prompt (Optional)"
-                                value={config.attended_transfer?.caller_connected_prompt ?? DEFAULT_ATTENDED_CALLER_CONNECTED_PROMPT}
-                                onChange={(e) => updateNestedConfig('attended_transfer', 'caller_connected_prompt', e.target.value)}
-                                tooltip="Optional phrase spoken to the caller right before bridging to the destination (e.g., 'Connecting you now.')."
-                                placeholder="Connecting you now."
-                            />
-
-                            <FormInput
-                                label="Caller Declined Prompt (Optional)"
-                                value={config.attended_transfer?.caller_declined_prompt ?? DEFAULT_ATTENDED_CALLER_DECLINED_PROMPT}
-                                onChange={(e) => updateNestedConfig('attended_transfer', 'caller_declined_prompt', e.target.value)}
-                                tooltip="Spoken to the caller when the destination declines or the attended transfer times out (keeps the conversation moving)."
-                                placeholder="I’m not able to complete that transfer right now. Would you like me to take a message?"
-                            />
                         </div>
                     )}
                 </div>
@@ -797,6 +1019,22 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onSaveNow }: ToolFo
                             />
                         </div>
                     )}
+                </div>
+
+                {/* Check Extension Status */}
+                <div className="border border-border rounded-lg p-4 bg-card/50">
+                    <div className="space-y-2">
+                        <FormLabel tooltip="Controls whether availability checks are limited to extensions explicitly configured under Live Agents or Transfer Destinations. Disable only if you intentionally want the model to probe arbitrary extension numbers.">
+                            Check Extension Status
+                        </FormLabel>
+                        <FormSwitch
+                            label="Restrict To Configured Extensions"
+                            description="Recommended safety guardrail. Prevents the AI from checking arbitrary extension numbers that are not configured under Tools."
+                            checked={config.check_extension_status?.restrict_to_configured_extensions ?? true}
+                            onChange={(e) => updateNestedConfig('check_extension_status', 'restrict_to_configured_extensions', e.target.checked)}
+                            className="mb-0 border-0 p-0 bg-transparent"
+                        />
+                    </div>
                 </div>
 
                 {/* Hangup Call */}
@@ -839,95 +1077,94 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onSaveNow }: ToolFo
                                     onChange={(e) => setShowHangupExpert(e.target.checked)}
                                     className="mb-0 border-0 p-0 bg-transparent"
                                 />
-                                <p className={`text-xs mt-2 ${showHangupExpert ? 'text-amber-700 dark:text-amber-400' : 'text-muted-foreground'}`}>
-                                    {showHangupExpert
-                                        ? 'Warning: these values directly influence hangup intent matching and fallback behavior.'
-                                        : 'Expert values are shown with defaults and are read-only until enabled.'}
-                                </p>
-                                <p className="text-xs text-muted-foreground mt-2">
-                                    These markers are global defaults. Pipelines can override end-of-call markers per pipeline under <code>Pipelines</code> → <code>LLM Expert Settings</code>.
-                                </p>
-                                {hangupUsage && (
-                                    <div className="mt-3 text-xs text-muted-foreground space-y-1">
-                                        <div className="font-medium text-foreground">Usage</div>
-                                        <div>
-                                            Google Live marker heuristics:{' '}
-                                            <span className="font-mono">
-                                                {hangupUsage.googleLiveMarkersEnabled === null
-                                                    ? 'unknown'
-                                                    : hangupUsage.googleLiveMarkersEnabled
-                                                        ? 'enabled'
-                                                        : 'disabled'}
-                                            </span>
+                                {showHangupExpert && (
+                                    <div className="mt-4 pt-4 border-t border-amber-300/20">
+                                        <p className="text-xs text-amber-700 dark:text-amber-400">
+                                            Warning: these values directly influence hangup intent matching and fallback behavior.
+                                        </p>
+                                        <p className="text-xs text-muted-foreground mt-2">
+                                            These markers are global defaults. Pipelines can override end-of-call markers per pipeline under <code>Pipelines</code> → <code>LLM Expert Settings</code>.
+                                        </p>
+                                        {hangupUsage && (
+                                            <div className="mt-3 text-xs text-muted-foreground space-y-1">
+                                                <div className="font-medium text-foreground">Usage</div>
+                                                <div>
+                                                    Google Live marker heuristics:{' '}
+                                                    <span className="font-mono">
+                                                        {hangupUsage.googleLiveMarkersEnabled === null
+                                                            ? 'unknown'
+                                                            : hangupUsage.googleLiveMarkersEnabled
+                                                                ? 'enabled'
+                                                                : 'disabled'}
+                                                    </span>
+                                                </div>
+                                                <div>
+                                                    Pipelines overriding end-call markers:{' '}
+                                                    {hangupUsage.pipelineEndCallOverrides.length > 0
+                                                        ? hangupUsage.pipelineEndCallOverrides.join(', ')
+                                                        : 'none'}
+                                                </div>
+                                                <div>
+                                                    Pipelines overriding guardrail mode:{' '}
+                                                    {hangupUsage.pipelineModeOverrides.length > 0
+                                                        ? hangupUsage.pipelineModeOverrides.map((p) => `${p.name}=${p.mode}`).join(', ')
+                                                        : 'none'}
+                                                </div>
+                                                <div>
+                                                    Pipelines overriding guardrail enabled:{' '}
+                                                    {hangupUsage.pipelineGuardrailOverrides.length > 0
+                                                        ? hangupUsage.pipelineGuardrailOverrides
+                                                            .map((p) => `${p.name}=${p.enabled ? 'on' : 'off'}`)
+                                                            .join(', ')
+                                                        : 'none'}
+                                                </div>
+                                            </div>
+                                        )}
+                                        <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-4">
+                                            <FormSelect
+                                                label="Hangup Guardrail Mode"
+                                                value={config.hangup_call?.policy?.mode || DEFAULT_HANGUP_POLICY_MODE}
+                                                onChange={(e) => updateHangupPolicy('mode', e.target.value)}
+                                                tooltip="Controls how strict the engine is when matching end-of-call intent from text: Relaxed matches broader phrasing, Normal balances false positives vs misses, Strict requires stronger matches."
+                                                options={[
+                                                    { value: 'relaxed', label: 'Relaxed' },
+                                                    { value: 'normal', label: 'Normal' },
+                                                    { value: 'strict', label: 'Strict' },
+                                                ]}
+                                            />
                                         </div>
-                                        <div>
-                                            Pipelines overriding end-call markers:{' '}
-                                            {hangupUsage.pipelineEndCallOverrides.length > 0
-                                                ? hangupUsage.pipelineEndCallOverrides.join(', ')
-                                                : 'none'}
-                                        </div>
-                                        <div>
-                                            Pipelines overriding guardrail mode:{' '}
-                                            {hangupUsage.pipelineModeOverrides.length > 0
-                                                ? hangupUsage.pipelineModeOverrides.map((p) => `${p.name}=${p.mode}`).join(', ')
-                                                : 'none'}
-                                        </div>
-                                        <div>
-                                            Pipelines overriding guardrail enabled:{' '}
-                                            {hangupUsage.pipelineGuardrailOverrides.length > 0
-                                                ? hangupUsage.pipelineGuardrailOverrides
-                                                    .map((p) => `${p.name}=${p.enabled ? 'on' : 'off'}`)
-                                                    .join(', ')
-                                                : 'none'}
+                                        <div className="mt-1 grid grid-cols-1 md:grid-cols-2 gap-4">
+                                            <div className="space-y-2">
+                                                <FormLabel tooltip="Caller-side phrases that indicate they want to end the call. If a transcript contains one of these markers, the hangup guardrail is more likely to allow call termination.">
+                                                    End Call Markers
+                                                </FormLabel>
+                                                <textarea
+                                                    className="w-full p-2 rounded border border-input bg-background text-sm min-h-[120px]"
+                                                    value={endCallMarkerDraft}
+                                                    onChange={(e) => setEndCallMarkerDraft(e.target.value)}
+                                                    onBlur={() => updateHangupMarkers('end_call', parseMarkerList(endCallMarkerDraft))}
+                                                />
+                                                <p className="text-xs text-muted-foreground">
+                                                    One phrase per line. Focus on user intent language (for example, "that&apos;s all", "no thanks", "end call").
+                                                </p>
+                                            </div>
+                                            <div className="space-y-2">
+                                                <FormLabel tooltip="Assistant-side phrases used to recognize that the AI has delivered a farewell. Helps fallback logic avoid hanging up before the closing message is complete.">
+                                                    Assistant Farewell Markers
+                                                </FormLabel>
+                                                <textarea
+                                                    className="w-full p-2 rounded border border-input bg-background text-sm min-h-[120px]"
+                                                    value={assistantFarewellMarkerDraft}
+                                                    onChange={(e) => setAssistantFarewellMarkerDraft(e.target.value)}
+                                                    onBlur={() => updateHangupMarkers('assistant_farewell', parseMarkerList(assistantFarewellMarkerDraft))}
+                                                />
+                                                <p className="text-xs text-muted-foreground">
+                                                    One phrase per line. Include common assistant closings (for example, "goodbye", "thank you for calling").
+                                                </p>
+                                            </div>
                                         </div>
                                     </div>
                                 )}
-                                <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-4">
-                                    <FormSelect
-                                        label="Hangup Guardrail Mode"
-                                        value={config.hangup_call?.policy?.mode || DEFAULT_HANGUP_POLICY_MODE}
-                                        onChange={(e) => updateHangupPolicy('mode', e.target.value)}
-                                        tooltip="Controls how strict the engine is when matching end-of-call intent from text: Relaxed matches broader phrasing, Normal balances false positives vs misses, Strict requires stronger matches."
-                                        options={[
-                                            { value: 'relaxed', label: 'Relaxed' },
-                                            { value: 'normal', label: 'Normal' },
-                                            { value: 'strict', label: 'Strict' },
-                                        ]}
-                                        disabled={!showHangupExpert}
-                                    />
-                                </div>
-                                <div className="mt-1 grid grid-cols-1 md:grid-cols-2 gap-4">
-                                    <div className="space-y-2">
-                                        <FormLabel tooltip="Caller-side phrases that indicate they want to end the call. If a transcript contains one of these markers, the hangup guardrail is more likely to allow call termination.">
-                                            End Call Markers
-                                        </FormLabel>
-                                        <textarea
-                                            className="w-full p-2 rounded border border-input bg-background text-sm min-h-[120px] disabled:cursor-not-allowed disabled:opacity-50"
-                                            value={endCallMarkerDraft}
-                                            onChange={(e) => setEndCallMarkerDraft(e.target.value)}
-                                            onBlur={() => updateHangupMarkers('end_call', parseMarkerList(endCallMarkerDraft))}
-                                            disabled={!showHangupExpert}
-                                        />
-                                        <p className="text-xs text-muted-foreground">
-                                            One phrase per line. Focus on user intent language (for example, "that&apos;s all", "no thanks", "end call").
-                                        </p>
-                                    </div>
-                                    <div className="space-y-2">
-                                        <FormLabel tooltip="Assistant-side phrases used to recognize that the AI has delivered a farewell. Helps fallback logic avoid hanging up before the closing message is complete.">
-                                            Assistant Farewell Markers
-                                        </FormLabel>
-                                        <textarea
-                                            className="w-full p-2 rounded border border-input bg-background text-sm min-h-[120px] disabled:cursor-not-allowed disabled:opacity-50"
-                                            value={assistantFarewellMarkerDraft}
-                                            onChange={(e) => setAssistantFarewellMarkerDraft(e.target.value)}
-                                            onBlur={() => updateHangupMarkers('assistant_farewell', parseMarkerList(assistantFarewellMarkerDraft))}
-                                            disabled={!showHangupExpert}
-                                        />
-                                        <p className="text-xs text-muted-foreground">
-                                            One phrase per line. Include common assistant closings (for example, "goodbye", "thank you for calling").
-                                        </p>
-                                    </div>
-                                </div>
                             </div>
                         </div>
                     )}
@@ -961,14 +1198,14 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onSaveNow }: ToolFo
 	                            onClick={() => {
 	                                const existing = config.extensions?.internal || {};
 	                                let idx = Object.keys(existing).length + 1;
-                                let key = `ext_${idx}`;
+	                                let key = `ext_${idx}`;
 	                                while (Object.prototype.hasOwnProperty.call(existing, key)) {
 	                                    idx += 1;
 	                                    key = `ext_${idx}`;
 	                                }
                                     const rowId = getInternalExtRowId(key);
                                     getInternalExtRowMeta(rowId).autoDerivedKey = true;
-	                                updateNestedConfig('extensions', 'internal', { ...existing, [key]: { name: '', description: '', dial_string: '', transfer: true, device_state_tech: 'auto', action_type: 'transfer', aliases: [], pass_caller_info: false } });
+	                                updateNestedConfig('extensions', 'internal', { ...existing, [key]: { name: '', description: '', dial_string: '', transfer: true, device_state_tech: 'auto', action_type: 'transfer', aliases: [] } });
 	                            }}
 	                            className="text-xs flex items-center bg-secondary px-2 py-1 rounded hover:bg-secondary/80 transition-colors"
 	                        >
@@ -1009,39 +1246,47 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onSaveNow }: ToolFo
                                     const title = titleParts.join(' • ');
 
                                     return (
-	                            <div key={rowId} className="grid grid-cols-1 md:grid-cols-12 gap-2 p-3 border rounded bg-background/50 items-center">
-	                                <div className="md:col-span-1">
-                                        {(() => {
-                                            const derived = extractNumericExtensionKeyFromDialString(ext?.dial_string || '');
-                                            const displayKey = isNumericKey(key) ? key : derived;
-                                            return (
-	                                            <input
-	                                                className="w-full border rounded px-2 py-1 text-sm bg-muted text-muted-foreground"
-	                                                placeholder="Auto"
-	                                                value={displayKey || ''}
-	                                                disabled
-	                                                title="Auto-derived from dial string (e.g. PJSIP/2765 -> 2765). Numeric keys are locked to prevent accidental renames."
-	                                            />
-                                            );
-                                        })()}
+	                            <div key={rowId} className="flex flex-col gap-4 p-5 border border-border/60 rounded-lg bg-card/40 hover:bg-card/60 transition-colors shadow-sm">
+
+                                {/* Core Info Row */}
+                                <div className="flex flex-col xl:flex-row gap-4 xl:items-end items-start w-full">
+	                                <div className="w-full xl:w-24 shrink-0">
+                                        <label className="block text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1.5 ml-1">Ext</label>
+	                                    <input
+	                                        className="w-full border border-input rounded-md px-3 py-2 text-sm bg-background focus:ring-1 focus:ring-ring focus:outline-none transition-shadow"
+	                                        placeholder="E.g. 6000"
+	                                        value={internalExtKeyDraftByRowId[rowId] ?? String(key || '')}
+	                                        onChange={(e) => setInternalExtKeyDraftByRowId((prev) => ({ ...prev, [rowId]: e.target.value }))}
+	                                        onBlur={() => commitInternalExtensionKeyDraft(rowId, key)}
+	                                        onKeyDown={(e) => {
+	                                            if (e.key === 'Enter') {
+	                                                e.preventDefault();
+	                                                commitInternalExtensionKeyDraft(rowId, key);
+	                                                (e.target as HTMLInputElement).blur();
+	                                            }
+	                                        }}
+	                                        title="Numeric extension key used for Live Agent routing. New placeholder keys can be renamed here or auto-derived from the dial string."
+	                                    />
 	                                </div>
-	                                <div className="md:col-span-2">
+	                                <div className="w-full xl:w-64 shrink-0">
+                                        <label className="block text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1.5 ml-1">Agent Name</label>
 	                                    <input
-	                                        className="w-full border rounded px-2 py-1 text-sm"
-	                                        placeholder="Name"
-                                        value={ext.name || ''}
-                                        onChange={(e) => {
-                                            const updated = { ...(config.extensions?.internal || {}) };
-                                            updated[key] = { ...ext, name: e.target.value };
-                                            updateNestedConfig('extensions', 'internal', updated);
-                                        }}
-                                        title="Agent Name"
-                                    />
-                                </div>
-	                                <div className="md:col-span-2">
+	                                        className="w-full border border-input rounded-md px-3 py-2 text-sm bg-background focus:ring-1 focus:ring-ring focus:outline-none transition-shadow"
+	                                        placeholder="E.g. Support Team"
+                                            value={ext.name || ''}
+                                            onChange={(e) => {
+                                                const updated = { ...(config.extensions?.internal || {}) };
+                                                updated[key] = { ...ext, name: e.target.value };
+                                                updateNestedConfig('extensions', 'internal', updated);
+                                            }}
+                                            title="Agent Name"
+                                        />
+                                    </div>
+	                                <div className="w-full xl:flex-1 shrink-0">
+                                        <label className="block text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1.5 ml-1">Dial String</label>
 	                                    <input
-	                                        className="w-full border rounded px-2 py-1 text-sm"
-	                                        placeholder="Dial String"
+	                                        className="w-full border border-input rounded-md px-3 py-2 text-sm bg-background focus:ring-1 focus:ring-ring focus:outline-none transition-shadow"
+	                                        placeholder="E.g. PJSIP/6000"
 	                                        value={ext.dial_string || ''}
 	                                        onChange={(e) => {
                                                 const nextDial = e.target.value;
@@ -1083,113 +1328,25 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onSaveNow }: ToolFo
 	                                        title="PJSIP/..."
 	                                    />
 	                                </div>
-                                <div className="md:col-span-2">
-                                    <select
-                                        className="w-full border rounded px-2 py-1 text-sm bg-background"
-                                        value={ext.device_state_tech || 'auto'}
-                                        onChange={(e) => {
-                                            const updated = { ...(config.extensions?.internal || {}) };
-                                            updated[key] = { ...ext, device_state_tech: e.target.value };
-                                            updateNestedConfig('extensions', 'internal', updated);
-                                        }}
-                                        title="Device state technology for availability checks"
-                                    >
-                                        <option value="auto">Device Tech: auto</option>
-                                        <option value="PJSIP">PJSIP</option>
-                                        <option value="SIP">SIP</option>
-                                        <option value="IAX2">IAX2</option>
-                                        <option value="DAHDI">DAHDI</option>
-                                    </select>
-                                </div>
-                                <div className="md:col-span-2">
-                                    <input
-                                        className="w-full border rounded px-2 py-1 text-sm"
-                                        placeholder="Description"
-                                        value={ext.description || ''}
-                                        onChange={(e) => {
-                                            const updated = { ...(config.extensions?.internal || {}) };
-                                            updated[key] = { ...ext, description: e.target.value };
-                                            updateNestedConfig('extensions', 'internal', updated);
-                                        }}
-	                                        title="Description"
-	                                    />
-	                                </div>
-                                    <>
-                                        <div className="md:col-span-2">
-                                            <select
-                                                className="w-full border rounded px-2 py-1 text-sm bg-background disabled:cursor-not-allowed disabled:opacity-50"
-                                                value={ext.action_type || 'transfer'}
-                                                onChange={(e) => {
-                                                    const updated = { ...(config.extensions?.internal || {}) };
-                                                    updated[key] = { ...ext, action_type: e.target.value };
-                                                    updateNestedConfig('extensions', 'internal', updated);
-                                                }}
-                                                title="Action type used when transfer tool resolves this target"
-                                                disabled={!showLiveAgentsExpert}
-                                            >
-                                                <option value="transfer">action_type: transfer</option>
-                                                <option value="voicemail">action_type: voicemail</option>
-                                                <option value="queue">action_type: queue</option>
-                                                <option value="ringgroup">action_type: ringgroup</option>
-                                            </select>
-                                        </div>
-	                                        <div className="md:col-span-2">
-	                                            <input
-	                                                className="w-full border rounded px-2 py-1 text-sm disabled:cursor-not-allowed disabled:opacity-50"
-	                                                placeholder="Aliases (comma-separated)"
-	                                                value={internalAliasesDraftByRowId[rowId] ?? (Array.isArray(ext.aliases) ? ext.aliases.join(', ') : (ext.aliases || ''))}
-	                                                onChange={(e) => {
-	                                                    const raw = String(e.target.value || '');
-	                                                    setInternalAliasesDraftByRowId((prev) => ({ ...prev, [rowId]: raw }));
-	                                                }}
-	                                                onBlur={() => {
-	                                                    const raw = internalAliasesDraftByRowId[rowId] ?? '';
-	                                                    const aliases = String(raw)
-	                                                        .split(',')
-	                                                        .map((s) => s.trim())
-	                                                        .filter(Boolean);
-	                                                    const committed = aliases.join(', ');
 
-	                                                    internalAliasesCommittedRef.current[rowId] = committed;
-	                                                    setInternalAliasesDraftByRowId((prev) => ({ ...prev, [rowId]: committed }));
-
-	                                                    const updated = { ...(config.extensions?.internal || {}) };
-	                                                    updated[key] = { ...ext, aliases };
-	                                                    updateNestedConfig('extensions', 'internal', updated);
-	                                                }}
-	                                                title="Alternative names users can say to target this live agent"
-	                                                disabled={!showLiveAgentsExpert}
-	                                            />
-	                                        </div>
-                                        <div className="md:col-span-2">
-                                            <FormSwitch
-                                                label="Pass Caller Info"
-                                                description="Include caller name/number and last transcript in transfer context."
-                                                checked={ext.pass_caller_info ?? false}
-                                                onChange={(e) => {
-                                                    const updated = { ...(config.extensions?.internal || {}) };
-                                                    updated[key] = { ...ext, pass_caller_info: e.target.checked };
-                                                    updateNestedConfig('extensions', 'internal', updated);
-                                                }}
-                                                disabled={!showLiveAgentsExpert}
-                                            />
-                                        </div>
-                                    </>
-	                                <div className="md:col-span-3 flex justify-end items-center gap-3 min-w-0 overflow-hidden">
+                                    {/* Action Buttons Compacted into Row 1 */}
+                                    <div className="flex items-center gap-3 shrink-0 w-full xl:w-auto xl:justify-end mt-2 xl:mt-0 xl:pb-[1px]">
                                         <button
                                             type="button"
-                                            className={`inline-flex items-center gap-2 px-2.5 py-1 rounded-full text-xs font-medium border ${pillClass} hover:bg-accent/40 transition-colors min-w-0 max-w-[150px] overflow-hidden`}
+                                            className={`inline-flex items-center justify-center gap-2 px-4 py-2 h-[38px] rounded-md text-xs font-semibold border shadow-sm ${pillClass} hover:opacity-80 transition-opacity`}
                                             title={title}
                                             onClick={() => checkLiveAgentStatus(rowId, key, ext)}
                                         >
                                             {loading ? (
-                                                <Loader2 className="w-3 h-3 animate-spin shrink-0" />
+                                                <Loader2 className="w-4 h-4 animate-spin shrink-0" />
                                             ) : (
-                                                <span className={`w-2 h-2 rounded-full ${dotClass} shrink-0`} />
+                                                <span className={`w-2 h-2 rounded-full ${dotClass} shadow-sm shrink-0`} />
                                             )}
-                                            <span className="truncate whitespace-nowrap">{label}</span>
+                                            <span className="truncate max-w-[120px]">{label}</span>
                                         </button>
-                                        <div className="shrink-0">
+                                        
+                                        <div className="flex items-center gap-2.5 bg-secondary/30 px-3 py-1.5 h-[38px] rounded-md border border-border/50 shadow-sm shrink-0">
+                                            <span className="text-[10px] font-bold tracking-wide uppercase text-muted-foreground pt-[1px]">Enabled</span>
 	                                        <FormSwitch
 	                                            checked={ext.transfer ?? true}
 	                                            onChange={(e) => {
@@ -1197,26 +1354,120 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onSaveNow }: ToolFo
 	                                                updated[key] = { ...ext, transfer: e.target.checked };
 	                                                updateNestedConfig('extensions', 'internal', updated);
 	                                            }}
-	                                            className="mb-0 border-0 p-0 bg-transparent"
+	                                            className="mb-0 border-0 p-0 bg-transparent flex-shrink-0"
 	                                            label=""
 	                                            description=""
 	                                        />
                                         </div>
-                                        <div className="shrink-0">
-	                                        <button
-	                                            onClick={() => {
-	                                                const updated = { ...(config.extensions?.internal || {}) };
-	                                                delete updated[key];
-                                                    deleteInternalExtRowId(key);
-	                                                updateNestedConfig('extensions', 'internal', updated);
-	                                            }}
-	                                            className="p-2 text-destructive hover:bg-destructive/10 rounded"
-	                                            title="Delete Extension"
-	                                        >
-	                                            <Trash2 className="w-4 h-4" />
-	                                        </button>
+
+                                        <button
+                                            onClick={() => {
+                                                const updated = { ...(config.extensions?.internal || {}) };
+                                                delete updated[key];
+                                                deleteInternalExtRowId(key);
+                                                updateNestedConfig('extensions', 'internal', updated);
+                                            }}
+                                            className="h-[38px] w-[38px] flex items-center justify-center text-muted-foreground hover:text-destructive hover:bg-destructive/10 rounded-md transition-colors shrink-0"
+                                            title="Delete Extension"
+                                        >
+                                            <Trash2 className="w-4.5 h-4.5" />
+                                        </button>
+                                    </div>
+                                </div>
+
+                                {/* Full width description row */}
+                                <div className="w-full mt-2">
+                                    <label className="block text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1.5 ml-1">Description</label>
+                                    <input
+                                        className="w-full border border-input rounded-md px-3 py-2 text-sm bg-background focus:ring-1 focus:ring-ring focus:outline-none transition-shadow"
+                                        placeholder="Describe this extension..."
+                                        value={ext.description || ''}
+                                        onChange={(e) => {
+                                            const updated = { ...(config.extensions?.internal || {}) };
+                                            updated[key] = { ...ext, description: e.target.value };
+                                            updateNestedConfig('extensions', 'internal', updated);
+                                        }}
+                                        title="Description"
+                                    />
+                                </div>
+
+                                {/* Expert Row */}
+                                {showLiveAgentsExpert && (
+                                    <div className="flex flex-col gap-4 p-5 bg-secondary/30 border border-border/50 rounded-lg mt-3 relative">
+                                        <div className="absolute -top-3 left-4 bg-background px-2.5 text-[10px] font-bold text-amber-600 dark:text-amber-500 tracking-wider uppercase rounded-full border border-amber-200 dark:border-amber-900/50 shadow-sm">
+                                            Advanced Routing
                                         </div>
-	                                </div>
+                                        <div className="grid grid-cols-1 md:grid-cols-3 gap-5 items-start mt-1">
+                                            <div>
+                                                <label className="block text-[11px] font-medium text-muted-foreground mb-1.5 uppercase tracking-wider">Device Tech</label>
+                                                <select
+                                                    className="w-full border border-input rounded-md px-3 py-2 text-sm bg-background focus:ring-1 focus:ring-ring focus:outline-none transition-shadow"
+                                                    value={ext.device_state_tech || 'auto'}
+                                                    onChange={(e) => {
+                                                        const updated = { ...(config.extensions?.internal || {}) };
+                                                        updated[key] = { ...ext, device_state_tech: e.target.value };
+                                                        updateNestedConfig('extensions', 'internal', updated);
+                                                    }}
+                                                    title="Device state technology for availability checks"
+                                                >
+                                                    <option value="auto">auto</option>
+                                                    <option value="PJSIP">PJSIP</option>
+                                                    <option value="SIP">SIP</option>
+                                                    <option value="IAX2">IAX2</option>
+                                                    <option value="DAHDI">DAHDI</option>
+                                                </select>
+                                            </div>
+                                            <div>
+                                                <label className="block text-[11px] font-medium text-muted-foreground mb-1.5 uppercase tracking-wider">Action Type</label>
+                                                <select
+                                                    className="w-full border border-input rounded-md px-3 py-2 text-sm bg-background focus:ring-1 focus:ring-ring focus:outline-none transition-shadow disabled:cursor-not-allowed disabled:opacity-50"
+                                                    value={ext.action_type || 'transfer'}
+                                                    onChange={(e) => {
+                                                        const updated = { ...(config.extensions?.internal || {}) };
+                                                        updated[key] = { ...ext, action_type: e.target.value };
+                                                        updateNestedConfig('extensions', 'internal', updated);
+                                                    }}
+                                                    title="Action type used when transfer tool resolves this target"
+                                                    disabled={!showLiveAgentsExpert}
+                                                >
+                                                    <option value="transfer">transfer</option>
+                                                    <option value="voicemail">voicemail</option>
+                                                    <option value="queue">queue</option>
+                                                    <option value="ringgroup">ringgroup</option>
+                                                </select>
+                                            </div>
+                                            <div>
+                                                <label className="block text-[11px] font-medium text-muted-foreground mb-1.5 uppercase tracking-wider">Aliases (comma-separated)</label>
+                                                <input
+                                                    className="w-full border border-input rounded-md px-3 py-2 text-sm bg-background focus:ring-1 focus:ring-ring focus:outline-none transition-shadow disabled:cursor-not-allowed disabled:opacity-50"
+                                                    placeholder="e.g. support, agent"
+                                                    value={internalAliasesDraftByRowId[rowId] ?? (Array.isArray(ext.aliases) ? ext.aliases.join(', ') : (ext.aliases || ''))}
+                                                    onChange={(e) => {
+                                                        const raw = String(e.target.value || '');
+                                                        setInternalAliasesDraftByRowId((prev) => ({ ...prev, [rowId]: raw }));
+                                                    }}
+                                                    onBlur={() => {
+                                                        const raw = internalAliasesDraftByRowId[rowId] ?? '';
+                                                        const aliases = String(raw)
+                                                            .split(',')
+                                                            .map((s) => s.trim())
+                                                            .filter(Boolean);
+                                                        const committed = aliases.join(', ');
+
+                                                        internalAliasesCommittedRef.current[rowId] = committed;
+                                                        setInternalAliasesDraftByRowId((prev) => ({ ...prev, [rowId]: committed }));
+
+                                                        const updated = { ...(config.extensions?.internal || {}) };
+                                                        updated[key] = { ...ext, aliases };
+                                                        updateNestedConfig('extensions', 'internal', updated);
+                                                    }}
+                                                    title="Alternative names users can say to target this live agent"
+                                                    disabled={!showLiveAgentsExpert}
+                                                />
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
 	                            </div>
                                     );
                                 })()

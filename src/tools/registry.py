@@ -90,8 +90,10 @@ class ToolRegistry:
         # Try alias lookup
         canonical_name = self.TOOL_ALIASES.get(name)
         if canonical_name:
+            if name in {"transfer_call", "transfer_to_queue"}:
+                logger.warning("Deprecated tool alias requested: %s -> %s", name, canonical_name)
             return self._tools.get(canonical_name)
-        
+
         return None
 
     def canonicalize_tool_name(self, name: str) -> str:

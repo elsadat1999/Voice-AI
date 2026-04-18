@@ -2005,14 +2005,15 @@ class GoogleLiveProvider(AIProviderInterface):
                     provider_name="google_live",
                 )
 
-                # Enforce allowlist from context
-                if not self._allowed_tools or not tool_registry.is_tool_allowed(func_name, self._allowed_tools):
+                block_result = await tool_context.get_tool_block_response(func_name)
+                if block_result:
+                    result = block_result
+                elif not self._allowed_tools or not tool_registry.is_tool_allowed(func_name, self._allowed_tools):
                     result = {
                         "status": "error",
                         "message": f"Tool '{func_name}' not allowed for this call",
                     }
                 else:
-                # Execute tool
                     result = await self._tool_adapter.execute_tool(
                         func_name,
                         func_args,

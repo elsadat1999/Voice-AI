@@ -13,9 +13,11 @@ def detect_capabilities(config: LocalAIConfig) -> Dict[str, Any]:
         "kroko_embedded": False,
         "faster_whisper": False,
         "whisper_cpp": False,
+        "tone": False,
         "piper": False,
         "kokoro": False,
         "melotts": False,
+        "silero": False,
         "llama": False,
     }
 
@@ -48,6 +50,12 @@ def detect_capabilities(config: LocalAIConfig) -> Dict[str, Any]:
         pass
 
     try:
+        from tone.pipeline import StreamingCTCPipeline  # noqa: F401
+        capabilities["tone"] = True
+    except ImportError:
+        pass
+
+    try:
         from piper import PiperVoice  # noqa: F401
         capabilities["piper"] = True
     except ImportError:
@@ -67,6 +75,15 @@ def detect_capabilities(config: LocalAIConfig) -> Dict[str, Any]:
         capabilities["melotts"] = True
     except ImportError:
         pass
+
+    # Silero: detect by import availability instead of build-time env var
+    try:
+        import torch  # noqa: F401
+        silero_available = True
+    except ImportError:
+        silero_available = False
+    if silero_available:
+        capabilities["silero"] = True
 
     try:
         from llama_cpp import Llama  # noqa: F401

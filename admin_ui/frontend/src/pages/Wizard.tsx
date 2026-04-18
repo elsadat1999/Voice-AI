@@ -22,6 +22,7 @@ interface SetupConfig {
     elevenlabs_key?: string;
     elevenlabs_agent_id?: string;
     cartesia_key?: string;
+    camb_key?: string;
     greeting: string;
     ai_name: string;
     ai_role: string;
@@ -37,6 +38,8 @@ interface SetupConfig {
     kokoro_voice?: string;
     kokoro_api_key?: string;
     kokoro_api_base_url?: string;
+    silero_speaker?: string;
+    silero_language?: string;
     local_llm_model?: string;
     local_llm_custom_url?: string;
     local_llm_custom_filename?: string;
@@ -398,16 +401,30 @@ exten => s,1,NoOp(AI Agent Call)
                     (m: any) => (m.backend || '').toLowerCase() === currentTtsBackend
                 );
                 if (sameTtsBackendModels.length > 0) {
-                    setConfig(prev => ({
-                        ...prev,
-                        local_tts_model: sameTtsBackendModels[0].id,
-                    }));
+                    const autoModel = sameTtsBackendModels[0];
+                    setConfig(prev => {
+                        const updates: Partial<SetupConfig> = { local_tts_model: autoModel.id };
+                        if (autoModel.backend === 'silero') {
+                            updates.silero_speaker = autoModel.speaker;
+                            const lang = (autoModel.language || '').split('-')[0];
+                            updates.silero_language = lang === 'uk' ? 'ua' : lang;
+                        }
+                        return { ...prev, ...updates };
+                    });
                 } else {
-                    setConfig(prev => ({
-                        ...prev,
-                        local_tts_model: ttsModels[0].id,
-                        local_tts_backend: ttsModels[0].backend
-                    }));
+                    const autoModel = ttsModels[0];
+                    setConfig(prev => {
+                        const updates: Partial<SetupConfig> = {
+                            local_tts_model: autoModel.id,
+                            local_tts_backend: autoModel.backend,
+                        };
+                        if (autoModel.backend === 'silero') {
+                            updates.silero_speaker = autoModel.speaker;
+                            const lang = (autoModel.language || '').split('-')[0];
+                            updates.silero_language = lang === 'uk' ? 'ua' : lang;
+                        }
+                        return { ...prev, ...updates };
+                    });
                 }
             }
         }
@@ -576,14 +593,22 @@ exten => s,1,NoOp(AI Agent Call)
             setStartingLocalServer(false);
         }
 
-        // AAVA-177: Use 60-minute timeout for image builds, 2-minute for normal starts
-        const pollTimeoutMs = isBuilding ? 3_600_000 : 120_000;
+        // AAVA-177: Timeout tiers:
+        //   60 min  — Docker image build (isBuilding)
+        //   10 min  — First-run HuggingFace model download (bumped dynamically when detected)
+        //    2 min  — Normal container startup (pre-downloaded models)
+        const NORMAL_TIMEOUT_MS   = 120_000;
+        const DOWNLOAD_TIMEOUT_MS = 600_000;
+        const BUILD_TIMEOUT_MS    = 3_600_000;
+        // Use a ref so the active timeout ceiling can be raised mid-poll without
+        // restarting the loop (e.g. when a model download is detected on the first tick).
+        const effectiveTimeoutRef = { current: isBuilding ? BUILD_TIMEOUT_MS : NORMAL_TIMEOUT_MS };
 
         const pollLogs = async () => {
             if (localServerPollRef.current.cancelled) return;
             const startedAt = localServerPollRef.current.startedAt || Date.now();
             const elapsed = Date.now() - startedAt;
-            if (elapsed >= pollTimeoutMs) {
+            if (elapsed >= effectiveTimeoutRef.current) {
                 setLocalAIStatus((prev) => ({
                     ...prev,
                     serverLogs: [...prev.serverLogs, "Polling timed out after maximum wait time."],
@@ -592,10 +617,18 @@ exten => s,1,NoOp(AI Agent Call)
             }
             try {
                 const logRes = await axios.get('/api/wizard/local/server-logs');
+                // If the server reports an active model download, bump the ceiling to
+                // 10 minutes so large HuggingFace downloads (distil-large-v3, turbo,
+                // large-v3, etc.) aren't cut off by the normal 2-minute window.
+                if (logRes.data.downloading && !isBuilding) {
+                    effectiveTimeoutRef.current = DOWNLOAD_TIMEOUT_MS;
+                }
                 if (!localServerPollRef.current.cancelled) {
                     setLocalAIStatus((prev) => ({
                         ...prev,
-                        serverLogs: logRes.data.logs || [],
+                        serverLogs: logRes.data.downloading && !prev.serverLogs.includes("⬇️ Downloading model from HuggingFace, please wait…")
+                            ? [...(logRes.data.logs || []), "⬇️ Downloading model from HuggingFace, please wait…"]
+                            : logRes.data.logs || [],
                         serverReady: logRes.data.ready,
                         serverPhase: logRes.data.phase || (logRes.data.ready ? 'running' : 'starting')
                     }));
@@ -649,6 +682,15 @@ exten => s,1,NoOp(AI Agent Call)
         setLocalAIStatus(prev => ({ ...prev, downloading: true, downloadOutput: [], downloadProgress: null }));
 
         try {
+            // Derive Silero speaker/language from the selected catalog entry
+            const selectedTtsEntry = (modelCatalog?.tts || []).find((m: any) => m.id === config.local_tts_model);
+            const sileroSpeaker = selectedTtsEntry?.backend === 'silero' ? selectedTtsEntry.speaker : undefined;
+            const sileroLang = selectedTtsEntry?.backend === 'silero'
+                ? (selectedTtsEntry.language || '').split('-')[0]  // "ru-RU" -> "ru", "uk-UA" -> "uk" -> remap to "ua"
+                : undefined;
+            // Silero uses "ua" internally for Ukrainian, not "uk"
+            const sileroLanguage = sileroLang === 'uk' ? 'ua' : sileroLang;
+
             const startRes = await axios.post('/api/wizard/local/download-selected-models', {
                 stt: config.local_stt_backend,
                 llm: config.local_llm_model || pickRecommendedLlmId(),
@@ -664,6 +706,8 @@ exten => s,1,NoOp(AI Agent Call)
                 llm_model_path: config.local_llm_custom_filename,
                 kokoro_api_base_url: config.kokoro_api_base_url,
                 kokoro_api_key: config.kokoro_api_key,
+                silero_speaker: sileroSpeaker,
+                silero_language: sileroLanguage,
                 skip_llm_download: skipLlmDownload
             });
 
@@ -827,6 +871,20 @@ exten => s,1,NoOp(AI Agent Call)
                     return;
                 }
             }
+            if (config.provider === 'cambai') {
+                if (!config.camb_key) {
+                    showToast('CAMB AI API key is required.', 'error');
+                    return;
+                }
+                if (!config.deepgram_key) {
+                    showToast('Deepgram API key is required for CAMB AI pipeline (STT).', 'error');
+                    return;
+                }
+                if (!config.openai_key) {
+                    showToast('OpenAI API key is required for CAMB AI pipeline (LLM).', 'error');
+                    return;
+                }
+            }
         }
 
         if (step === 3) {
@@ -930,6 +988,36 @@ exten => s,1,NoOp(AI Agent Call)
                     } else {
                         throw new Error('ElevenLabs API Key is required');
                     }
+                }
+
+                if (config.provider === 'cambai') {
+                    // CAMB AI pipeline requires three keys: CAMB AI (TTS), Deepgram (STT), OpenAI (LLM)
+                    if (!config.camb_key) {
+                        throw new Error('CAMB AI API Key is required');
+                    }
+                    const cambRes = await axios.post('/api/wizard/validate-key', {
+                        provider: 'cambai',
+                        api_key: config.camb_key
+                    });
+                    if (!cambRes.data.valid) throw new Error(`CAMB AI Key Invalid: ${cambRes.data.error}`);
+
+                    if (!config.deepgram_key) {
+                        throw new Error('Deepgram API Key is required for CAMB AI pipeline (STT)');
+                    }
+                    const dgRes = await axios.post('/api/wizard/validate-key', {
+                        provider: 'deepgram',
+                        api_key: config.deepgram_key
+                    });
+                    if (!dgRes.data.valid) throw new Error(`Deepgram Key Invalid: ${dgRes.data.error}`);
+
+                    if (!config.openai_key) {
+                        throw new Error('OpenAI API Key is required for CAMB AI pipeline (LLM)');
+                    }
+                    const oaRes = await axios.post('/api/wizard/validate-key', {
+                        provider: 'openai',
+                        api_key: config.openai_key
+                    });
+                    if (!oaRes.data.valid) throw new Error(`OpenAI Key Invalid: ${oaRes.data.error}`);
                 }
 
                 // Only verify Local AI health for local_hybrid on step 3
@@ -1129,6 +1217,12 @@ exten => s,1,NoOp(AI Agent Call)
                                 id="elevenlabs_agent"
                                 title="ElevenLabs Conversational"
                                 description="High-quality voices with pre-configured agent. Configure voice, prompt, and tools in ElevenLabs dashboard."
+                                icon={Cloud}
+                            />
+                            <ProviderCard
+                                id="cambai"
+                                title="CAMB AI"
+                                description="Multilingual MARS TTS (mars-flash ~150ms latency, voice cloning, 16+ languages). Pipeline: Deepgram STT + OpenAI LLM + CAMB AI TTS."
                                 icon={Cloud}
                             />
                         </div>
@@ -1377,18 +1471,25 @@ exten => s,1,NoOp(AI Agent Call)
                                                             const langOk = m.language === selectedLanguage || m.language === 'multi';
                                                             return langOk && (m.backend || '').toLowerCase() === String(nextBackend).toLowerCase();
                                                         });
-                                                        setConfig({
-                                                            ...config,
+                                                        const picked = candidates[0];
+                                                        const updates: Partial<SetupConfig> = {
                                                             local_tts_backend: nextBackend,
                                                             kokoro_mode: nextKokoroMode,
-                                                            local_tts_model: candidates[0]?.id || ''
-                                                        });
+                                                            local_tts_model: picked?.id || '',
+                                                        };
+                                                        if (picked?.backend === 'silero') {
+                                                            updates.silero_speaker = picked.speaker;
+                                                            const lang = (picked.language || '').split('-')[0];
+                                                            updates.silero_language = lang === 'uk' ? 'ua' : lang;
+                                                        }
+                                                        setConfig({ ...config, ...updates });
                                                     }}
                                                 >
                                                     <option value="piper">Piper (Local)</option>
                                                     <option value="kokoro_local">Kokoro (Local)</option>
                                                     <option value="kokoro_cloud">Kokoro (Cloud/API)</option>
                                                     <option value="melotts">MeloTTS (Local/CPU)</option>
+                                                    <option value="silero">Silero (Local/Multi-language)</option>
                                                 </select>
                                             </div></div>
 
@@ -1401,18 +1502,26 @@ exten => s,1,NoOp(AI Agent Call)
                                                     onChange={e => {
                                                         const modelId = e.target.value;
                                                         const picked = (modelCatalog.tts || []).find((m: any) => m.id === modelId);
-                                                        setConfig({
-                                                            ...config,
+                                                        const updates: Partial<SetupConfig> = {
                                                             local_tts_model: modelId,
-                                                            local_tts_backend: picked?.backend || config.local_tts_backend
-                                                        });
+                                                            local_tts_backend: picked?.backend || config.local_tts_backend,
+                                                        };
+                                                        if (picked?.backend === 'silero') {
+                                                            updates.silero_speaker = picked.speaker;
+                                                            const lang = (picked.language || '').split('-')[0];
+                                                            updates.silero_language = lang === 'uk' ? 'ua' : lang;
+                                                        }
+                                                        setConfig({ ...config, ...updates });
                                                     }}
-                                                    disabled={(config.local_tts_backend || '').toLowerCase() === 'melotts'}
+                                                    disabled={['melotts'].includes((config.local_tts_backend || '').toLowerCase())}
                                                 >
                                                     {(() => {
                                                         const backend = (config.local_tts_backend || 'piper').toLowerCase();
                                                         if (backend === 'melotts') {
                                                             return <option value="">MeloTTS (no downloadable model)</option>;
+                                                        }
+                                                        if (backend === 'silero') {
+                                                            return <option value="">Silero (auto-download via torch.hub)</option>;
                                                         }
                                                         const candidates = (modelCatalog.tts || []).filter((m: any) => {
                                                             const langOk = m.language === selectedLanguage || m.language === 'multi';
@@ -1740,6 +1849,86 @@ exten => s,1,NoOp(AI Agent Call)
                             </div>
                         )}
 
+                        {config.provider === 'cambai' && (
+                            <div className="space-y-4">
+                                <div className="bg-blue-50/50 dark:bg-blue-900/10 p-4 rounded-md border border-blue-100 dark:border-blue-900/20 text-sm text-blue-800 dark:text-blue-300">
+                                    <p className="font-semibold mb-1">CAMB AI Pipeline</p>
+                                    <p className="text-blue-700 dark:text-blue-400">
+                                        Pipeline mode using <strong>Deepgram STT</strong> + <strong>OpenAI LLM</strong> + <strong>CAMB AI TTS</strong> (mars-flash, ~150ms latency).
+                                        Requires three API keys.
+                                    </p>
+                                </div>
+                                <div className="space-y-2">
+                                    <label className="text-sm font-medium">CAMB AI API Key</label>
+                                    <div className="flex space-x-2">
+                                        <input
+                                            type="password"
+                                            className="w-full p-2 rounded-md border border-input bg-background"
+                                            value={config.camb_key}
+                                            onChange={e => setConfig({ ...config, camb_key: e.target.value })}
+                                            placeholder="UUID..."
+                                        />
+                                        <button
+                                            type="button"
+                                            onClick={() => handleTestKey('cambai', config.camb_key || '')}
+                                            className="px-3 py-2 rounded-md bg-secondary text-secondary-foreground hover:bg-secondary/80"
+                                            disabled={loading}
+                                        >
+                                            Test
+                                        </button>
+                                    </div>
+                                    <p className="text-xs text-muted-foreground">
+                                        Get yours at{' '}
+                                        <a href="https://studio.camb.ai" target="_blank" rel="noopener noreferrer" className="text-primary hover:underline">
+                                            studio.camb.ai
+                                        </a>
+                                    </p>
+                                </div>
+                                <div className="space-y-2">
+                                    <label className="text-sm font-medium">Deepgram API Key (for STT)</label>
+                                    <div className="flex space-x-2">
+                                        <input
+                                            type="password"
+                                            className="w-full p-2 rounded-md border border-input bg-background"
+                                            value={config.deepgram_key}
+                                            onChange={e => setConfig({ ...config, deepgram_key: e.target.value })}
+                                            placeholder="Token..."
+                                        />
+                                        <button
+                                            type="button"
+                                            onClick={() => handleTestKey('deepgram', config.deepgram_key || '')}
+                                            className="px-3 py-2 rounded-md bg-secondary text-secondary-foreground hover:bg-secondary/80"
+                                            disabled={loading}
+                                        >
+                                            Test
+                                        </button>
+                                    </div>
+                                    <p className="text-xs text-muted-foreground">For speech-to-text transcription.</p>
+                                </div>
+                                <div className="space-y-2">
+                                    <label className="text-sm font-medium">OpenAI API Key (for LLM)</label>
+                                    <div className="flex space-x-2">
+                                        <input
+                                            type="password"
+                                            className="w-full p-2 rounded-md border border-input bg-background"
+                                            value={config.openai_key}
+                                            onChange={e => setConfig({ ...config, openai_key: e.target.value })}
+                                            placeholder="sk-..."
+                                        />
+                                        <button
+                                            type="button"
+                                            onClick={() => handleTestKey('openai', config.openai_key || '')}
+                                            className="px-3 py-2 rounded-md bg-secondary text-secondary-foreground hover:bg-secondary/80"
+                                            disabled={loading}
+                                        >
+                                            Test
+                                        </button>
+                                    </div>
+                                    <p className="text-xs text-muted-foreground">For LLM reasoning (gpt-4o-mini by default).</p>
+                                </div>
+                            </div>
+                        )}
+
                         {config.provider === 'local' && (
                             <div className="space-y-6">
                                 <div className="bg-green-50/50 dark:bg-green-900/10 p-4 rounded-md border border-green-100 dark:border-green-900/20">
@@ -1973,11 +2162,16 @@ exten => s,1,NoOp(AI Agent Call)
                                                         const val = e.target.value;
                                                         const model = modelCatalog?.tts?.find((m: any) => m.id === val);
                                                         if (model) {
-                                                            setConfig({
-                                                                ...config,
+                                                            const updates: Partial<SetupConfig> = {
                                                                 local_tts_backend: model.backend,
                                                                 local_tts_model: model.id,
-                                                            });
+                                                            };
+                                                            if (model.backend === 'silero') {
+                                                                updates.silero_speaker = model.speaker;
+                                                                const lang = (model.language || '').split('-')[0];
+                                                                updates.silero_language = lang === 'uk' ? 'ua' : lang;
+                                                            }
+                                                            setConfig({ ...config, ...updates });
                                                         }
                                                     }}
                                                 >
@@ -1986,7 +2180,8 @@ exten => s,1,NoOp(AI Agent Call)
                                                         m.language === selectedLanguage || m.language === 'multi'
                                                     ).map((model: any) => {
                                                         const needsRebuild =
-                                                            (model.backend === 'melotts' && backendCaps && !backendCaps.tts?.melotts?.available);
+                                                            (model.backend === 'melotts' && backendCaps && !backendCaps.tts?.melotts?.available) ||
+                                                            (model.backend === 'silero' && backendCaps && !backendCaps.tts?.silero?.available);
                                                         return (
                                                             <option key={model.id} value={model.id}>
                                                                 {model.name} ({model.backend}) - {model.size_display}{needsRebuild ? ' (requires rebuild)' : ''}
@@ -2001,6 +2196,7 @@ exten => s,1,NoOp(AI Agent Call)
                                                                 <option value="piper">Piper (Local)</option>
                                                                 <option value="kokoro">Kokoro (Premium)</option>
                                                                 <option value="melotts">MeloTTS (Local)</option>
+                                                                <option value="silero">Silero (Local/Multi-language)</option>
                                                             </>
                                                         )}
                                                 </select>
@@ -2117,7 +2313,7 @@ exten => s,1,NoOp(AI Agent Call)
                                                         return (
                                                             <option key={model.id} value={model.id}>
                                                                 {model.name}
-                                                                {model.system_recommended ? ' • Recommended' : ''}
+                                                                {model.cpu_recommended && !localAIStatus.gpuDetected ? ' • ⚡ CPU Recommended' : model.system_recommended ? ' • Recommended' : ''}
                                                                 {model.size_display ? ` • ${model.size_display}` : ''}
                                                                 {exceedsRam ? ` • ⚠ needs ${model.recommended_ram_gb}GB RAM` : ''}
                                                                 {!exceedsRam && model.description ? ` • ${model.description}` : ''}

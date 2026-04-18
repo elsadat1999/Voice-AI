@@ -5,7 +5,9 @@ import logging
 import math
 import os
 import random
+import re
 import signal
+import socket
 import struct
 import time
 import uuid
@@ -194,6 +196,30 @@ _cleanup_completed_at: dict = {}  # call_id -> epoch seconds (best-effort dedupe
 _cleanup_lock = asyncio.Lock()  # Lock to make cleanup guard atomic (AAVA-148)
 
 
+def _ts_msg(role: str, content, **extra) -> dict:
+    """Build a conversation-history entry with an automatic timestamp."""
+    extra.pop("timestamp", None)
+    msg = {"role": role, "content": content, "timestamp": time.time()}
+    msg.update(extra)
+    return msg
+
+
+# Keys that LLM chat-completion APIs accept in message objects.
+_LLM_MSG_KEYS = {"role", "content", "name", "tool_calls", "tool_call_id"}
+
+
+def _sanitize_for_llm(history: list) -> list:
+    """Strip non-standard keys (e.g. timestamp) before sending to LLM adapters."""
+    sanitized = []
+    for msg in history or []:
+        if not isinstance(msg, dict):
+            continue
+        filtered = {k: v for k, v in msg.items() if k in _LLM_MSG_KEYS}
+        if "role" in filtered:
+            sanitized.append(filtered)
+    return sanitized
+
+
 class Engine:
     """The main application engine."""
 
@@ -228,6 +254,10 @@ class Engine:
         self._attended_transfer_dtmf_waiters: Dict[str, asyncio.Future] = {}
         self._attended_transfer_dtmf_digits: Dict[str, str] = {}
         self._attended_transfer_agent_channel_to_call_id: Dict[str, str] = {}
+        self._attended_transfer_helper_state_by_agent_channel: Dict[str, Dict[str, Any]] = {}
+        self._attended_transfer_helper_external_media_to_agent_channel: Dict[str, str] = {}
+        self._attended_transfer_screening_state_by_call: Dict[str, Dict[str, Any]] = {}
+        self._attended_transfer_helper_rtp_lock = asyncio.Lock()
         # Per-call transcript timing cache for latency histograms
         self._last_transcript_ts: Dict[str, float] = {}
 
@@ -399,6 +429,7 @@ class Engine:
         self.audio_buffers: Dict[str, bytes] = {}
         self.buffer_size = 1600  # 200ms of audio at 8kHz (1600 bytes of ulaw)
         self.rtp_server: Optional[Any] = None
+        self.attended_transfer_rtp_server: Optional[RTPServer] = None
         self.headless_sessions: Dict[str, Dict[str, Any]] = {}
         # Bridge and Local channel tracking for Local Channel Bridge pattern
         self.bridges: Dict[str, str] = {}  # channel_id -> bridge_id
@@ -412,8 +443,17 @@ class Engine:
         self.webrtc_vad = None
         try:
             vad_cfg = getattr(config, "vad", None)
-            use_provider_vad = bool(getattr(vad_cfg, "use_provider_vad", False)) if vad_cfg else False
-            if use_provider_vad:
+            # Resolve effective VAD mode: vad_mode takes precedence, fall back to legacy use_provider_vad
+            vad_mode = getattr(vad_cfg, "vad_mode", "auto") if vad_cfg else "auto"
+            legacy_use_provider_vad = bool(getattr(vad_cfg, "use_provider_vad", False)) if vad_cfg else False
+            # For backward compatibility: if vad_mode is "auto" and use_provider_vad is true,
+            # treat it as explicit "provider" mode (legacy configs expect this behavior)
+            if vad_mode == "auto" and legacy_use_provider_vad:
+                vad_mode = "provider"
+            self._vad_mode = vad_mode  # Store for per-call runtime decisions
+            # In "auto" mode, always initialize local VAD so it's available per-call;
+            # vad_mode takes precedence over legacy use_provider_vad
+            if vad_mode == "provider":
                 logger.info("Using provider-managed VAD; local VAD disabled")
             elif vad_cfg and getattr(vad_cfg, "enhanced_enabled", False):
                 self.vad_manager = EnhancedVADManager(
@@ -442,7 +482,7 @@ class Engine:
                     except Exception as e:
                         logger.warning("🎤 WebRTC VAD initialization failed", error=str(e))
                         self.webrtc_vad = None
-                elif not use_provider_vad:
+                elif vad_mode != "provider":
                     logger.warning("🎤 WebRTC VAD not available - install py-webrtcvad")
         except Exception:
             logger.error("Failed to initialize VAD components", exc_info=True)
@@ -529,6 +569,33 @@ class Engine:
                 error=str(exc),
                 exc_info=exc,
             )
+
+    def _should_use_local_vad(self, provider_name: Optional[str] = None) -> bool:
+        """Decide whether local VAD should be active for a given provider.
+
+        In 'auto' mode (default), local VAD is skipped only for providers
+        that have native VAD, native barge-in, and native AEC — i.e. they can
+        reliably handle turn detection on telephony without local assistance.
+        """
+        vad_mode = getattr(self, "_vad_mode", "auto")
+        if vad_mode == "local":
+            return True
+        if vad_mode == "provider":
+            return False
+        # auto mode: check provider capabilities
+        if provider_name and provider_name in self.providers:
+            provider = self.providers[provider_name]
+            caps = None
+            if hasattr(provider, "get_capabilities"):
+                caps = provider.get_capabilities()
+            if (
+                caps
+                and getattr(caps, "has_native_vad", False)
+                and getattr(caps, "has_native_barge_in", False)
+                and getattr(caps, "has_native_aec", False)
+            ):
+                return False
+        return True
 
     def _fire_and_forget(self, coro, *, name: Optional[str] = None) -> asyncio.Task:
         """Create a fire-and-forget task with exception logging."""
@@ -696,17 +763,15 @@ class Engine:
                     getattr(self.config.external_media, "port_range", None),
                     rtp_port,
                 )
-                allowed_remote_hosts = getattr(self.config.external_media, "allowed_remote_hosts", None)
-                if not allowed_remote_hosts:
-                    try:
-                        ipaddress.ip_address(str(self.config.asterisk.host))
-                        allowed_remote_hosts = [str(self.config.asterisk.host)]
-                        logger.info(
-                            "ExternalMedia RTP allowlist defaulted to Asterisk host IP",
-                            allowed_remote_hosts=allowed_remote_hosts,
-                        )
-                    except Exception:
-                        allowed_remote_hosts = None
+                allowed_remote_hosts = self._resolve_allowed_remote_hosts(
+                    getattr(self.config.external_media, "allowed_remote_hosts", None),
+                    getattr(self.config.asterisk, "host", None),
+                )
+                if allowed_remote_hosts:
+                    logger.info(
+                        "ExternalMedia RTP allowlist resolved",
+                        allowed_remote_hosts=allowed_remote_hosts,
+                    )
                 lock_remote_endpoint = bool(
                     getattr(self.config.external_media, "lock_remote_endpoint", True)
                 )
@@ -803,6 +868,18 @@ class Engine:
                 logger.error("Failed to start ExternalMedia RTP transport", error=str(exc), exc_info=True)
                 self.rtp_server = None
 
+        # Prepare helper RTP runtime for attended-transfer streaming even when the
+        # main call transport is AudioSocket.
+        if self._attended_transfer_streaming_enabled():
+            try:
+                await self._ensure_attended_transfer_helper_rtp_server_started()
+            except Exception as exc:
+                logger.error(
+                    "Failed to start attended transfer helper RTP transport",
+                    error=str(exc),
+                    exc_info=True,
+                )
+
         # 6) Start ARI reconnect supervisor (initial connect happens in the background).
         # This avoids a startup race after host reboot where Asterisk/ARI isn't ready yet.
         self.ari_client.add_event_handler("PlaybackFinished", self._on_playback_finished)
@@ -870,6 +947,144 @@ class Engine:
                 fallback=fallback_port,
             )
             return (int(fallback_port), int(fallback_port))
+
+    def _get_attended_transfer_config(self) -> Dict[str, Any]:
+        tools_cfg = getattr(self.config, "tools", {}) or {}
+        attended_cfg = tools_cfg.get("attended_transfer") if isinstance(tools_cfg, dict) else None
+        return attended_cfg if isinstance(attended_cfg, dict) else {}
+
+    @staticmethod
+    def _session_was_transferred(session: Optional["CallSession"]) -> bool:
+        if not session:
+            return False
+        return bool(
+            getattr(session, "transfer_active", False)
+            or getattr(session, "transfer_state", None)
+            or getattr(session, "transfer_destination", None)
+        )
+
+    def _attended_transfer_streaming_enabled(self, attended_cfg: Optional[Dict[str, Any]] = None) -> bool:
+        cfg = attended_cfg if isinstance(attended_cfg, dict) else self._get_attended_transfer_config()
+        delivery_mode = str(cfg.get("delivery_mode", "file") or "file").strip().lower()
+        return delivery_mode == "stream"
+
+    def _resolve_allowed_remote_hosts(self, configured_hosts: Any, fallback_host: Any) -> Optional[List[str]]:
+        hosts: List[str] = []
+        if isinstance(configured_hosts, str):
+            hosts = [item.strip() for item in configured_hosts.split(",") if item.strip()]
+        elif isinstance(configured_hosts, (list, tuple, set)):
+            hosts = [str(item).strip() for item in configured_hosts if str(item).strip()]
+
+        if hosts:
+            return hosts
+
+        fallback = str(fallback_host or "").strip()
+        if not fallback:
+            return []
+
+        try:
+            ipaddress.ip_address(fallback)
+            return [fallback]
+        except ValueError:
+            pass
+
+        try:
+            resolved = {
+                info[4][0]
+                for info in socket.getaddrinfo(fallback, None)
+                if info and len(info) >= 5 and info[4]
+            }
+            return sorted(resolved)
+        except (socket.gaierror, OSError):
+            logger.warning(
+                "Failed to resolve allowed_remote_hosts fallback host; helper RTP allowlist will remain empty",
+                fallback_host=fallback,
+                exc_info=True,
+            )
+            return []
+
+    def _derive_routable_advertise_host(self, bind_host: str) -> str:
+        candidate = str(bind_host or "").strip()
+        if candidate and candidate not in {"0.0.0.0", "::"}:
+            try:
+                ipaddress.ip_address(candidate)
+                return candidate
+            except ValueError:
+                pass
+
+        try:
+            family = socket.AF_INET6 if ":" in candidate and candidate != "0.0.0.0" else socket.AF_INET
+            probe_target = ("2001:4860:4860::8888", 53) if family == socket.AF_INET6 else ("8.8.8.8", 53)
+            with socket.socket(family, socket.SOCK_DGRAM) as sock:
+                sock.connect(probe_target)
+                derived = str(sock.getsockname()[0] or "").strip()
+                if derived and derived not in {"0.0.0.0", "::"}:
+                    return derived
+        except OSError:
+            logger.error(
+                "Unable to derive routable advertise_host for attended transfer helper media",
+                bind_host=bind_host,
+                exc_info=True,
+            )
+        return ""
+
+    def _get_attended_transfer_helper_settings(self, attended_cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        cfg = attended_cfg if isinstance(attended_cfg, dict) else self._get_attended_transfer_config()
+        helper_cfg = cfg.get("external_media_helper") if isinstance(cfg.get("external_media_helper"), dict) else {}
+        global_external = getattr(self.config, "external_media", None)
+
+        bind_host = str(
+            helper_cfg.get("bind_host")
+            or getattr(global_external, "rtp_host", None)
+            or "0.0.0.0"
+        ).strip() or "0.0.0.0"
+        advertise_host = str(
+            helper_cfg.get("advertise_host")
+            or getattr(global_external, "advertise_host", None)
+            or bind_host
+        ).strip() or bind_host
+        if advertise_host in {"0.0.0.0", "::"}:
+            advertise_host = self._derive_routable_advertise_host(bind_host)
+
+        main_rtp_port = int(getattr(global_external, "rtp_port", 18080) or 18080)
+        helper_rtp_port = int(helper_cfg.get("rtp_port") or (main_rtp_port + 100))
+
+        raw_port_range = helper_cfg.get("port_range")
+        if raw_port_range is None:
+            main_port_range = self._parse_port_range(
+                getattr(global_external, "port_range", None),
+                main_rtp_port,
+            )
+            helper_width = max(0, int(main_port_range[1]) - int(main_port_range[0]))
+            port_range = (int(helper_rtp_port), int(helper_rtp_port) + helper_width)
+        else:
+            port_range = self._parse_port_range(raw_port_range, helper_rtp_port)
+
+        helper_allowed_remote_hosts = helper_cfg.get("allowed_remote_hosts")
+        if not helper_allowed_remote_hosts:
+            helper_allowed_remote_hosts = getattr(global_external, "allowed_remote_hosts", None)
+        allowed_remote_hosts = self._resolve_allowed_remote_hosts(
+            helper_allowed_remote_hosts,
+            getattr(self.config.asterisk, "host", None),
+        )
+
+        endpoint_wait_ms = int(helper_cfg.get("endpoint_wait_ms", 1000) or 1000)
+        lock_remote_endpoint = bool(helper_cfg.get("lock_remote_endpoint", True))
+        direction = str(helper_cfg.get("direction", "both") or "both").strip() or "both"
+
+        return {
+            "bind_host": bind_host,
+            "advertise_host": advertise_host,
+            "rtp_port": helper_rtp_port,
+            "port_range": port_range,
+            "allowed_remote_hosts": allowed_remote_hosts,
+            "endpoint_wait_ms": max(100, endpoint_wait_ms),
+            "lock_remote_endpoint": lock_remote_endpoint,
+            "direction": direction,
+            "format": "ulaw",
+            "codec": "ulaw",
+            "sample_rate": 8000,
+        }
 
     # ------------------------------------------------------------------
     # Outbound Campaign Dialer (Milestone 22)
@@ -1901,6 +2116,9 @@ class Engine:
         # Stop RTP server if running
         if hasattr(self, 'rtp_server') and self.rtp_server:
             await self.rtp_server.stop()
+        if self.attended_transfer_rtp_server:
+            await self.attended_transfer_rtp_server.stop()
+            self.attended_transfer_rtp_server = None
         # Stop health server
         if self.audio_socket_server:
             await self.audio_socket_server.stop()
@@ -2355,9 +2573,286 @@ class Engine:
                     direction=direction)
         return channel_id
 
+    async def _on_attended_transfer_helper_rtp_audio(self, call_id: str, ssrc: int, audio_data: bytes) -> None:
+        """Helper-leg RTP audio is currently ignored; DTMF stays on the SIP/PJSIP agent channel."""
+        return
+
+    async def _ensure_attended_transfer_helper_rtp_server_started(self) -> Optional[RTPServer]:
+        if self.attended_transfer_rtp_server and getattr(self.attended_transfer_rtp_server, "running", False):
+            return self.attended_transfer_rtp_server
+        if not self._attended_transfer_streaming_enabled():
+            return None
+
+        async with self._attended_transfer_helper_rtp_lock:
+            if self.attended_transfer_rtp_server and getattr(self.attended_transfer_rtp_server, "running", False):
+                return self.attended_transfer_rtp_server
+
+            helper_settings = self._get_attended_transfer_helper_settings()
+            server = RTPServer(
+                host=helper_settings["bind_host"],
+                port=int(helper_settings["rtp_port"]),
+                engine_callback=self._on_attended_transfer_helper_rtp_audio,
+                codec=helper_settings["codec"],
+                format=helper_settings["format"],
+                sample_rate=int(helper_settings["sample_rate"]),
+                port_range=helper_settings["port_range"],
+                allowed_remote_hosts=helper_settings["allowed_remote_hosts"],
+                lock_remote_endpoint=helper_settings["lock_remote_endpoint"],
+            )
+            await server.start()
+            self.attended_transfer_rtp_server = server
+            logger.info(
+                "Attended transfer helper RTP server started",
+                host=helper_settings["bind_host"],
+                advertise_host=helper_settings["advertise_host"],
+                port_range=helper_settings["port_range"],
+                allowed_remote_hosts=helper_settings["allowed_remote_hosts"],
+            )
+            return self.attended_transfer_rtp_server
+
+    async def _attach_attended_transfer_helper_external_media(self, external_media_id: str) -> bool:
+        agent_channel_id = self._attended_transfer_helper_external_media_to_agent_channel.get(external_media_id)
+        if not agent_channel_id:
+            return False
+
+        state = self._attended_transfer_helper_state_by_agent_channel.get(agent_channel_id) or {}
+        if state.get("external_media_attached"):
+            return True
+        bridge_id = state.get("bridge_id")
+        if not bridge_id:
+            return False
+
+        success = await self.ari_client.add_channel_to_bridge(bridge_id, external_media_id)
+        if success:
+            state["external_media_attached"] = True
+            self._attended_transfer_helper_state_by_agent_channel[agent_channel_id] = state
+            return True
+        latest_state = self._attended_transfer_helper_state_by_agent_channel.get(agent_channel_id) or {}
+        if latest_state.get("external_media_attached"):
+            return True
+        return False
+
+    async def _start_attended_transfer_helper_media(
+        self,
+        *,
+        call_id: str,
+        agent_channel_id: str,
+        attended_cfg: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        server = await self._ensure_attended_transfer_helper_rtp_server_started()
+        if not server:
+            logger.warning(
+                "Attended transfer helper RTP server unavailable",
+                call_id=call_id,
+                agent_channel_id=agent_channel_id,
+            )
+            return None
+
+        existing = self._attended_transfer_helper_state_by_agent_channel.get(agent_channel_id)
+        if existing:
+            return existing
+
+        helper_settings = self._get_attended_transfer_helper_settings(attended_cfg)
+        if not str(helper_settings.get("advertise_host") or "").strip():
+            logger.error(
+                "Attended transfer helper streaming disabled because advertise_host could not be derived",
+                call_id=call_id,
+                agent_channel_id=agent_channel_id,
+            )
+            return None
+        helper_session_id = f"attx:{call_id}:{agent_channel_id}"
+        bridge_id: Optional[str] = None
+        external_media_id: Optional[str] = None
+
+        try:
+            port = await server.allocate_session(helper_session_id)
+            bridge_id = await self.ari_client.create_bridge("mixing")
+            if not bridge_id:
+                raise RuntimeError("Failed to create attended transfer helper bridge")
+
+            if not await self.ari_client.add_channel_to_bridge(bridge_id, agent_channel_id):
+                raise RuntimeError("Failed to add agent channel to helper bridge")
+
+            external_host = f"{helper_settings['advertise_host']}:{port}"
+            response = await self.ari_client.create_external_media_channel(
+                app=self.config.asterisk.app_name,
+                external_host=external_host,
+                format=helper_settings["codec"],
+                direction=helper_settings["direction"],
+                encapsulation="rtp",
+            )
+            external_media_id = response.get("id") if isinstance(response, dict) else None
+            if not external_media_id:
+                raise RuntimeError("Failed to create attended transfer helper ExternalMedia channel")
+
+            state = {
+                "call_id": call_id,
+                "agent_channel_id": agent_channel_id,
+                "bridge_id": bridge_id,
+                "external_media_id": external_media_id,
+                "rtp_session_id": helper_session_id,
+                "rtp_port": port,
+                "external_host": external_host,
+                "external_media_attached": False,
+            }
+            self._attended_transfer_helper_state_by_agent_channel[agent_channel_id] = state
+            self._attended_transfer_helper_external_media_to_agent_channel[external_media_id] = agent_channel_id
+
+            attach_deadline = time.time() + max(0.2, float(helper_settings["endpoint_wait_ms"]) / 1000.0)
+            attached = False
+            while time.time() < attach_deadline:
+                if await self._attach_attended_transfer_helper_external_media(external_media_id):
+                    attached = True
+                    break
+                await asyncio.sleep(0.05)
+            if not attached:
+                raise RuntimeError("Failed to attach helper ExternalMedia channel to bridge")
+
+            await self._kick_rtp_flow(bridge_id, helper_session_id)
+
+            endpoint_deadline = time.time() + max(0.2, float(helper_settings["endpoint_wait_ms"]) / 1000.0)
+            while time.time() < endpoint_deadline:
+                if server.has_remote_endpoint(helper_session_id):
+                    return self._attended_transfer_helper_state_by_agent_channel.get(agent_channel_id)
+                await asyncio.sleep(0.05)
+
+            raise RuntimeError("Timed out waiting for attended transfer helper RTP endpoint")
+        except Exception as exc:
+            logger.warning(
+                "Failed to start attended transfer helper media",
+                call_id=call_id,
+                agent_channel_id=agent_channel_id,
+                external_media_id=external_media_id,
+                error=str(exc),
+                exc_info=True,
+            )
+            await self._cleanup_attended_transfer_helper_media(agent_channel_id)
+            return None
+
+    async def _stream_attended_transfer_audio(
+        self,
+        agent_channel_id: str,
+        audio_bytes: bytes,
+        *,
+        frame_ms: int = 20,
+    ) -> bool:
+        if not audio_bytes:
+            return True
+
+        state = self._attended_transfer_helper_state_by_agent_channel.get(agent_channel_id)
+        server = self.attended_transfer_rtp_server
+        if not state or not server:
+            return False
+
+        helper_session_id = state.get("rtp_session_id")
+        if not helper_session_id:
+            return False
+
+        frame_size = max(1, int(8000 * (max(1, int(frame_ms)) / 1000.0)))
+        for offset in range(0, len(audio_bytes), frame_size):
+            if self._attended_transfer_dtmf_digits.get(agent_channel_id):
+                logger.info(
+                    "Attended transfer helper stream interrupted by early DTMF",
+                    agent_channel_id=agent_channel_id,
+                    helper_session_id=helper_session_id,
+                )
+                return True
+
+            chunk = audio_bytes[offset:offset + frame_size]
+            if len(chunk) < frame_size:
+                chunk = chunk + (b"\xff" * (frame_size - len(chunk)))
+            if not await server.send_audio(helper_session_id, chunk):
+                logger.warning(
+                    "Attended transfer helper RTP send failed",
+                    agent_channel_id=agent_channel_id,
+                    helper_session_id=helper_session_id,
+                    offset=offset,
+                    chunk_size=len(chunk),
+                )
+                return False
+            await asyncio.sleep(max(0.01, float(frame_ms) / 1000.0))
+        return True
+
+    async def _cleanup_attended_transfer_helper_media(self, agent_channel_id: str) -> None:
+        state = self._attended_transfer_helper_state_by_agent_channel.pop(agent_channel_id, None)
+        if not state:
+            return
+
+        external_media_id = state.get("external_media_id")
+        bridge_id = state.get("bridge_id")
+        helper_session_id = state.get("rtp_session_id")
+
+        if external_media_id:
+            self._attended_transfer_helper_external_media_to_agent_channel.pop(external_media_id, None)
+
+        try:
+            if bridge_id and external_media_id:
+                await self.ari_client.remove_channel_from_bridge(bridge_id, external_media_id)
+        except Exception:
+            logger.debug(
+                "Failed to detach attended transfer helper ExternalMedia channel",
+                agent_channel_id=agent_channel_id,
+                external_media_id=external_media_id,
+                bridge_id=bridge_id,
+                exc_info=True,
+            )
+
+        try:
+            if bridge_id:
+                await self.ari_client.remove_channel_from_bridge(bridge_id, agent_channel_id)
+        except Exception:
+            logger.debug(
+                "Failed to detach agent channel from attended transfer helper bridge",
+                agent_channel_id=agent_channel_id,
+                bridge_id=bridge_id,
+                exc_info=True,
+            )
+
+        try:
+            if external_media_id:
+                await self.ari_client.hangup_channel(external_media_id)
+        except Exception:
+            logger.debug(
+                "Failed to hang up attended transfer helper ExternalMedia channel",
+                agent_channel_id=agent_channel_id,
+                external_media_id=external_media_id,
+                exc_info=True,
+            )
+
+        try:
+            if bridge_id:
+                await self.ari_client.destroy_bridge(bridge_id)
+        except Exception:
+            logger.debug(
+                "Failed to destroy attended transfer helper bridge",
+                agent_channel_id=agent_channel_id,
+                bridge_id=bridge_id,
+                exc_info=True,
+            )
+
+        try:
+            if helper_session_id and self.attended_transfer_rtp_server:
+                await self.attended_transfer_rtp_server.cleanup_session(helper_session_id)
+        except Exception:
+            logger.debug(
+                "Failed to clean up attended transfer helper RTP session",
+                agent_channel_id=agent_channel_id,
+                helper_session_id=helper_session_id,
+                exc_info=True,
+            )
+
     async def _handle_external_media_stasis_start(self, external_media_id: str, channel: dict):
         """Handle ExternalMedia channel entering Stasis."""
         try:
+            if external_media_id in self._attended_transfer_helper_external_media_to_agent_channel:
+                if await self._attach_attended_transfer_helper_external_media(external_media_id):
+                    logger.info(
+                        "Attended transfer helper ExternalMedia channel entered Stasis",
+                        external_media_id=external_media_id,
+                        agent_channel_id=self._attended_transfer_helper_external_media_to_agent_channel.get(external_media_id),
+                    )
+                    return
+
             # Find session by external_media_id
             session = await self.session_store.get_by_channel_id(external_media_id)
             if not session:
@@ -2477,6 +2972,16 @@ class Engine:
         """
         for attempt in range(1, max(1, attempts) + 1):
             try:
+                if external_media_id in self._attended_transfer_helper_external_media_to_agent_channel:
+                    if await self._attach_attended_transfer_helper_external_media(external_media_id):
+                        logger.info(
+                            "Attended transfer helper ExternalMedia channel attached after retry",
+                            external_media_id=external_media_id,
+                            agent_channel_id=self._attended_transfer_helper_external_media_to_agent_channel.get(external_media_id),
+                            attempt=attempt,
+                        )
+                        return
+
                 session = await self.session_store.get_by_channel_id(external_media_id)
                 if not session:
                     sessions = await self.session_store.get_all_sessions()
@@ -2589,7 +3094,16 @@ class Engine:
                 start_time=datetime.now(timezone.utc)  # Track call start time (UTC for consistent storage)
             )
             session.is_outbound = bool(is_outbound)
-            session.enhanced_vad_enabled = bool(self.vad_manager)
+            # Per-provider VAD decision: local VAD active only when appropriate for this provider
+            use_local = self._should_use_local_vad(session.provider_name)
+            session.enhanced_vad_enabled = bool(self.vad_manager) and use_local
+            if self.vad_manager and not use_local:
+                logger.info(
+                    "Provider handles VAD natively; local VAD inactive for this call",
+                    call_id=session.call_id,
+                    provider=session.provider_name,
+                    vad_mode=getattr(self, "_vad_mode", "auto"),
+                )
             await self._save_session(session, new=True)
 
             # Read called_number: cache (from ChannelVarSet events) > GET request > "unknown"
@@ -2760,6 +3274,9 @@ class Engine:
                 # Full agent override for this call
                 previous = session.provider_name
                 session.provider_name = resolved_provider
+                # Re-evaluate per-provider VAD decision after provider change
+                use_local = self._should_use_local_vad(resolved_provider)
+                session.enhanced_vad_enabled = bool(self.vad_manager) and use_local
                 await self._save_session(session)
                 logger.info(
                     "AI provider override applied from channel variable",
@@ -3446,7 +3963,12 @@ class Engine:
         except Exception:
             return base
 
-    def _apply_prompt_template_substitution(self, text: str, session: CallSession) -> str:
+    def _apply_prompt_template_substitution(
+        self,
+        text: str,
+        session: CallSession,
+        extra_substitutions: Optional[Dict[str, Any]] = None,
+    ) -> str:
         """Apply template variable substitution to prompts and greetings.
         
         Available variables (with defaults if not available):
@@ -3484,6 +4006,12 @@ class Engine:
             # Don't override built-in variables
             if key not in substitutions:
                 substitutions[key] = str(value) if value else ""
+
+        if isinstance(extra_substitutions, dict):
+            for key, value in extra_substitutions.items():
+                if value is None:
+                    continue
+                substitutions[str(key)] = str(value)
         
         def replace_match(match):
             key = match.group(1)
@@ -3506,6 +4034,269 @@ class Engine:
                 error=str(e),
             )
             return text
+
+    def _build_attended_transfer_ai_briefing_prompt(
+        self,
+        session: CallSession,
+        *,
+        destination_description: Optional[str] = None,
+        briefing_language: Optional[str] = None,
+    ) -> str:
+        recent_messages = list(getattr(session, "conversation_history", []) or [])[-8:]
+        transcript_lines = []
+        for message in recent_messages:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "unknown").strip().lower() or "unknown"
+            content = str(message.get("content") or "").strip()
+            if not content:
+                continue
+            transcript_lines.append(f"{role}: {content}")
+
+        last_transcript = str(getattr(session, "last_transcript", "") or "").strip()
+        caller_name = str(getattr(session, "caller_name", "") or "").strip()
+        caller_number = str(getattr(session, "caller_number", "") or "").strip()
+        context_name = str(getattr(session, "context_name", "") or "").strip()
+        destination_name = str(destination_description or "").strip()
+        language = str(briefing_language or "").strip()
+
+        transcript_block = "\n".join(transcript_lines) if transcript_lines else "(none)"
+        language_instruction = f"Write the briefing in {language}.\n" if language else ""
+        return (
+            "Write a short attended-transfer briefing for the callee.\n"
+            "Return plain text only.\n"
+            "Use the caller's spoken name if clearly stated; otherwise omit the name.\n"
+            "Prefer what the caller said over caller ID.\n"
+            "Summarize the reason for the call in one short sentence.\n"
+            "Do not use markdown, JSON, bullet points, quotes, or filler.\n"
+            "Maximum 25 words.\n"
+            f"{language_instruction}"
+            "\n"
+            f"Caller ID name: {caller_name or '(unknown)'}\n"
+            f"Caller number: {caller_number or '(unknown)'}\n"
+            f"Context: {context_name or '(unknown)'}\n"
+            f"Destination description: {destination_name or '(unknown)'}\n"
+            f"Last transcript: {last_transcript or '(none)'}\n"
+            "Recent conversation:\n"
+            f"{transcript_block}\n"
+        )
+
+    def _sanitize_attended_transfer_briefing_text(self, response_text: str) -> Optional[str]:
+        raw = str(response_text or "").strip()
+        if not raw:
+            return None
+
+        text = raw
+        if "```" in text:
+            fenced = re.findall(r"```(?:[\w-]+)?\s*(.*?)\s*```", text, flags=re.DOTALL)
+            if fenced:
+                text = str(fenced[0]).strip()
+
+        # Collapse whitespace and strip obvious quoting wrappers.
+        text = re.sub(r"\s+", " ", text).strip().strip('"').strip("'")
+        if not text:
+            return None
+
+        # Treat JSON-like responses as unusable for this mode.
+        if "```" in text or (text.startswith("{") and text.endswith("}")) or (text.startswith("[") and text.endswith("]")):
+            return None
+
+        normalized = text.casefold()
+        unusable_exact = {
+            "i'm here to help you. how can i assist you today?",
+            "im here to help you. how can i assist you today?",
+        }
+        if normalized in unusable_exact:
+            return None
+
+        words = text.split()
+        if len(words) > 25:
+            text = " ".join(words[:25]).rstrip(" ,;:-")
+        return text or None
+
+    def _build_attended_transfer_template_vars(
+        self,
+        session: CallSession,
+        *,
+        destination_description: Optional[str] = None,
+    ) -> Dict[str, str]:
+        caller_display = session.caller_name or session.caller_number or "the caller"
+        context_name = getattr(session, "context_name", None) or "support"
+        briefing = {}
+        screening_payload = {}
+        try:
+            if session.current_action and session.current_action.get("type") == "attended_transfer":
+                briefing = dict(session.current_action.get("briefing") or {})
+                screening_payload = dict(session.current_action.get("screening_payload") or {})
+        except Exception:
+            briefing = {}
+            screening_payload = {}
+
+        screened_caller_name = str(briefing.get("screened_caller_name") or "").strip()
+        screened_call_reason = str(briefing.get("screened_call_reason") or "").strip()
+        screening_summary = ""
+        if str(screening_payload.get("kind") or "").strip() == "ai_briefing":
+            screening_summary = str(screening_payload.get("text") or "").strip()
+        if screening_summary and not screened_call_reason:
+            screened_call_reason = screening_summary
+
+        return {
+            "caller_name": session.caller_name or "",
+            "caller_number": session.caller_number or "",
+            "caller_display": caller_display,
+            "context_name": context_name,
+            "destination_description": str(destination_description or "").strip(),
+            "screened_caller_name": screened_caller_name,
+            "screened_call_reason": screened_call_reason,
+            "screened_caller_display": screened_caller_name or caller_display,
+            "screened_reason_display": screened_call_reason or screening_summary or context_name,
+            "screening_summary": screening_summary,
+        }
+
+    @staticmethod
+    def _resolve_attended_transfer_screening_mode(attended_cfg: Optional[Dict[str, Any]]) -> str:
+        cfg = attended_cfg if isinstance(attended_cfg, dict) else {}
+        raw_mode = str(cfg.get("screening_mode") or "").strip().lower()
+        if raw_mode in {"basic_tts", "caller_recording", "ai_briefing"}:
+            return raw_mode
+        if raw_mode == "ai_summary":
+            return "ai_briefing"
+        if bool(cfg.get("pass_caller_info_to_context", False)):
+            return "ai_briefing"
+        return "basic_tts"
+
+    @staticmethod
+    def _session_has_pending_attended_transfer(session: Optional[CallSession]) -> bool:
+        if not session:
+            return False
+        action = getattr(session, "current_action", None) or {}
+        if not isinstance(action, dict):
+            return False
+        if action.get("type") != "attended_transfer":
+            return False
+        decision = str(action.get("decision") or "").strip().lower()
+        return decision not in {"accepted", "declined"}
+
+    @staticmethod
+    def _pcm16_to_ulaw8k(audio_bytes: bytes, sample_rate: int) -> bytes:
+        if not audio_bytes:
+            return b""
+        pcm_bytes = audio_bytes
+        state = None
+        if int(sample_rate or 0) != 8000:
+            pcm_bytes, _state = audioop.ratecv(audio_bytes, 2, 1, int(sample_rate or 16000), 8000, state)
+        return audioop.lin2ulaw(pcm_bytes, 2)
+
+    async def collect_attended_transfer_screening(
+        self,
+        *,
+        call_id: str,
+        max_seconds: float,
+        silence_ms: int,
+    ) -> Optional[Dict[str, Any]]:
+        session = await self.session_store.get_by_call_id(call_id)
+        if not session or not session.current_action or session.current_action.get("type") != "attended_transfer":
+            return None
+
+        now = time.time()
+        state: Dict[str, Any] = {
+            "armed_at": now,
+            "first_speech_ts": 0.0,
+            "last_voice_ts": 0.0,
+            "speech_started": False,
+            "silence_accum_ms": 0,
+            "sample_rate": 8000,
+            "ulaw_audio": bytearray(),
+            "max_seconds": max(1.0, float(max_seconds or 6.0)),
+            "silence_ms": max(300, int(silence_ms or 1200)),
+            "energy_threshold": 450,
+        }
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+        state["future"] = future
+        self._attended_transfer_screening_state_by_call[call_id] = state
+
+        try:
+            result = await asyncio.wait_for(future, timeout=max(4.0, state["max_seconds"] + 6.0))
+            if isinstance(result, dict):
+                return result
+            return None
+        except asyncio.TimeoutError:
+            logger.info("Attended transfer caller screening timed out", call_id=call_id)
+            return None
+        finally:
+            self._attended_transfer_screening_state_by_call.pop(call_id, None)
+
+    def _consume_attended_transfer_screening_audio(self, call_id: str, pcm16: bytes, sample_rate: int) -> bool:
+        state = self._attended_transfer_screening_state_by_call.get(call_id)
+        if not state:
+            return False
+        fut = state.get("future")
+        if fut and fut.done():
+            return False
+        if not pcm16:
+            return True
+
+        try:
+            now = time.time()
+            energy = int(audioop.rms(pcm16, 2)) if pcm16 else 0
+            voiced = energy >= int(state.get("energy_threshold", 450))
+            frame_ms = int((len(pcm16) / max(1, int(sample_rate or 8000)) / 2) * 1000)
+            ulaw_chunk = self._pcm16_to_ulaw8k(pcm16, int(sample_rate or state.get("sample_rate") or 8000))
+            state["sample_rate"] = 8000
+            current_audio: bytearray = state.setdefault("ulaw_audio", bytearray())
+            max_bytes = int(max(1.0, float(state.get("max_seconds", 6.0))) * 8000)
+
+            if voiced:
+                if not state.get("speech_started"):
+                    state["speech_started"] = True
+                    state["first_speech_ts"] = now
+                state["last_voice_ts"] = now
+                state["silence_accum_ms"] = 0
+                if ulaw_chunk:
+                    current_audio.extend(ulaw_chunk)
+                    if len(current_audio) > max_bytes:
+                        del current_audio[max_bytes:]
+            elif state.get("speech_started") and ulaw_chunk and len(current_audio) < max_bytes:
+                state["silence_accum_ms"] = int(state.get("silence_accum_ms", 0)) + max(20, frame_ms)
+                current_audio.extend(ulaw_chunk)
+                if len(current_audio) > max_bytes:
+                    del current_audio[max_bytes:]
+
+            should_finish = False
+            if state.get("speech_started"):
+                if len(current_audio) >= max_bytes:
+                    should_finish = True
+                elif int(state.get("silence_accum_ms", 0)) >= int(state.get("silence_ms", 1200)):
+                    should_finish = True
+
+            if should_finish and fut and not fut.done():
+                payload = bytes(current_audio)
+                if len(payload) < 800:
+                    fut.set_result(None)
+                else:
+                    fut.set_result(
+                        {
+                            "audio_ulaw": payload,
+                            "duration_ms": int(len(payload) / 8),
+                        }
+                    )
+            return True
+        except Exception:
+            logger.debug("Attended transfer caller screening audio handling failed", call_id=call_id, exc_info=True)
+            if fut and not fut.done():
+                fut.set_result(None)
+            self._attended_transfer_screening_state_by_call.pop(call_id, None)
+            return True
+
+    def _cancel_attended_transfer_screening(self, call_id: str, *, reason: str) -> None:
+        state = self._attended_transfer_screening_state_by_call.pop(call_id, None)
+        if not state:
+            return
+        fut = state.get("future")
+        if fut and not fut.done():
+            fut.set_result(None)
+        logger.info("Attended transfer caller screening cancelled", call_id=call_id, reason=reason)
 
     async def _wait_for_attended_transfer_dtmf(
         self,
@@ -3559,6 +4350,96 @@ class Engine:
 
         return mode, timeout_sec
 
+    async def _local_ai_server_llm_request(
+        self,
+        *,
+        call_id: str,
+        text: str,
+        timeout_sec: float,
+    ) -> Optional[str]:
+        try:
+            import websockets
+
+            providers = getattr(self.config, "providers", {}) or {}
+            local_cfg = providers.get("local") if isinstance(providers, dict) else None
+            if not isinstance(local_cfg, dict) or not bool(local_cfg.get("enabled", True)):
+                return None
+            ws_url = str(local_cfg.get("base_url") or local_cfg.get("ws_url") or "").strip()
+            if not ws_url:
+                return None
+            auth_token = str(local_cfg.get("auth_token") or "").strip() or None
+            deadline = time.time() + max(0.1, float(timeout_sec))
+
+            async with websockets.connect(ws_url, open_timeout=float(timeout_sec), ping_interval=None) as ws:
+                if not await self._authenticate_local_ai_server_ws(
+                    ws=ws,
+                    call_id=call_id,
+                    auth_token=auth_token,
+                    deadline=deadline,
+                ):
+                    return None
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "llm_request",
+                            "text": text,
+                            "call_id": call_id,
+                            "mode": "llm",
+                        }
+                    )
+                )
+                while time.time() < deadline:
+                    msg = await asyncio.wait_for(ws.recv(), timeout=max(0.1, float(deadline - time.time())))
+                    if isinstance(msg, bytes):
+                        continue
+                    try:
+                        data = json.loads(msg)
+                    except Exception as e:
+                        logger.debug(
+                            "Received malformed Local AI Server LLM response",
+                            call_id=call_id,
+                            message_preview=str(msg)[:200],
+                            error=str(e),
+                        )
+                        continue
+                    if data.get("type") == "llm_response":
+                        return str(data.get("text") or "").strip()
+                return None
+        except Exception:
+            logger.debug("Local AI Server LLM request failed", call_id=call_id, exc_info=True)
+            return None
+
+    async def _generate_attended_transfer_briefing_text(
+        self,
+        *,
+        session: CallSession,
+        destination_description: Optional[str],
+        timeout_sec: float,
+        briefing_language: Optional[str] = None,
+    ) -> Optional[str]:
+        response_text = await self._local_ai_server_llm_request(
+            call_id=session.call_id,
+            text=self._build_attended_transfer_ai_briefing_prompt(
+                session,
+                destination_description=destination_description,
+                briefing_language=briefing_language,
+            ),
+            timeout_sec=timeout_sec,
+        )
+        if not response_text:
+            return None
+
+        briefing_text = self._sanitize_attended_transfer_briefing_text(response_text)
+        if briefing_text:
+            return briefing_text
+
+        logger.warning(
+            "Attended transfer AI briefing returned unusable text",
+            call_id=session.call_id,
+            preview=response_text[:160],
+        )
+        return None
+
     async def _local_ai_server_tts(self, *, call_id: str, text: str, timeout_sec: float) -> Optional[bytes]:
         """Synthesize μ-law 8k audio via local-ai-server (hard requirement for attended transfer)."""
         try:
@@ -3574,10 +4455,16 @@ class Engine:
             if not ws_url:
                 return None
             auth_token = str(local_cfg.get("auth_token") or "").strip() or None
+            deadline = time.time() + max(0.1, float(timeout_sec))
 
             async with websockets.connect(ws_url, open_timeout=float(timeout_sec), ping_interval=None) as ws:
-                if auth_token:
-                    await ws.send(json.dumps({"type": "auth", "auth_token": auth_token}))
+                if not await self._authenticate_local_ai_server_ws(
+                    ws=ws,
+                    call_id=call_id,
+                    auth_token=auth_token,
+                    deadline=deadline,
+                ):
+                    return None
                 await ws.send(
                     json.dumps(
                         {
@@ -3588,7 +4475,6 @@ class Engine:
                         }
                     )
                 )
-                deadline = time.time() + max(0.1, float(timeout_sec))
                 while time.time() < deadline:
                     msg = await asyncio.wait_for(ws.recv(), timeout=max(0.1, float(deadline - time.time())))
                     if isinstance(msg, bytes):
@@ -3603,6 +4489,44 @@ class Engine:
         except Exception:
             logger.debug("Local AI Server TTS failed", call_id=call_id, exc_info=True)
             return None
+
+    async def _authenticate_local_ai_server_ws(
+        self,
+        *,
+        ws: Any,
+        call_id: str,
+        auth_token: Optional[str],
+        deadline: float,
+    ) -> bool:
+        if not auth_token:
+            return True
+
+        await ws.send(json.dumps({"type": "auth", "auth_token": auth_token}))
+
+        while time.time() < deadline:
+            msg = await asyncio.wait_for(ws.recv(), timeout=max(0.1, float(deadline - time.time())))
+            if isinstance(msg, bytes):
+                continue
+            try:
+                data = json.loads(msg)
+            except Exception:
+                continue
+
+            if data.get("type") != "auth_response":
+                continue
+            if data.get("status") == "ok":
+                return True
+
+            logger.warning(
+                "Local AI Server auth failed",
+                call_id=call_id,
+                status=data.get("status"),
+                message=data.get("message"),
+            )
+            return False
+
+        logger.warning("Local AI Server auth timed out", call_id=call_id)
+        return False
 
     async def _play_ulaw_bytes_on_channel_and_wait(
         self,
@@ -3711,23 +4635,72 @@ class Engine:
         else:
             dest_desc = str(destination_key)
 
-        caller_display = session.caller_name or session.caller_number or "the caller"
-        context_name = getattr(session, "context_name", None) or "support"
-        template_vars = {
-            "caller_name": session.caller_name or "",
-            "caller_number": session.caller_number or "",
-            "caller_display": caller_display,
-            "context_name": context_name,
-            "destination_description": dest_desc,
-        }
-
-        announcement_template = str(
-            attended_cfg.get(
-                "announcement_template",
-                "Hi, this is Ava. I'm transferring {caller_display} regarding {context_name}.",
+        screening_mode = self._resolve_attended_transfer_screening_mode(attended_cfg)
+        raw_screening_mode = str(attended_cfg.get("screening_mode") or "").strip().lower()
+        ai_briefing_timeout = float(attended_cfg.get("ai_briefing_timeout_seconds", 2.0) or 2.0)
+        ai_briefing_language = str(attended_cfg.get("ai_briefing_language", "") or "").strip()
+        if screening_mode == "ai_briefing" and (
+            raw_screening_mode == "ai_summary" or bool(attended_cfg.get("pass_caller_info_to_context", False))
+        ):
+            logger.warning(
+                "Deprecated attended transfer ai_summary config mapped to ai_briefing",
+                call_id=caller_id,
+                config_key="tools.attended_transfer.pass_caller_info_to_context",
+                replacement="tools.attended_transfer.screening_mode=ai_briefing",
             )
-            or ""
+        if screening_mode == "ai_briefing":
+            briefing_text = await self._generate_attended_transfer_briefing_text(
+                session=session,
+                destination_description=dest_desc,
+                timeout_sec=ai_briefing_timeout,
+                briefing_language=ai_briefing_language or None,
+            )
+            if briefing_text:
+                try:
+                    session.current_action = dict(session.current_action or {})
+                    session.current_action["screening_payload"] = {
+                        "kind": "ai_briefing",
+                        "text": briefing_text,
+                        "source": "local_ai_server",
+                        "generated_at": time.time(),
+                    }
+                    await self._save_session(session)
+                except Exception:
+                    logger.debug("Failed to persist attended transfer AI briefing", call_id=caller_id, exc_info=True)
+            else:
+                logger.warning(
+                    "Attended transfer AI briefing unavailable; falling back to basic_tts",
+                    call_id=caller_id,
+                    destination_key=destination_key,
+                )
+        template_vars = self._build_attended_transfer_template_vars(
+            session,
+            destination_description=dest_desc,
         )
+
+        screening_payload = None
+        try:
+            if session.current_action and session.current_action.get("type") == "attended_transfer":
+                screening_payload = dict(session.current_action.get("screening_payload") or {})
+        except Exception:
+            screening_payload = None
+
+        effective_screening_mode = screening_mode
+        if screening_mode == "ai_briefing":
+            if not (isinstance(screening_payload, dict) and screening_payload.get("kind") == "ai_briefing" and str(screening_payload.get("text") or "").strip()):
+                effective_screening_mode = "basic_tts"
+
+        default_announcement_template = "Hi, this is Ava. I'm transferring {caller_display} regarding {context_name}."
+        if effective_screening_mode == "caller_recording" and screening_payload and screening_payload.get("kind") == "caller_recording":
+            default_announcement_template = "Hi, this is Ava. Here is the caller's screening."
+
+        if effective_screening_mode == "ai_briefing":
+            announcement_template = str(
+                attended_cfg.get("ai_briefing_intro_template")
+                or "Hi, this is Ava. Here is a short summary of the caller."
+            )
+        else:
+            announcement_template = str(attended_cfg.get("announcement_template", default_announcement_template) or "")
         prompt_template = str(
             (
                 attended_cfg.get("agent_accept_prompt_template")
@@ -3748,21 +4721,30 @@ class Engine:
             or 15
         )
         tts_timeout = float(attended_cfg.get("tts_timeout_seconds", 8) or 8)
+        stream_fallback_to_file = bool(attended_cfg.get("stream_fallback_to_file", True))
+        use_streaming = self._attended_transfer_streaming_enabled(attended_cfg)
 
         # Treat blank templates as "use defaults" (UI may persist empty strings).
         if not announcement_template.strip():
-            announcement_template = "Hi, this is Ava. I'm transferring {caller_display} regarding {context_name}."
+            if effective_screening_mode == "caller_recording" and screening_payload and screening_payload.get("kind") == "caller_recording":
+                announcement_template = "Hi, this is Ava. Here is the caller's screening."
+            elif effective_screening_mode == "ai_briefing":
+                announcement_template = "Hi, this is Ava. Here is a short summary of the caller."
+            else:
+                announcement_template = "Hi, this is Ava. I'm transferring {caller_display} regarding {context_name}."
         if not prompt_template.strip():
             prompt_template = "Press 1 to accept, or 2 to decline."
 
-        try:
-            announcement_text = announcement_template.format(**template_vars)
-        except Exception:
-            announcement_text = "Hi, this is Ava. I'm transferring the caller."
-        try:
-            prompt_text = prompt_template.format(**template_vars)
-        except Exception:
-            prompt_text = "Press 1 to accept, or 2 to decline."
+        announcement_text = self._apply_prompt_template_substitution(
+            announcement_template,
+            session,
+            extra_substitutions=template_vars,
+        )
+        prompt_text = self._apply_prompt_template_substitution(
+            prompt_template,
+            session,
+            extra_substitutions=template_vars,
+        )
 
         logger.info(
             "🔀 ATTENDED TRANSFER - Agent answered, starting announcement",
@@ -3771,6 +4753,23 @@ class Engine:
             destination_key=destination_key,
         )
 
+        if use_streaming:
+            helper_ready = await self._start_attended_transfer_helper_media(
+                call_id=caller_id,
+                agent_channel_id=channel_id,
+                attended_cfg=attended_cfg,
+            )
+            if not helper_ready and stream_fallback_to_file:
+                logger.warning(
+                    "Attended transfer helper streaming unavailable; falling back to file playback",
+                    call_id=caller_id,
+                    channel_id=channel_id,
+                )
+                use_streaming = False
+            elif not helper_ready:
+                await self._attended_transfer_abort_and_resume(session, channel_id, reason="stream-unavailable")
+                return
+
         # Step A: Play one-way announcement to agent (hard requirement: Local AI Server TTS).
         announcement_audio = await self._local_ai_server_tts(call_id=caller_id, text=announcement_text, timeout_sec=tts_timeout)
         if not announcement_audio:
@@ -3778,12 +4777,79 @@ class Engine:
             await self._attended_transfer_abort_and_resume(session, channel_id, reason="tts-unavailable")
             return
 
-        await self._play_ulaw_bytes_on_channel_and_wait(
-            channel_id=channel_id,
-            audio_bytes=announcement_audio,
-            playback_id_prefix="attx-ann",
-            timeout_sec=max(3.0, tts_timeout * 4),
-        )
+        announcement_ok = True
+        if use_streaming:
+            announcement_ok = await self._stream_attended_transfer_audio(channel_id, announcement_audio)
+            if not announcement_ok and stream_fallback_to_file:
+                await self._cleanup_attended_transfer_helper_media(channel_id)
+                use_streaming = False
+        if not use_streaming:
+            played_id = await self._play_ulaw_bytes_on_channel_and_wait(
+                channel_id=channel_id,
+                audio_bytes=announcement_audio,
+                playback_id_prefix="attx-ann",
+                timeout_sec=max(3.0, tts_timeout * 4),
+            )
+            announcement_ok = bool(played_id)
+        if not announcement_ok:
+            logger.warning("Attended transfer announcement delivery failed; aborting", call_id=caller_id)
+            await self._attended_transfer_abort_and_resume(session, channel_id, reason="stream-unavailable")
+            return
+
+        recorded_screening_audio = None
+        if effective_screening_mode == "caller_recording" and isinstance(screening_payload, dict):
+            if screening_payload.get("kind") == "caller_recording":
+                recorded_screening_audio = screening_payload.get("audio_ulaw")
+                if isinstance(recorded_screening_audio, bytearray):
+                    recorded_screening_audio = bytes(recorded_screening_audio)
+                if not isinstance(recorded_screening_audio, (bytes, bytearray)) or not recorded_screening_audio:
+                    recorded_screening_audio = None
+
+        ai_briefing_text = None
+        if effective_screening_mode == "ai_briefing" and isinstance(screening_payload, dict):
+            if screening_payload.get("kind") == "ai_briefing":
+                ai_briefing_text = str(screening_payload.get("text") or "").strip() or None
+
+        if recorded_screening_audio:
+            screening_ok = True
+            if use_streaming:
+                screening_ok = await self._stream_attended_transfer_audio(channel_id, bytes(recorded_screening_audio))
+                if not screening_ok and stream_fallback_to_file:
+                    await self._cleanup_attended_transfer_helper_media(channel_id)
+                    use_streaming = False
+            if not use_streaming:
+                played_id = await self._play_ulaw_bytes_on_channel_and_wait(
+                    channel_id=channel_id,
+                    audio_bytes=bytes(recorded_screening_audio),
+                    playback_id_prefix="attx-screen",
+                    timeout_sec=8.0,
+                )
+                screening_ok = bool(played_id)
+            if not screening_ok:
+                logger.warning("Attended transfer screening clip delivery failed; aborting", call_id=caller_id)
+                await self._attended_transfer_abort_and_resume(session, channel_id, reason="stream-unavailable")
+                return
+        elif ai_briefing_text:
+            briefing_audio = await self._local_ai_server_tts(call_id=caller_id, text=ai_briefing_text, timeout_sec=tts_timeout)
+            if briefing_audio:
+                briefing_ok = True
+                if use_streaming:
+                    briefing_ok = await self._stream_attended_transfer_audio(channel_id, briefing_audio)
+                    if not briefing_ok and stream_fallback_to_file:
+                        await self._cleanup_attended_transfer_helper_media(channel_id)
+                        use_streaming = False
+                if not use_streaming:
+                    played_id = await self._play_ulaw_bytes_on_channel_and_wait(
+                        channel_id=channel_id,
+                        audio_bytes=briefing_audio,
+                        playback_id_prefix="attx-brief",
+                        timeout_sec=max(3.0, tts_timeout * 4),
+                    )
+                    briefing_ok = bool(played_id)
+                if not briefing_ok:
+                    logger.warning("Attended transfer AI briefing delivery failed; continuing with prompt", call_id=caller_id)
+            else:
+                logger.warning("Attended transfer AI briefing TTS failed; continuing with prompt", call_id=caller_id)
 
         # Step B: Collect DTMF acceptance/decline (early digits during announcement are honored).
         digit = self._attended_transfer_dtmf_digits.get(channel_id)
@@ -3793,12 +4859,24 @@ class Engine:
                 logger.warning("Attended transfer prompt TTS failed; aborting", call_id=caller_id)
                 await self._attended_transfer_abort_and_resume(session, channel_id, reason="tts-unavailable")
                 return
-            await self._play_ulaw_bytes_on_channel_and_wait(
-                channel_id=channel_id,
-                audio_bytes=prompt_audio,
-                playback_id_prefix="attx-prompt",
-                timeout_sec=max(3.0, tts_timeout * 4),
-            )
+            prompt_ok = True
+            if use_streaming:
+                prompt_ok = await self._stream_attended_transfer_audio(channel_id, prompt_audio)
+                if not prompt_ok and stream_fallback_to_file:
+                    await self._cleanup_attended_transfer_helper_media(channel_id)
+                    use_streaming = False
+            if not use_streaming:
+                played_id = await self._play_ulaw_bytes_on_channel_and_wait(
+                    channel_id=channel_id,
+                    audio_bytes=prompt_audio,
+                    playback_id_prefix="attx-prompt",
+                    timeout_sec=max(3.0, tts_timeout * 4),
+                )
+                prompt_ok = bool(played_id)
+            if not prompt_ok:
+                logger.warning("Attended transfer prompt delivery failed; aborting", call_id=caller_id)
+                await self._attended_transfer_abort_and_resume(session, channel_id, reason="stream-unavailable")
+                return
             digit = await self._wait_for_attended_transfer_dtmf(channel_id, timeout_sec=accept_timeout)
 
         accepted = digit == accept_digit
@@ -3826,10 +4904,15 @@ class Engine:
             destination_description=dest_desc,
             caller_connected_prompt=caller_connected_prompt,
             tts_timeout=tts_timeout,
+            template_vars=template_vars,
         )
 
     async def _attended_transfer_abort_and_resume(self, session: "CallSession", agent_channel_id: str, *, reason: str) -> None:
         call_id = session.call_id
+        try:
+            await self._cleanup_attended_transfer_helper_media(agent_channel_id)
+        except Exception:
+            logger.debug("Failed to clean up attended transfer helper media on abort", call_id=call_id, agent_channel_id=agent_channel_id, exc_info=True)
         # IMPORTANT: unregister mapping before hanging up the agent leg so that the resulting
         # ChannelDestroyed/StasisEnd does not get resolved back to the caller session and tear down the call.
         self._unregister_attended_transfer_agent_channel(agent_channel_id)
@@ -3856,12 +4939,18 @@ class Engine:
                 )
                 tts_timeout = float(attended_cfg.get("tts_timeout_seconds", 8) or 8)
                 if caller_prompt.strip():
+                    template_vars = self._build_attended_transfer_template_vars(session)
                     # Keep capture disabled while we play this prompt so we don't feed it back into STT.
                     try:
                         session.audio_capture_enabled = False
                     except Exception:
                         pass
-                    prompt_audio = await self._local_ai_server_tts(call_id=call_id, text=caller_prompt.strip(), timeout_sec=tts_timeout)
+                    prompt_text = self._apply_prompt_template_substitution(
+                        caller_prompt.strip(),
+                        session,
+                        extra_substitutions=template_vars,
+                    )
+                    prompt_audio = await self._local_ai_server_tts(call_id=call_id, text=prompt_text, timeout_sec=tts_timeout)
                     if prompt_audio:
                         await self._play_ulaw_bytes_on_channel_and_wait(
                             channel_id=session.caller_channel_id,
@@ -3895,6 +4984,7 @@ class Engine:
         destination_description: str,
         caller_connected_prompt: str,
         tts_timeout: float,
+        template_vars: Optional[Dict[str, Any]] = None,
     ) -> None:
         call_id = session.call_id
 
@@ -3905,9 +4995,14 @@ class Engine:
             pass
 
         if caller_connected_prompt.strip():
+            prompt_text = self._apply_prompt_template_substitution(
+                caller_connected_prompt.strip(),
+                session,
+                extra_substitutions=template_vars or self._build_attended_transfer_template_vars(session),
+            )
             prompt_audio = await self._local_ai_server_tts(
                 call_id=call_id,
-                text=caller_connected_prompt.strip(),
+                text=prompt_text,
                 timeout_sec=float(tts_timeout),
             )
             if prompt_audio:
@@ -3917,6 +5012,11 @@ class Engine:
                     playback_id_prefix="attx-caller",
                     timeout_sec=max(3.0, float(tts_timeout) * 4),
                 )
+
+        try:
+            await self._cleanup_attended_transfer_helper_media(agent_channel_id)
+        except Exception:
+            logger.debug("Failed to clean up attended transfer helper media before bridge finalize", call_id=call_id, agent_channel_id=agent_channel_id, exc_info=True)
 
         # Remove AI media from bridge and stop provider session (best effort).
         try:
@@ -4521,8 +5621,7 @@ class Engine:
             # Determine call outcome based on session state
             call_outcome = "caller_hangup"  # Default: caller hung up
             try:
-                # Check transfer state - UnifiedTransferTool sets transfer_active/transfer_state
-                if getattr(session, 'transfer_active', False) or getattr(session, 'transfer_state', None):
+                if self._session_was_transferred(session):
                     call_outcome = "transferred"
                 elif getattr(session, 'cleanup_after_tts', False):
                     call_outcome = "agent_hangup"  # AI agent initiated hangup via hangup_call tool
@@ -4542,6 +5641,11 @@ class Engine:
                 await self.streaming_playback_manager.stop_streaming_playback(call_id)
             except Exception:
                 logger.debug("Streaming playback stop failed during cleanup", call_id=call_id, exc_info=True)
+
+            try:
+                self._cancel_attended_transfer_screening(call_id, reason="call-cleanup")
+            except Exception:
+                logger.debug("Attended transfer screening cleanup failed", call_id=call_id, exc_info=True)
 
             # Stop background music if playing (AAVA-89)
             try:
@@ -4595,6 +5699,17 @@ class Engine:
                         action_channels.append(str(action.get("channel_id")))
             except Exception:
                 action_channels = []
+
+            for agent_channel_id in dict.fromkeys(action_channels):
+                try:
+                    await self._cleanup_attended_transfer_helper_media(agent_channel_id)
+                except Exception:
+                    logger.debug(
+                        "Attended transfer helper cleanup failed during call cleanup",
+                        call_id=call_id,
+                        agent_channel_id=agent_channel_id,
+                        exc_info=True,
+                    )
 
             for channel_id in filter(
                 None,
@@ -4871,7 +5986,7 @@ class Engine:
                     provider_name=getattr(session, "provider_name", None) or "",
                     pipeline_name=getattr(session, "pipeline_name", None) or "",
                     audio_transport=getattr(self.config, "audio_transport", "") or "",
-                    transferred=bool(getattr(session, "transfer_active", False) or getattr(session, "transfer_state", None)),
+                    transferred=self._session_was_transferred(session),
                     transfer_destination=getattr(session, "transfer_destination", None) or getattr(session, "transfer_target", None) or "",
                     media_rx_confirmed=bool(getattr(session, "media_rx_confirmed", False)),
                 )
@@ -4909,7 +6024,7 @@ class Engine:
             outcome = "completed"
             if session.error_message:
                 outcome = "error"
-            elif session.transfer_destination:
+            elif self._session_was_transferred(session):
                 outcome = "transferred"
             elif not session.conversation_history:
                 outcome = "abandoned"
@@ -4973,7 +6088,7 @@ class Engine:
                             final_outcome = "answered_human"
                             if session.error_message:
                                 final_outcome = "error"
-                            elif session.transfer_destination:
+                            elif self._session_was_transferred(session):
                                 final_outcome = "transferred"
 
                             await self.outbound_store.finish_attempt(
@@ -5441,6 +6556,17 @@ class Engine:
             except Exception:
                 logger.debug("Inbound diagnostics update failed", call_id=caller_channel_id, exc_info=True)
 
+            if self._consume_attended_transfer_screening_audio(session.call_id, pcm_bytes, pcm_rate):
+                return
+
+            if self._session_has_pending_attended_transfer(session):
+                logger.debug(
+                    "Suspending provider audio during pending attended transfer",
+                    call_id=caller_channel_id,
+                    source="audiosocket",
+                )
+                return
+
             # CRITICAL FIX: Check for pipeline mode FIRST before routing to monolithic providers
             if self._pipeline_forced.get(caller_channel_id):
                 # AAVA-28: Check gating to prevent agent from hearing its own TTS output
@@ -5833,7 +6959,13 @@ class Engine:
                     return
 
             vad_result: Optional[VADResult] = None
-            if self.vad_manager:
+            # enhanced_vad_enabled=None means "not yet initialized" — fall back to
+            # per-provider decision so restored sessions and test constructions
+            # are not silently opted-out.
+            _vad_flag = session.enhanced_vad_enabled
+            if _vad_flag is None:
+                _vad_flag = bool(self.vad_manager) and self._should_use_local_vad(session.provider_name)
+            if self.vad_manager and _vad_flag:
                 try:
                     vad_result = await self._run_enhanced_vad(session, audio_bytes)
                 except Exception:
@@ -6938,6 +8070,15 @@ class Engine:
             # Check for pipeline mode FIRST (before continuous_input provider routing)
             # Pipeline adapters need audio in their queue, not sent to monolithic providers
             pipeline_forced = self._pipeline_forced.get(caller_channel_id)
+            if self._consume_attended_transfer_screening_audio(session.call_id, pcm_16k, int(getattr(self.rtp_server, 'sample_rate', 16000) if self.rtp_server else 16000)):
+                return
+            if self._session_has_pending_attended_transfer(session):
+                logger.debug(
+                    "Suspending provider audio during pending attended transfer",
+                    call_id=caller_channel_id,
+                    source="externalmedia",
+                )
+                return
             logger.debug(
                 "RTP audio routing check",
                 call_id=caller_channel_id,
@@ -8819,7 +9960,7 @@ class Engine:
                     # Add to conversation history
                     if not hasattr(session, 'conversation_history') or session.conversation_history is None:
                         session.conversation_history = []
-                    session.conversation_history.append({"role": "user", "content": text})
+                    session.conversation_history.append(_ts_msg("user", text))
                     await self.session_store.upsert_call(session)
                     logger.debug("Added user transcript to history", call_id=call_id, text_preview=text[:50])
             
@@ -8830,7 +9971,7 @@ class Engine:
                     # Add to conversation history
                     if not hasattr(session, 'conversation_history') or session.conversation_history is None:
                         session.conversation_history = []
-                    session.conversation_history.append({"role": "assistant", "content": text})
+                    session.conversation_history.append(_ts_msg("assistant", text))
                     await self.session_store.upsert_call(session)
                     logger.debug("Added agent transcript to history", call_id=call_id, text_preview=text[:50])
             
@@ -9162,7 +10303,7 @@ class Engine:
                             else:
                                 # AAVA-85: Persist greeting to session history so it appears in email summary
                                 try:
-                                    session.conversation_history.append({"role": "assistant", "content": greeting})
+                                    session.conversation_history.append(_ts_msg("assistant", greeting))
                                     await self.session_store.upsert_call(session)
                                     logger.info("Persisted initial greeting to session history", call_id=call_id)
                                 except Exception as e:
@@ -9183,12 +10324,12 @@ class Engine:
                                 
                                 # AAVA-85: Persist greeting to session history so it appears in email summary
                                 try:
-                                    session.conversation_history.append({"role": "assistant", "content": greeting})
+                                    session.conversation_history.append(_ts_msg("assistant", greeting))
                                     await self.session_store.upsert_call(session)
                                     logger.info("Persisted initial greeting to session history", call_id=call_id)
                                 except Exception as e:
                                     logger.warning("Failed to persist greeting history", call_id=call_id, error=str(e))
-                                
+
                         break
                     except RuntimeError as exc:
                         error_text = str(exc).lower()
@@ -9463,6 +10604,7 @@ class Engine:
                     nonlocal conversation_history
                     response_text = ""
                     tool_calls = []
+                    _streaming_handled = False  # Set True when streaming overlap played audio + recorded history
                     turn_start_time = time.time()  # Track turn latency for call history
                     
                     pipeline_label = getattr(session, 'pipeline_name', None) or 'none'
@@ -9471,26 +10613,275 @@ class Engine:
                     
                     # Build context with conversation history
                     # System prompt only in first turn (when history is empty)
-                    context_for_llm = {"prior_messages": list(conversation_history)}
-                    
-                    try:
-                        llm_result = await pipeline.llm_adapter.generate(
-                            call_id,
-                            transcript_text,
-                            context_for_llm,  # Include conversation history
-                            llm_options,  # Use context-injected options (includes system_prompt)
-                        )
-                    except Exception:
-                        logger.debug("LLM generate failed", call_id=call_id, exc_info=True)
-                        return
+                    context_for_llm = {"prior_messages": _sanitize_for_llm(conversation_history)}
 
-                    # Handle structured LLM response with tool calls
-                    if isinstance(llm_result, LLMResponse):
-                        response_text = (llm_result.text or "").strip()
-                        tool_calls = llm_result.tool_calls
+                    # ── Pipeline filler audio: instant ack before LLM ──
+                    # Uses fire-and-forget: synthesize filler, push all chunks, send
+                    # EOS sentinel, then stop_streaming_playback so the slot is free
+                    # for the real LLM→TTS streaming overlap that follows.
+                    _streaming_cfg = getattr(self.config, "streaming", None)
+                    _filler_enabled = getattr(_streaming_cfg, "pipeline_filler_enabled", False) if _streaming_cfg else False
+                    if _filler_enabled and pipeline.tts_adapter:
+                        _filler_phrases = getattr(_streaming_cfg, "pipeline_filler_phrases", None) or []
+                        if _filler_phrases:
+                            import random as _rnd
+                            _filler_text = _rnd.choice(_filler_phrases)
+                            try:
+                                _filler_q: asyncio.Queue = asyncio.Queue(maxsize=64)
+                                _old_pn = getattr(session, "provider_name", None)
+                                session.provider_name = "pipeline"
+
+                                _tts_fmt = (pipeline.tts_options or {}).get("format")
+                                if not isinstance(_tts_fmt, dict):
+                                    _tts_fmt = (pipeline.tts_options or {}).get("target_format")
+                                if not isinstance(_tts_fmt, dict):
+                                    _tts_fmt = {}
+                                _filler_enc = str(_tts_fmt.get("encoding") or _tts_fmt.get("format") or "mulaw")
+                                try:
+                                    _filler_rate = int(_tts_fmt.get("sample_rate") or _tts_fmt.get("sample_rate_hz") or 8000)
+                                except Exception:
+                                    _filler_rate = 8000
+
+                                _filler_sid = await self.streaming_playback_manager.start_streaming_playback(
+                                    call_id, _filler_q,
+                                    playback_type="pipeline-tts-filler",
+                                    source_encoding=_filler_enc,
+                                    source_sample_rate=_filler_rate,
+                                )
+                                if _filler_sid:
+                                    async for _fc in pipeline.tts_adapter.synthesize(call_id, _filler_text, pipeline.tts_options):
+                                        if _fc:
+                                            await _filler_q.put(_fc)
+                                    try:
+                                        _filler_q.put_nowait(None)
+                                    except asyncio.QueueFull:
+                                        await _filler_q.put(None)
+                                    logger.info(
+                                        "Pipeline filler audio emitted",
+                                        call_id=call_id,
+                                        phrase=_filler_text,
+                                    )
+                                    # Wait for filler playback to finish, then release the
+                                    # streaming slot so the real LLM→TTS overlap can use it.
+                                    await self.streaming_playback_manager.stop_streaming_playback(call_id)
+                                    # Backdate tts_ended_ts so the post_tts_end_protection_ms
+                                    # window has already expired. This avoids blocking barge-in
+                                    # between filler and real response, while keeping the echo
+                                    # protection mechanism intact for future TTS emissions.
+                                    _post_guard = getattr(self.config, "barge_in", None)
+                                    _post_ms = getattr(_post_guard, "post_tts_end_protection_ms", 250) if _post_guard else 250
+                                    session.tts_ended_ts = time.time() - (_post_ms / 1000.0) - 0.01
+                                if _old_pn is not None:
+                                    session.provider_name = _old_pn
+                            except Exception:
+                                logger.debug("Pipeline filler audio failed", call_id=call_id, exc_info=True)
+                                try:
+                                    await self.streaming_playback_manager.stop_streaming_playback(call_id)
+                                except Exception:
+                                    pass
+
+                    # ── Streaming overlap: LLM tokens → sentence split → TTS ──
+                    # Works even when tools are configured: if the LLM returns a tool
+                    # call instead of text, generate_stream() yields nothing and we
+                    # fall through to the serial path for tool execution.
+                    _streaming_cfg = getattr(self.config, "streaming", None)
+                    _overlap_enabled = getattr(_streaming_cfg, "pipeline_streaming_overlap", False) if _streaming_cfg else False
+                    _adapter_supports_streaming = getattr(pipeline.llm_adapter, "supports_streaming", False)
+
+                    _tts_dm_override = getattr(pipeline.tts_adapter, "downstream_mode_override", "auto") or "auto"
+                    if _tts_dm_override == "stream":
+                        _use_streaming_pb = True
+                    elif _tts_dm_override == "file":
+                        _use_streaming_pb = False
                     else:
-                        response_text = (str(llm_result) or "").strip()
-                        tool_calls = []
+                        _use_streaming_pb = self.config.downstream_mode != "file"
+
+                    if (
+                        _overlap_enabled
+                        and _adapter_supports_streaming
+                        and _use_streaming_pb
+                    ):
+                        logger.info(
+                            "Pipeline streaming overlap active",
+                            call_id=call_id,
+                            pipeline=pipeline_label,
+                            tools_configured=bool((llm_options or {}).get("tools")),
+                        )
+                        _SENTENCE_RE = re.compile(r"[.!?]\s+")
+                        sentence_buffer = ""
+                        full_response_text = ""
+                        first_tts_ts: Optional[float] = None
+
+                        stream_q: asyncio.Queue = asyncio.Queue(maxsize=256)
+                        old_provider_name = getattr(session, "provider_name", None)
+                        try:
+                            session.provider_name = "pipeline"
+                            await self.session_store.upsert_call(session)
+                        except Exception:
+                            pass
+
+                        try:
+                            tts_format = (pipeline.tts_options or {}).get("format")
+                            if not isinstance(tts_format, dict):
+                                tts_format = (pipeline.tts_options or {}).get("target_format")
+                            if not isinstance(tts_format, dict):
+                                tts_format = {}
+                            tts_encoding = str(tts_format.get("encoding") or tts_format.get("format") or "mulaw")
+                            try:
+                                tts_rate = int(tts_format.get("sample_rate") or tts_format.get("sample_rate_hz") or 8000)
+                            except Exception:
+                                tts_rate = 8000
+
+                            stream_id = await self.streaming_playback_manager.start_streaming_playback(
+                                call_id,
+                                stream_q,
+                                playback_type="pipeline-tts",
+                                source_encoding=tts_encoding,
+                                source_sample_rate=tts_rate,
+                            )
+                            if not stream_id:
+                                raise RuntimeError("start_streaming_playback returned no stream_id")
+
+                            async for token in pipeline.llm_adapter.generate_stream(
+                                call_id, transcript_text, context_for_llm, llm_options,
+                            ):
+                                sentence_buffer += token
+                                full_response_text += token
+
+                                match = _SENTENCE_RE.search(sentence_buffer)
+                                if match:
+                                    split_pos = match.end()
+                                    to_speak = sentence_buffer[:split_pos].strip()
+                                    sentence_buffer = sentence_buffer[split_pos:]
+
+                                    if to_speak:
+                                        async for tts_chunk in pipeline.tts_adapter.synthesize(
+                                            call_id, to_speak, pipeline.tts_options,
+                                        ):
+                                            if tts_chunk:
+                                                if first_tts_ts is None:
+                                                    first_tts_ts = time.time()
+                                                    turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
+                                                    session.turn_latencies_ms.append(turn_latency_ms)
+                                                    try:
+                                                        if t_start is not None:
+                                                            _TURN_STT_TO_TTS.labels(pipeline_label, provider_label).observe(
+                                                                max(0.0, first_tts_ts - t_start)
+                                                            )
+                                                    except Exception:
+                                                        pass
+                                                await stream_q.put(tts_chunk)
+
+                            # Flush remaining sentence buffer
+                            remainder = sentence_buffer.strip()
+                            if remainder:
+                                async for tts_chunk in pipeline.tts_adapter.synthesize(
+                                    call_id, remainder, pipeline.tts_options,
+                                ):
+                                    if tts_chunk:
+                                        if first_tts_ts is None:
+                                            first_tts_ts = time.time()
+                                            turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
+                                            session.turn_latencies_ms.append(turn_latency_ms)
+                                        await stream_q.put(tts_chunk)
+
+                            # End-of-segment sentinel
+                            try:
+                                stream_q.put_nowait(None)
+                            except asyncio.QueueFull:
+                                asyncio.create_task(stream_q.put(None))
+                            try:
+                                if t_start is not None:
+                                    _TURN_RESPONSE_SECONDS.labels(pipeline_label, provider_label).observe(
+                                        max(0.0, time.time() - t_start)
+                                    )
+                            except Exception:
+                                pass
+
+                        except Exception:
+                            logger.error(
+                                "Pipeline streaming overlap failed; falling through to serial path",
+                                call_id=call_id,
+                                exc_info=True,
+                            )
+                            try:
+                                await self.streaming_playback_manager.stop_streaming_playback(call_id)
+                            except Exception:
+                                pass
+                            # Don't return — fall through to serial path below
+                            full_response_text = ""
+                        finally:
+                            try:
+                                session.provider_name = old_provider_name
+                                await self.session_store.upsert_call(session)
+                            except Exception:
+                                pass
+
+                        if full_response_text.strip():
+                            response_text = full_response_text.strip()
+                            _streaming_handled = True
+                            conversation_history.append(_ts_msg("user", transcript_text))
+                            conversation_history.append(_ts_msg("assistant", response_text))
+                            session.conversation_history = list(conversation_history)
+                            await self.session_store.upsert_call(session)
+
+                            # Check for tool calls detected during streaming
+                            _pending_tools = getattr(pipeline.llm_adapter, "_pending_tool_calls_by_call", {}).get(call_id) or []
+                            if _pending_tools:
+                                logger.info(
+                                    "Streaming path executing pending tool calls",
+                                    call_id=call_id,
+                                    tool_count=len(_pending_tools),
+                                    tools=[tc.get("name") for tc in _pending_tools],
+                                )
+                                tool_calls = list(_pending_tools)
+                                pipeline.llm_adapter._pending_tool_calls_by_call.pop(call_id, None)
+                                # Jump to tool execution (reuse serial path's tool handling)
+                                # by setting response_text and tool_calls, then breaking out
+                            else:
+                                return
+
+                            # Fall through to tool execution below if tool calls were found
+                        else:
+                            # Streaming produced no text — likely a tool-call-only response.
+                            _pending_tools = getattr(pipeline.llm_adapter, "_pending_tool_calls_by_call", {}).get(call_id) or []
+                            if _pending_tools:
+                                tool_calls = list(_pending_tools)
+                                pipeline.llm_adapter._pending_tool_calls_by_call.pop(call_id, None)
+                                response_text = ""
+                                logger.info(
+                                    "Streaming produced tool calls only; executing",
+                                    call_id=call_id,
+                                    tools=[tc.get("name") for tc in tool_calls],
+                                )
+                            else:
+                                # No text and no tools — fall through to serial path
+                                logger.info(
+                                    "Pipeline streaming produced no text; falling to serial path",
+                                    call_id=call_id,
+                                )
+
+                    # ── Serial path (original) ──
+                    # Skip if streaming path already set tool_calls
+                    if not tool_calls:
+                        try:
+                            llm_result = await pipeline.llm_adapter.generate(
+                                call_id,
+                                transcript_text,
+                                context_for_llm,  # Include conversation history
+                                llm_options,  # Use context-injected options (includes system_prompt)
+                            )
+                        except Exception:
+                            logger.debug("LLM generate failed", call_id=call_id, exc_info=True)
+                            return
+
+                        # Handle structured LLM response with tool calls
+                        if isinstance(llm_result, LLMResponse):
+                            response_text = (llm_result.text or "").strip()
+                            tool_calls = llm_result.tool_calls
+                        else:
+                            response_text = (str(llm_result) or "").strip()
+                            tool_calls = []
 
                     # Contexts are the source of truth for tool allowlisting: enforce at execution time too.
                     allowed_tools: set[str] = set()
@@ -9623,22 +11014,24 @@ class Engine:
 
                     if not response_text and not tool_calls:
                         return
-                    
-                    # Update conversation history
-                    conversation_history.append({"role": "user", "content": transcript_text})
-                    if response_text:
-                        conversation_history.append({"role": "assistant", "content": response_text})
-                    elif tool_calls:
-                        conversation_history.append({"role": "assistant", "content": "(tool execution)"})
-                    
-                    # AAVA-85: Persist session history so tools (email) can access it
-                    session.conversation_history = list(conversation_history)
-                    await self.session_store.upsert_call(session)
+
+                    # Update conversation history (skip if streaming path already did this)
+                    if not _streaming_handled:
+                        conversation_history.append(_ts_msg("user", transcript_text))
+                        if response_text:
+                            conversation_history.append(_ts_msg("assistant", response_text))
+                        elif tool_calls:
+                            conversation_history.append(_ts_msg("assistant", "(tool execution)"))
+
+                        # AAVA-85: Persist session history so tools (email) can access it
+                        session.conversation_history = list(conversation_history)
+                        await self.session_store.upsert_call(session)
 
                     playback_id = None
-                    
+
                     # 1. Synthesize and Play Text (if any)
-                    if response_text:
+                    # Skip TTS if streaming path already played audio
+                    if response_text and not _streaming_handled:
                         # Resolve effective downstream mode: TTS adapter can override global setting.
                         _tts_dm_override = getattr(pipeline.tts_adapter, "downstream_mode_override", "auto") or "auto"
                         logger.debug(f"TTS Adapter DM Override evaluated as: {_tts_dm_override} on adapter {pipeline.tts_adapter.__class__.__name__}")
@@ -9799,6 +11192,13 @@ class Engine:
                                 await asyncio.sleep(len(response_text) * 0.08)
                             except Exception:
                                 pass
+                        elif _streaming_handled and response_text:
+                            try:
+                                # Streaming path played audio without setting playback_id;
+                                # estimate wait from response length so caller hears farewell
+                                await asyncio.sleep(len(response_text) * 0.08)
+                            except Exception:
+                                pass
 
                         from src.tools.context import ToolExecutionContext
                         from src.tools.registry import tool_registry
@@ -9878,7 +11278,7 @@ class Engine:
                                         farewell = result.get("message")
                                         if farewell:
                                             # Add farewell to conversation history for email
-                                            conversation_history.append({"role": "assistant", "content": farewell})
+                                            conversation_history.append(_ts_msg("assistant", farewell))
                                             session.conversation_history = list(conversation_history)
                                             await self.session_store.upsert_call(session)
                                             logger.info("Farewell added to conversation history", call_id=call_id)
@@ -9925,21 +11325,19 @@ class Engine:
                                     if not result.get("will_hangup") and canonical_tool not in ("blind_transfer", "live_agent_transfer"):
                                         tool_result_msg = result.get("message", f"Tool {name} executed successfully.")
                                         # Add tool result to conversation history
-                                        conversation_history.append({
-                                            "role": "assistant",
-                                            "content": None,
-                                            "tool_calls": [{"id": f"call_{name}", "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}]
-                                        })
-                                        conversation_history.append({
-                                            "role": "tool",
-                                            "tool_call_id": f"call_{name}",
-                                            "content": tool_result_msg
-                                        })
+                                        conversation_history.append(_ts_msg(
+                                            "assistant", None,
+                                            tool_calls=[{"id": f"call_{name}", "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}]
+                                        ))
+                                        conversation_history.append(_ts_msg(
+                                            "tool", tool_result_msg,
+                                            tool_call_id=f"call_{name}"
+                                        ))
                                         logger.info("Tool result added to conversation, triggering LLM continuation", tool=name, call_id=call_id)
                                         
                                         # Trigger LLM to generate follow-up response
                                         try:
-                                            context_for_llm = {"prior_messages": list(conversation_history)}
+                                            context_for_llm = {"prior_messages": _sanitize_for_llm(conversation_history)}
                                             llm_response = await pipeline.llm_adapter.generate(
                                                 call_id,
                                                 "",  # Empty transcript - tool result already in context
@@ -9951,7 +11349,7 @@ class Engine:
                                                 if getattr(llm_response, 'text', None):
                                                     response_text = llm_response.text.strip()
                                                     if response_text:
-                                                        conversation_history.append({"role": "assistant", "content": response_text})
+                                                        conversation_history.append(_ts_msg("assistant", response_text))
                                                         logger.info("LLM continuation response", preview=response_text[:80], call_id=call_id)
                                                         
                                                         # Synthesize and play TTS
@@ -10014,7 +11412,7 @@ class Engine:
                                                             next_result = await next_task
                                                             if next_result.get("will_hangup"):
                                                                 farewell = next_result.get("message", "Goodbye!")
-                                                                conversation_history.append({"role": "assistant", "content": farewell})
+                                                                conversation_history.append(_ts_msg("assistant", farewell))
                                                                 session.conversation_history = list(conversation_history)
                                                                 await self.session_store.upsert_call(session)
                                                                 fw_bytes = bytearray()
@@ -10067,13 +11465,7 @@ class Engine:
                     threshold_met = words >= min_words or chars >= min_chars
                     
                     if not threshold_met:
-                        if force:
-                            pending_segments.clear()
-                            if from_flush:
-                                flush_task = None
-                            else:
-                                await cancel_flush()
-                        else:
+                        if not force:
                             logger.debug(
                                 "Accumulating transcript before LLM",
                                 call_id=call_id,
@@ -10081,7 +11473,7 @@ class Engine:
                                 chars=chars,
                                 words=words,
                             )
-                        return
+                            return
                     if from_flush:
                         flush_task = None
                     else:
@@ -11821,6 +13213,43 @@ class Engine:
                         elif hasattr(context_config, 'prompt') and context_config.prompt:
                             provider_context['prompt'] = context_config.prompt
                             provider_context['instructions'] = context_config.prompt  # Alias for ElevenLabs
+
+                        try:
+                            from src.tools.runtime_guidance import build_in_call_tool_runtime_guidance
+
+                            runtime_tool_guidance = build_in_call_tool_runtime_guidance(
+                                self.config.dict(),
+                                provider_context.get("tools") or [],
+                            )
+                            if runtime_tool_guidance:
+                                runtime_tool_guidance = str(runtime_tool_guidance).strip()
+                                base_prompt = str(
+                                    provider_context.get("prompt")
+                                    or provider_context.get("instructions")
+                                    or ""
+                                ).strip()
+                                existing_guidance = str(provider_context.get("tool_runtime_guidance") or "").strip()
+                                if existing_guidance == runtime_tool_guidance or (
+                                    base_prompt and runtime_tool_guidance and runtime_tool_guidance in base_prompt
+                                ):
+                                    combined_prompt = base_prompt
+                                else:
+                                    combined_prompt = (
+                                        f"{base_prompt}\n\n{runtime_tool_guidance}".strip()
+                                        if base_prompt
+                                        else runtime_tool_guidance
+                                    )
+                                provider_context["prompt"] = combined_prompt
+                                provider_context["instructions"] = combined_prompt
+                                provider_context["tool_runtime_guidance"] = runtime_tool_guidance
+                                logger.debug(
+                                    "Injected runtime tool guidance into provider prompt",
+                                    call_id=call_id,
+                                    tool_count=len(provider_context.get("tools") or []),
+                                    guidance_length=len(runtime_tool_guidance),
+                                )
+                        except Exception:
+                            logger.debug("Failed to inject runtime tool guidance", call_id=call_id, exc_info=True)
 
                         if isinstance(greeting_override, str) and greeting_override.strip():
                             provider_context["greeting"] = greeting_override

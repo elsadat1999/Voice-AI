@@ -16,6 +16,24 @@ def _parse_bool(raw: Optional[str], default: bool = False) -> bool:
     return default
 
 
+def _parse_float(raw: Optional[str], default: float = 0.0) -> float:
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except (ValueError, TypeError):
+        return default
+
+
+def _parse_int(raw: Optional[str], default: int = 0) -> int:
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except (ValueError, TypeError):
+        return default
+
+
 @dataclass(frozen=True)
 class LocalAIConfig:
     runtime_mode: str = "full"
@@ -30,6 +48,15 @@ class LocalAIConfig:
     stt_model_path: str = "/app/models/stt/vosk-model-en-us-0.22"
 
     sherpa_model_path: str = "/app/models/stt/sherpa"
+    sherpa_model_type: str = "online"
+    sherpa_vad_model_path: str = ""
+    sherpa_vad_threshold: float = 0.35
+    sherpa_vad_min_silence_ms: int = 700
+    sherpa_vad_min_speech_ms: int = 200
+    sherpa_offline_preroll_ms: int = 350
+    tone_model_path: str = "/app/models/stt/t-one"
+    tone_decoder_type: str = "beam_search"
+    tone_kenlm_path: str = ""
     faster_whisper_model: str = "base"
     faster_whisper_device: str = "cpu"
     faster_whisper_compute: str = "int8"
@@ -45,7 +72,10 @@ class LocalAIConfig:
     kroko_embedded: bool = False
     kroko_port: int = 6006
 
-    llm_model_path: str = "/app/models/llm/phi-3-mini-4k-instruct.Q4_K_M.gguf"
+    # Default model: Qwen 2.5-1.5B Instruct (best CPU voice model).
+    # Phi-3-mini (3.8B) is too slow on CPU (~0.8 tok/s). Qwen 2.5-1.5B
+    # achieves ~15-30 tok/s with good tool calling and chatml format.
+    llm_model_path: str = "/app/models/llm/qwen2.5-1.5b-instruct-q4_k_m.gguf"
     llm_threads: int = 4
     # NOTE: 768 is intentionally small for latency, but it is often too small for
     # realistic system prompts (e.g. demo contexts). We keep the dataclass default
@@ -60,8 +90,10 @@ class LocalAIConfig:
     llm_system_prompt: str = (
         "You are a helpful AI voice assistant. Respond naturally and conversationally to the caller."
     )
+    # Stop tokens for ChatML format (Qwen 2.5, Phi-3, Hermes, etc.)
+    # Also includes Phi-specific tokens for backward compatibility.
     llm_stop_tokens: List[str] = field(
-        default_factory=lambda: ["<|user|>", "<|assistant|>", "<|end|>"]
+        default_factory=lambda: ["<|im_end|>", "<|endoftext|>", "<|user|>", "<|assistant|>", "<|end|>"]
     )
     llm_use_mlock: bool = False
     llm_infer_timeout_sec: float = 20.0
@@ -88,6 +120,51 @@ class LocalAIConfig:
     kokoro_api_base_url: str = ""
     kokoro_api_key: str = ""
     kokoro_api_model: str = "model"
+
+    silero_speaker: str = "xenia"
+    silero_language: str = "ru"
+    silero_model_id: str = "v3_1_ru"
+    silero_sample_rate: int = 8000
+    silero_model_path: str = "/app/models/tts/silero"
+
+    # Matcha-TTS (via sherpa-onnx) — fast, high-quality CPU TTS
+    matcha_model_path: str = "/app/models/tts/matcha-icefall-en_US-ljspeech/model-steps-3.onnx"
+    matcha_vocoder_path: str = "/app/models/tts/matcha-icefall-en_US-ljspeech/hifigan_v2.onnx"
+    matcha_speed: float = 1.0
+    matcha_sid: int = 0
+
+    # ── Latency optimization settings ──
+
+    # Silero 8kHz direct µ-law: skip resampling when native rate matches telephony.
+    # WARNING: Silero TTS community models use CC-NC-BY licensing.
+    # Verify compatibility with your deployment's commercial terms before enabling.
+    silero_direct_mulaw: bool = True
+
+    # Filler audio: emit a fast eSpeak NG phrase before LLM inference.
+    enable_filler_audio: bool = False
+    filler_phrases: List[str] = field(default_factory=lambda: [
+        "One moment please.",
+        "Let me check on that.",
+        "Sure thing.",
+        "Just a moment.",
+    ])
+    filler_voice: str = "en"
+    filler_speed: int = 160
+
+    # LLM streaming → TTS overlap: stream LLM tokens sentence-by-sentence to TTS.
+    llm_streaming_tts_overlap: bool = True
+
+    # TTS phrase cache: cache TTS output for repeated short phrases.
+    tts_phrase_cache_enabled: bool = False
+    tts_phrase_cache_max_text_len: int = 200
+
+    # Speculative LLM on stable partial transcripts.
+    speculative_llm_enabled: bool = False
+    speculative_llm_max_tokens: int = 32
+    speculative_llm_stability_ms: int = 300
+
+    # Comfort noise: send low-level noise frames instead of silence during gaps.
+    comfort_noise_enabled: bool = False
 
     stt_idle_ms: int = 5000
     # Telephony-friendly utterance segmentation for batch STT backends (Whisper family).
@@ -159,6 +236,15 @@ class LocalAIConfig:
                 "LOCAL_STT_MODEL_PATH", "/app/models/stt/vosk-model-en-us-0.22"
             ),
             sherpa_model_path=os.getenv("SHERPA_MODEL_PATH", "/app/models/stt/sherpa"),
+            sherpa_model_type=(os.getenv("SHERPA_MODEL_TYPE", "online") or "online").strip().lower(),
+            sherpa_vad_model_path=os.getenv("SHERPA_VAD_MODEL_PATH", ""),
+            sherpa_vad_threshold=_parse_float(os.getenv("SHERPA_VAD_THRESHOLD"), 0.35),
+            sherpa_vad_min_silence_ms=_parse_int(os.getenv("SHERPA_VAD_MIN_SILENCE_MS"), 700),
+            sherpa_vad_min_speech_ms=_parse_int(os.getenv("SHERPA_VAD_MIN_SPEECH_MS"), 200),
+            sherpa_offline_preroll_ms=_parse_int(os.getenv("SHERPA_OFFLINE_PREROLL_MS"), 350),
+            tone_model_path=os.getenv("TONE_MODEL_PATH", "/app/models/stt/t-one"),
+            tone_decoder_type=(os.getenv("TONE_DECODER_TYPE", "beam_search") or "beam_search").strip().lower(),
+            tone_kenlm_path=os.getenv("TONE_KENLM_PATH", ""),
             faster_whisper_model=os.getenv("FASTER_WHISPER_MODEL", "base"),
             faster_whisper_device=os.getenv("FASTER_WHISPER_DEVICE", "cpu"),
             faster_whisper_compute=os.getenv("FASTER_WHISPER_COMPUTE_TYPE", "int8"),
@@ -218,6 +304,33 @@ class LocalAIConfig:
             kokoro_api_base_url=(os.getenv("KOKORO_API_BASE_URL", "") or "").strip(),
             kokoro_api_key=(os.getenv("KOKORO_API_KEY", "") or "").strip(),
             kokoro_api_model=(os.getenv("KOKORO_API_MODEL", "model") or "model").strip(),
+            silero_speaker=os.getenv("SILERO_SPEAKER", "xenia"),
+            silero_language=os.getenv("SILERO_LANGUAGE", "ru"),
+            silero_model_id=os.getenv("SILERO_MODEL_ID", "v3_1_ru"),
+            silero_sample_rate=_parse_int(os.getenv("SILERO_SAMPLE_RATE"), 8000),
+            silero_model_path=os.getenv("SILERO_MODEL_PATH", "/app/models/tts/silero"),
+            matcha_model_path=os.getenv("MATCHA_MODEL_PATH", "/app/models/tts/matcha/model.onnx"),
+            matcha_vocoder_path=os.getenv("MATCHA_VOCODER_PATH", "/app/models/tts/matcha/vocos.onnx"),
+            matcha_speed=float(os.getenv("MATCHA_SPEED", "1.0")),
+            matcha_sid=int(os.getenv("MATCHA_SID", "0")),
+            silero_direct_mulaw=_parse_bool(os.getenv("SILERO_DIRECT_MULAW", "1"), default=True),
+            enable_filler_audio=_parse_bool(os.getenv("LOCAL_ENABLE_FILLER_AUDIO", "0")),
+            filler_phrases=[
+                p.strip()
+                for p in (
+                    os.getenv("LOCAL_FILLER_PHRASES", "One moment please.,Let me check on that.,Sure thing.,Just a moment.") or ""
+                ).split(",")
+                if p.strip()
+            ] or ["One moment please.", "Let me check on that.", "Sure thing.", "Just a moment."],
+            filler_voice=os.getenv("LOCAL_FILLER_VOICE", "en"),
+            filler_speed=_parse_int(os.getenv("LOCAL_FILLER_SPEED"), 160),
+            llm_streaming_tts_overlap=_parse_bool(os.getenv("LOCAL_LLM_STREAMING_TTS_OVERLAP", "1"), default=True),
+            tts_phrase_cache_enabled=_parse_bool(os.getenv("LOCAL_TTS_PHRASE_CACHE", "0")),
+            tts_phrase_cache_max_text_len=_parse_int(os.getenv("LOCAL_TTS_PHRASE_CACHE_MAX_LEN"), 200),
+            speculative_llm_enabled=_parse_bool(os.getenv("LOCAL_SPECULATIVE_LLM", "0")),
+            speculative_llm_max_tokens=_parse_int(os.getenv("LOCAL_SPECULATIVE_LLM_MAX_TOKENS"), 32),
+            speculative_llm_stability_ms=_parse_int(os.getenv("LOCAL_SPECULATIVE_LLM_STABILITY_MS"), 300),
+            comfort_noise_enabled=_parse_bool(os.getenv("LOCAL_COMFORT_NOISE", "0")),
             stt_idle_ms=int(stt_idle_ms_raw),
             stt_segment_energy_threshold=int(os.getenv("LOCAL_STT_SEGMENT_ENERGY_THRESHOLD", "1200")),
             stt_segment_preroll_ms=int(os.getenv("LOCAL_STT_SEGMENT_PREROLL_MS", "200")),

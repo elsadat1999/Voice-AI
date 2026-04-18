@@ -97,7 +97,17 @@ class CallRecord:
 
 class CallHistoryStore:
     """SQLite-based call history storage."""
-    
+
+    @staticmethod
+    def _escape_like(value: str) -> str:
+        """Escape special characters for use in a SQL LIKE pattern with ESCAPE '\\'."""
+        return (
+            value
+            .replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+
     _CREATE_TABLE_SQL = """
     CREATE TABLE IF NOT EXISTS call_records (
         id TEXT PRIMARY KEY,
@@ -332,6 +342,7 @@ class CallHistoryStore:
         has_tool_calls: Optional[bool] = None,
         min_duration: Optional[float] = None,
         max_duration: Optional[float] = None,
+        transcript_search: Optional[str] = None,
         order_by: str = "start_time",
         order_dir: str = "DESC",
         include_details: bool = True,
@@ -406,7 +417,11 @@ class CallHistoryStore:
                     if max_duration is not None:
                         conditions.append("duration_seconds <= ?")
                         params.append(max_duration)
-                    
+                    if transcript_search:
+                        escaped = self._escape_like(transcript_search)
+                        conditions.append("LOWER(conversation_history) LIKE LOWER(?) ESCAPE '\\'")
+                        params.append(f"%{escaped}%")
+
                     # Validate order_by to prevent SQL injection
                     valid_columns = [
                         'start_time', 'end_time', 'duration_seconds', 
@@ -476,6 +491,7 @@ class CallHistoryStore:
         has_tool_calls: Optional[bool] = None,
         min_duration: Optional[float] = None,
         max_duration: Optional[float] = None,
+        transcript_search: Optional[str] = None,
     ) -> int:
         """Count records matching filters."""
         if not self._enabled:
@@ -523,7 +539,11 @@ class CallHistoryStore:
                     if max_duration is not None:
                         conditions.append("duration_seconds <= ?")
                         params.append(max_duration)
-                    
+                    if transcript_search:
+                        escaped = self._escape_like(transcript_search)
+                        conditions.append("LOWER(conversation_history) LIKE LOWER(?) ESCAPE '\\'")
+                        params.append(f"%{escaped}%")
+
                     where_clause = " AND ".join(conditions) if conditions else "1=1"
                     query = f"SELECT COUNT(*) FROM call_records WHERE {where_clause}"
                     

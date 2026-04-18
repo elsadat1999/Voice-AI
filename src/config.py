@@ -235,7 +235,8 @@ class MiniMaxLLMProviderConfig(BaseModel):
     Canonical defaults for the MiniMax LLM pipeline adapter.
 
     MiniMax exposes an OpenAI-compatible Chat Completions endpoint.
-    Supported models: MiniMax-M2.5, MiniMax-M2.5-highspeed (204K context).
+    Supported models: MiniMax-M2.7, MiniMax-M2.7-highspeed,
+    MiniMax-M2.5, MiniMax-M2.5-highspeed (204K context).
 
     Key constraints:
       - temperature must be in (0.0, 1.0]; 0 is rejected.
@@ -247,7 +248,7 @@ class MiniMaxLLMProviderConfig(BaseModel):
     api_key: Optional[str] = None
 
     chat_base_url: str = Field(default="https://api.minimax.io/v1")
-    chat_model: str = Field(default="MiniMax-M2.5")
+    chat_model: str = Field(default="MiniMax-M2.7")
 
     temperature: float = Field(default=1.0)
     max_tokens: Optional[int] = None
@@ -364,7 +365,7 @@ class GroqTTSProviderConfig(BaseModel):
 
 class ElevenLabsProviderConfig(BaseModel):
     """ElevenLabs TTS provider configuration.
-    
+
     API Reference: https://elevenlabs.io/docs/api-reference/text-to-speech
     """
     enabled: bool = Field(default=True)
@@ -380,6 +381,26 @@ class ElevenLabsProviderConfig(BaseModel):
     similarity_boost: float = Field(default=0.75)
     style: float = Field(default=0.0)
     use_speaker_boost: bool = Field(default=True)
+    # Provider-specific farewell hangup delay (overrides global)
+    farewell_hangup_delay_sec: Optional[float] = None
+
+
+class CambAiProviderConfig(BaseModel):
+    """CAMB AI TTS provider configuration.
+
+    Supports MARS speech models: mars-flash (~150ms latency),
+    mars-pro (higher quality), mars-instruct (director-level control).
+
+    API Reference: https://docs.camb.ai
+    """
+    enabled: bool = Field(default=True)
+    api_key: Optional[str] = None
+    voice_id: int = Field(default=147320)  # Default CAMB AI voice
+    speech_model: str = Field(default="mars-flash")  # mars-flash, mars-pro, mars-instruct
+    language: str = Field(default="en-us")  # BCP-47 language code
+    base_url: str = Field(default="https://client.camb.ai/apis")
+    # Output format for streaming TTS
+    output_format: str = Field(default="pcm_s16le")  # pcm_s16le for raw PCM
     # Provider-specific farewell hangup delay (overrides global)
     farewell_hangup_delay_sec: Optional[float] = None
 
@@ -630,7 +651,12 @@ class LLMConfig(BaseModel):
 
 
 class VADConfig(BaseModel):
-    use_provider_vad: bool = Field(default=False)
+    use_provider_vad: bool = Field(default=False)  # Deprecated: use vad_mode instead
+    vad_mode: Literal["auto", "local", "provider"] = Field(
+        default="auto",
+        description="VAD mode: 'auto' (decide per-provider based on capabilities), "
+                    "'local' (always use local VAD), 'provider' (prefer provider VAD, equivalent to use_provider_vad=true)"
+    )
     enhanced_enabled: bool = Field(default=False)
     # WebRTC VAD settings - optimized for real-time conversation
     webrtc_aggressiveness: int = 1
@@ -689,6 +715,18 @@ class StreamingConfig(BaseModel):
     egress_swap_mode: str = Field(default="auto")
     # When true, force outbound streaming audio to μ-law regardless of provider encoding.
     egress_force_mulaw: bool = Field(default=False)
+    # Overlap LLM token streaming with TTS synthesis in modular pipelines.
+    # Streams tokens → splits into sentences → synthesizes each sentence concurrently.
+    pipeline_streaming_overlap: bool = Field(default=True)
+    # Play a brief filler phrase (e.g. "One moment please.") via the pipeline TTS
+    # adapter immediately when a user turn is detected, before LLM inference starts.
+    pipeline_filler_enabled: bool = Field(default=False)
+    pipeline_filler_phrases: List[str] = Field(default_factory=lambda: [
+        "One moment please.",
+        "Let me check on that.",
+        "Sure thing.",
+        "Just a moment.",
+    ])
 
 
 class LoggingConfig(BaseModel):
