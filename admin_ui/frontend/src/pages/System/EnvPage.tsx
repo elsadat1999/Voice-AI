@@ -587,11 +587,11 @@ const EnvPage = () => {
             {activeTab === 'ai-engine' && (
                 <>
                     {/* Asterisk Settings */}
-                    <ConfigSection title="Asterisk Settings" description="Connection details for the Asterisk server.">
+                    <ConfigSection title="PBX System Settings" description="Connection details for the PBX System server.">
                 <ConfigCard>
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                         <FormInput
-                            label="Asterisk Host"
+                            label="PBX System Host"
                             value={env['ASTERISK_HOST'] || ''}
                             onChange={(e) => updateEnv('ASTERISK_HOST', e.target.value)}
                         />
@@ -641,7 +641,7 @@ const EnvPage = () => {
                             label="Stasis App Name"
                             value={env['ASTERISK_APP_NAME'] || 'asterisk-ai-voice-agent'}
                             onChange={(e) => updateEnv('ASTERISK_APP_NAME', e.target.value)}
-                            tooltip="Name of the Stasis application registered with Asterisk ARI."
+                            tooltip="Name of the Stasis application registered with PBX System ARI."
                         />
                         <FormInput
                             label="Media Directory"
@@ -678,7 +678,7 @@ const EnvPage = () => {
                                             <span>{ariTestResult.message}</span>
                                             {ariTestResult.asterisk_version && (
                                                 <span className="text-muted-foreground ml-2">
-                                                    (Asterisk {ariTestResult.asterisk_version})
+                                                    (PBX System {ariTestResult.asterisk_version})
                                                 </span>
                                             )}
                                         </>
@@ -865,7 +865,7 @@ const EnvPage = () => {
                     </ConfigSection>
 
                     {/* NAT/Hybrid Network */}
-                    <ConfigSection title="NAT / Hybrid Network" description="Use when AI Engine is behind NAT and Asterisk is remote.">
+                    <ConfigSection title="NAT / Hybrid Network" description="Use when AI Engine is behind NAT and PBX System is remote.">
                         <ConfigCard>
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                                 <FormInput
@@ -873,18 +873,18 @@ const EnvPage = () => {
                                     value={env['AUDIOSOCKET_ADVERTISE_HOST'] || ''}
                                     onChange={(e) => updateEnv('AUDIOSOCKET_ADVERTISE_HOST', e.target.value)}
                                     placeholder="10.8.0.5"
-                                    tooltip="IP address Asterisk can reach for AudioSocket (VPN IP, public IP, LAN IP)."
+                                    tooltip="IP address PBX System can reach for AudioSocket (VPN IP, public IP, LAN IP)."
                                 />
                                 <FormInput
                                     label="ExternalMedia Advertise Host"
                                     value={env['EXTERNAL_MEDIA_ADVERTISE_HOST'] || ''}
                                     onChange={(e) => updateEnv('EXTERNAL_MEDIA_ADVERTISE_HOST', e.target.value)}
                                     placeholder="10.8.0.5"
-                                    tooltip="IP address Asterisk can reach for ExternalMedia RTP."
+                                    tooltip="IP address PBX System can reach for ExternalMedia RTP."
                                 />
                             </div>
                             <p className="text-xs text-muted-foreground mt-3">
-                                Leave blank if AI Engine and Asterisk are on the same network.
+                                Leave blank if AI Engine and PBX System are on the same network.
                             </p>
                         </ConfigCard>
                     </ConfigSection>

@@ -319,7 +319,7 @@ export const SystemTopology = () => {
           {/* Asterisk PBX */}
           <div
             onClick={() => navigate('/env')}
-            title="Go to Asterisk Settings →"
+            title="Go to PBX System Settings →"
             className={`relative p-4 rounded-xl border backdrop-blur-sm transition-all duration-300 cursor-pointer hover:-translate-y-1 ${hasAsteriskChannels
               ? 'border-green-500/50 bg-green-500/10 shadow-[0_8px_30px_rgb(34,197,94,0.15)] ring-1 ring-green-500/50'
               : 'border-border/60 bg-card/60 hover:bg-card/80 hover:border-primary/40 shadow-sm'
@@ -330,7 +330,7 @@ export const SystemTopology = () => {
             <div className="flex flex-col items-center gap-2">
               <Phone className={`w-8 h-8 ${hasAsteriskChannels ? 'text-green-500' : 'text-muted-foreground'}`} />
               <div className="text-center">
-                <div className={`font-semibold ${hasAsteriskChannels ? 'text-green-500' : 'text-foreground'}`}>Asterisk</div>
+                <div className={`font-semibold ${hasAsteriskChannels ? 'text-green-500' : 'text-foreground'}`}>PBX System</div>
                 <div className="text-xs text-muted-foreground">PBX</div>
               </div>
               <div className="w-full pt-2 mt-2 border-t border-border/50 space-y-1">

@@ -852,7 +852,7 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onSaveNow }: ToolFo
                                     label="MOH Class"
                                     value={config.attended_transfer?.moh_class || 'default'}
                                     onChange={(e) => updateNestedConfig('attended_transfer', 'moh_class', e.target.value)}
-                                    tooltip="Asterisk Music On Hold class used while the destination is being dialed."
+                                    tooltip="PBX System Music On Hold class used while the destination is being dialed."
                                 />
                                 <FormInput
                                     label="Dial Timeout (seconds)"
@@ -1237,7 +1237,7 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onSaveNow }: ToolFo
                                     const pillClass = _statusPillClass(status, loading);
                                     const label = _statusLabel(status, loading, st.checkedAt);
                                     const titleParts: string[] = [];
-                                    titleParts.push('Checks Asterisk ARI device/endpoint state');
+                                    titleParts.push('Checks PBX System ARI device/endpoint state');
                                     titleParts.push('Click to refresh');
                                     if (st.source) titleParts.push(`source=${st.source}`);
                                     if (st.state) titleParts.push(`state=${st.state}`);

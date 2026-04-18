@@ -335,7 +335,7 @@ const DeepgramProviderForm: React.FC<DeepgramProviderFormProps> = ({ config, onC
                             <option value="alaw">A-law</option>
                         </select>
                         <p className="text-xs text-muted-foreground">
-                            Audio format from Asterisk. Use μ-law for standard telephony.
+                            Audio format from PBX System. Use μ-law for standard telephony.
                         </p>
                     </div>
 
@@ -348,7 +348,7 @@ const DeepgramProviderForm: React.FC<DeepgramProviderFormProps> = ({ config, onC
                             onChange={(e) => handleChange('input_sample_rate_hz', parseInt(e.target.value))}
                         />
                         <p className="text-xs text-muted-foreground">
-                            Sample rate from Asterisk. Standard telephony uses 8000 Hz.
+                            Sample rate from PBX System. Standard telephony uses 8000 Hz.
                         </p>
                     </div>
 
@@ -393,7 +393,7 @@ const DeepgramProviderForm: React.FC<DeepgramProviderFormProps> = ({ config, onC
                             <option value="alaw">A-law</option>
                         </select>
                         <p className="text-xs text-muted-foreground">
-                            Final format for playback to caller. Match your Asterisk codec.
+                            Final format for playback to caller. Match your PBX System codec.
                         </p>
                     </div>
 

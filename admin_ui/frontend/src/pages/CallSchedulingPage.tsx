@@ -415,7 +415,7 @@ const CallSchedulingPage = () => {
     const modalConsentEnabled = Boolean((modalForm as any)?.consent_enabled);
     const modalVoicemailEnabled = Boolean((modalForm as any)?.voicemail_drop_enabled);
     const modalDialplanSnippet = buildDialplanSnippet({
-        stasisAppName: 'asterisk-ai-voice-agent',
+        stasisAppName: 'pbx-system-ai-voice-agent',
         consentEnabled: modalConsentEnabled,
         voicemailEnabled: modalVoicemailEnabled,
     });
@@ -1626,7 +1626,7 @@ const CallSchedulingPage = () => {
 
                             {dialplanNeedsReview && (
                                 <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
-                                    Consent/voicemail settings changed in this modal. Review the updated dialplan in the “Setup Guide” tab and reload Asterisk dialplan if needed.
+                                    Consent/voicemail settings changed in this modal. Review the updated dialplan in the “Setup Guide” tab and reload PBX System dialplan if needed.
                                 </div>
                             )}
 
