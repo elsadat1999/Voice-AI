@@ -17,7 +17,7 @@ ENV PATH="/opt/venv/bin:$PATH"
 COPY requirements.txt .
 
 # Install dependencies (this layer will be cached)
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --default-timeout=1000 --no-cache-dir -r requirements.txt
 
 # --- Stage 2: Final Runtime Image ---
 # Use slim image for smaller footprint
