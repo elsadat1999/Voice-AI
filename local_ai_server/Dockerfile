@@ -93,10 +93,10 @@ RUN if [ "$INCLUDE_MELOTTS" = "true" ]; then \
         if ! python -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('torchaudio') else 1)"; then pip install --default-timeout=1000 --no-cache-dir torchaudio; fi && \
         pip install --default-timeout=1000 --no-cache-dir --no-build-isolation --no-deps . && \
         cd / && rm -rf /tmp/MeloTTS && \
-        python -m unidic download || true && \
-        python -c "import nltk; nltk.download('averaged_perceptron_tagger_eng', download_dir='/opt/venv/nltk_data')" || true && \
-        echo "📦 Pre-downloading MeloTTS BERT model (best effort)..." && \
-        python -c "from transformers import AutoTokenizer; AutoTokenizer.from_pretrained('bert-base-uncased')" || true && \
+#        python -m unidic download || true && \
+#        python -c "import nltk; nltk.download('averaged_perceptron_tagger_eng', download_dir='/opt/venv/nltk_data')" || true && \
+        echo "📦 Skipping MeloTTS BERT model download..." && \
+#        python -c "from transformers import AutoTokenizer; AutoTokenizer.from_pretrained('bert-base-uncased')" || true && \
         python -c "from melo.api import TTS; print('MeloTTS package ready')"; \
     fi
 
@@ -109,9 +109,9 @@ RUN if [ "$INCLUDE_SILERO" = "true" ]; then \
             pip install --default-timeout=1000 --no-cache-dir torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu; \
         fi && \
         pip install --default-timeout=1000 --no-cache-dir omegaconf && \
-        echo "📦 Pre-caching Silero Russian model (best effort)..." && \
-        python -c "import torch; torch.hub.set_dir('/opt/silero-cache'); torch.hub.load('snakers4/silero-models:v5.5', 'silero_tts', language='ru', speaker='v3_1_ru', trust_repo=True)" || true && \
-        echo "✅ Silero TTS ready"; \
+        echo "📦 Skipping Silero Russian model pre-caching..." \
+#        && python -c "import torch; torch.hub.set_dir('/opt/silero-cache'); torch.hub.load('snakers4/silero-models:v5.5', 'silero_tts', language='ru', speaker='v3_1_ru', trust_repo=True)" || true \
+        && echo "✅ Silero TTS ready"; \
     fi
 
 RUN if [ "$INCLUDE_LLAMA" = "true" ]; then \
@@ -121,7 +121,8 @@ RUN if [ "$INCLUDE_LLAMA" = "true" ]; then \
 
 # Pre-install spacy model for Kokoro TTS (only if Kokoro included)
 RUN if [ "$INCLUDE_KOKORO" = "true" ]; then \
-        python -m spacy download en_core_web_sm || true; \
+        echo "📦 Skipping Spacy model download..."; \
+#        python -m spacy download en_core_web_sm || true; \
     fi
 
 # --- Stage 2: Final Runtime Image ---
