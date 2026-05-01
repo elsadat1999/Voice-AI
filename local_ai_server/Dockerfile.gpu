@@ -54,7 +54,7 @@ RUN if [ "$INCLUDE_VOSK" = "true" ]; then \
     fi
 
 RUN if [ "$INCLUDE_SHERPA" = "true" ]; then \
-        pip install --no-cache-dir sherpa-onnx==1.12.38; \
+        pip install --no-cache-dir sherpa-onnx==1.12.40; \
     fi
 
 RUN if [ "$INCLUDE_FASTER_WHISPER" = "true" ]; then \
@@ -112,7 +112,7 @@ RUN if [ "$INCLUDE_SILERO" = "true" ]; then \
 RUN if [ "$INCLUDE_LLAMA" = "true" ]; then \
         CMAKE_ARGS="-DGGML_CUDA=on -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=OFF" \
         FORCE_CMAKE=1 \
-        pip install --no-cache-dir llama-cpp-python==0.3.16; \
+        pip install --no-cache-dir llama-cpp-python==0.3.21; \
     fi
 
 # Pre-install spacy model for Kokoro TTS (only if Kokoro included)

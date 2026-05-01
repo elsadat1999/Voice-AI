@@ -323,8 +323,8 @@ providers:
     target_encoding: ulaw
     target_sample_rate_hz: 8000
 
-    # Model/voice
-    llm_model: gemini-2.5-flash-native-audio-preview-12-2025
+    # Model/voice — see "Choosing a model" below
+    llm_model: gemini-2.5-flash-native-audio-latest
     tts_voice_name: Aoede
 
     # Session behavior
@@ -339,8 +339,23 @@ providers:
     hangup_fallback_turn_complete_timeout_sec: 2.5
 ```
 
-> Model lifecycle note: Google Live currently publishes native-audio models with `preview` version labels.  
-> Keep `llm_model` pinned to a known working preview version unless Google announces a GA Live model family.
+#### Choosing a model
+
+Google publishes Gemini Live models on two surfaces with different lifecycles. Pick based on which auth mode you're using (see [Provider-Vertex-Setup.md](Provider-Vertex-Setup.md) for Vertex AI auth):
+
+| Model ID | Surface | Status (2026-04) | Notes |
+|----------|---------|------------------|-------|
+| `gemini-2.5-flash-native-audio-latest` | Developer API | Preview alias | **Shipped default.** Tracks Google's newest 2.5 native-audio snapshot automatically. |
+| `gemini-2.5-flash-native-audio-preview-12-2025` | Developer API | Preview, dated | Pin this for reproducibility — guarantees a fixed snapshot. |
+| `gemini-3.1-flash-live-preview` | Developer API | Preview, newest generation | Gemini 3.1 generation Live model. Evaluate before flipping the default; tool-calling parity not yet validated for AAVA. |
+| `gemini-live-2.5-flash-native-audio` | **Vertex AI** | **GA** | Use via `use_vertex_ai: true`. SLA, VPC-SC, fewer function-calling bugs (see [Provider-Vertex-Setup.md](Provider-Vertex-Setup.md)). |
+
+**Recommendation:**
+- **Developer API users** → keep the shipped `gemini-2.5-flash-native-audio-latest` unless you need pinned reproducibility (then use the dated string).
+- **Production / enterprise** → switch to Vertex AI mode and use `gemini-live-2.5-flash-native-audio` for GA-grade reliability and the function-calling fix.
+- **Evaluating Gemini 3.1** → swap to `gemini-3.1-flash-live-preview` in a non-prod context first; report back via Discord/issues if function-calling and barge-in behave well end-to-end.
+
+> Older Live models (`gemini-2.0-flash-live-001-preview-*`) are no longer listed on Google's models page and should not be used for new deployments.
 
 ### Hangup Fallback Tuning
 
@@ -478,4 +493,3 @@ Stasis(asterisk-ai-voice-agent)
 
 - **Issues**: https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues
 - **Docs**: https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/tree/main/docs
-- **Linear**: Task AAVA-75 (Google Cloud Integration - CLOSED with findings)

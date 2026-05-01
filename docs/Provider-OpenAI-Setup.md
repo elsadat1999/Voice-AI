@@ -50,10 +50,10 @@ providers:
     enabled: true
     greeting: "Hi {caller_name}, I'm your AI assistant. How can I help you today?"
     
-    # API Version: "ga" (recommended) or "beta" (legacy, uses OpenAI-Beta header)
-    api_version: ga
-    # Model Configuration
-    model: gpt-realtime
+    # API Version: "beta" (default — works for all accounts) or "ga" (requires verified org)
+    api_version: beta
+    # Model Configuration — see "Choosing a model" below
+    model: gpt-4o-realtime-preview-2024-12-17
     temperature: 0.6                          # Creativity (0.0-1.0)
     max_response_output_tokens: 4096          # Max output length
     
@@ -85,12 +85,30 @@ providers:
 ```
 
 **Key Settings**:
-- `api_version`: `ga` (default, recommended) or `beta` (legacy). GA removes the `OpenAI-Beta` header and uses nested audio schema
-- `model`: `gpt-realtime` (GA recommended). If your account has temporary model access constraints, use a supported fallback model for your tenant.
-- `provider_input_sample_rate_hz`: must be `24000` for GA (minimum enforced by API)
+- `api_version`: `beta` (shipped default — works for any OpenAI account) or `ga` (requires a [verified organization](https://help.openai.com/en/articles/10910291-api-organization-verification)). GA removes the `OpenAI-Beta` header and uses the nested audio schema.
+- `model`: see **Choosing a model** below.
+- `provider_input_sample_rate_hz`: must be `24000` for GA (minimum enforced by API). Beta accepts 16000 or 24000.
 - `output_sample_rate_hz`: `24000` — OpenAI outputs PCM16 @ 24kHz; engine transcodes to mulaw @ 8kHz downstream
 - `turn_detection.type`: use `server_vad` for turn-taking (nested under `audio.input` in GA)
 - GA mode internally manages `turn_detection.create_response`; do not add `create_response` in YAML.
+
+#### Choosing a model
+
+OpenAI Realtime exposes two API versions and several models. The right choice depends on your OpenAI account tier:
+
+| `api_version` | Compatible models | Account requirement | Notes |
+|---------------|-------------------|---------------------|-------|
+| `beta` *(default)* | `gpt-4o-realtime-preview-2024-12-17` | Any OpenAI account | Shipped default — works out of the box. |
+| `beta` | `gpt-4o-mini-realtime-preview` | Any account | Lower cost, smaller model. |
+| `ga` | `gpt-realtime` | **Verified organization** | First GA Realtime model (graduated GA Aug 2025). Better instruction-following and tool-calling. |
+| `ga` | `gpt-realtime-1.5` *(snapshot 2026-02-23)* | Verified organization | Latest snapshot; further gains on instruction-following and tool-calling. |
+| `ga` | `gpt-realtime-mini` *(snapshot 2025-12-15)* | Verified organization | Cost-efficient GA option. |
+
+**Recommendation:**
+- **New deployments without verified org** → keep the shipped `api_version: beta` + `gpt-4o-realtime-preview-2024-12-17`.
+- **Verified org / production** → flip to `api_version: ga` + `gpt-realtime-1.5` (or `gpt-realtime-mini` if cost-sensitive). You'll also need to bump `provider_input_sample_rate_hz` to `24000`.
+
+To check whether your org is verified, see **OpenAI Console → Settings → Organization → API verification**. Verification involves a government-ID check and is generally available to all paid accounts.
 
 ### 4. Critical Turn Detection Configuration ⚠️
 

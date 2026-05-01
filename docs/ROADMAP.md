@@ -22,6 +22,11 @@ Outbound dialer shipped as Alpha in v5.0.0 — core scheduling, AMD, voicemail d
 
 | Milestone | Version | Details |
 |-----------|---------|---------|
+| Microsoft Calendar V1 | ✅ v6.4.2 | Outlook / Microsoft 365 calendar integration via device-code OAuth, Graph free/busy, per-context account binding, Tools UI Connect/Verify/Disconnect |
+| Google Calendar — major overhaul | ✅ v6.4.2 | Multi-account / per-context binding (#338), JSON upload + auto-discover, Domain-Wide Delegation support, Tools UI Verify with distinct error codes, native free/busy mode |
+| Reschedule reliability | ✅ v6.4.2 | Server-side `event_id` resolution + 400/404 fallback eliminates LLM-id-hallucination duplicate bookings; validated across Google Live, Deepgram, OpenAI Realtime, ElevenLabs |
+| Date/time prompt placeholders | ✅ v6.4.2 | `{today}`, `{current_date}`, `{current_weekday}`, `{current_time}`, `{current_datetime_iso}` injected per-call so models stop reasoning with stale years |
+| Google Live 30-voice catalog | ✅ v6.4.2 | Voice picker expanded from 8 hardcoded voices to full 30-voice catalog with Google's official tone descriptors (#349) |
 | CPU Latency Optimization | ✅ v6.4.1 | Streaming LLM→TTS overlap, pipeline filler audio, Qwen 2.5-1.5B CPU LLM, preflight hardening |
 | Matcha-TTS Backend | ✅ v6.4.1 | Matcha-TTS with audioop conversion, model catalog, vocoder auto-detection |
 | Modular Provider Subtypes | ✅ v6.4.1 | UI for adding custom LLM/STT/TTS providers as pipeline components |
@@ -56,7 +61,7 @@ Outbound dialer shipped as Alpha in v5.0.0 — core scheduling, AMD, voicemail d
 
 ### Good First Issues (Beginner-Friendly)
 
-Great for first-time contributors. **AVA helps you with all of these** — just open Windsurf and describe what you want to do. See the [Operator Contributor Guide](contributing/OPERATOR_CONTRIBUTOR_GUIDE.md) to get started.
+Great for first-time contributors. **AVA helps you with all of these** — just open Windsurf and describe what you want to do. Browse the live list of open beginner-friendly issues on GitHub: [`good first issue` issues](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues?q=is%3Aopen+is%3Aissue+label%3A%22good+first+issue%22).
 
 #### No-Code Tasks (Just Writing/Sharing)
 
@@ -72,10 +77,10 @@ Great for first-time contributors. **AVA helps you with all of these** — just 
 
 | Task | Contribution Area | Why YOU Can Do This |
 |------|-------------------|---------------------|
-| Add a new STT/TTS/LLM pipeline adapter | [Modular Providers](contributing/adding-pipeline-adapter.md) | You know which providers work best — AVA writes the adapter |
-| Add a pre-call CRM lookup hook | [Pre-Call Hooks](contributing/pre-call-hooks-development.md) | You have a CRM — AVA integrates it |
-| Add a post-call webhook (Slack, Discord, n8n) | [Post-Call Hooks](contributing/post-call-hooks-development.md) | You use these tools daily — AVA connects them |
-| Add an in-call appointment checker | [In-Call Hooks](contributing/in-call-hooks-development.md) | You book appointments by phone — AVA builds it |
+| Add a new STT/TTS/LLM pipeline adapter | [open issues: pipeline adapter](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues?q=is%3Aopen+is%3Aissue+pipeline+adapter) — see also `docs/contributing/pipeline-development.md` | You know which providers work best — AVA writes the adapter |
+| Add a pre-call CRM lookup hook | [open issues: pre-call hooks](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues?q=is%3Aopen+is%3Aissue+pre-call) — see also `docs/contributing/tool-development.md` | You have a CRM — AVA integrates it |
+| Add a post-call webhook (Slack, Discord, n8n) | [open issues: post-call hooks](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues?q=is%3Aopen+is%3Aissue+post-call) — see also `docs/TOOL_CALLING_GUIDE.md` (HTTP tools) | You use these tools daily — AVA connects them |
+| Add an in-call appointment checker | [open issues: in-call hooks](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues?q=is%3Aopen+is%3Aissue+in-call) — see also `docs/Google-calendar-tool.md` | You book appointments by phone — AVA builds it |
 | Test coverage for `src/tools/telephony/` | Python, pytest | You understand voicemail — AVA writes the tests |
 | Improve error messages in `agent doctor` | Go CLI | You've seen the confusing errors — AVA fixes them |
 | Admin UI accessibility audit (Lighthouse/axe) | React, CSS | Run the audit, AVA fixes what it finds |
@@ -122,4 +127,4 @@ Longer-term goals that will shape the project's direction:
 
 ---
 
-**Last Updated**: April 2026 | **Current Version**: v6.4.1
+**Last Updated**: April 2026 | **Current Version**: v6.4.2

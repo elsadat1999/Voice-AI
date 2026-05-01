@@ -53,7 +53,7 @@ RUN if [ "$INCLUDE_VOSK" = "true" ]; then \
 
 RUN if [ "$INCLUDE_SHERPA" = "true" ]; then \
         echo "📦 Installing Sherpa-ONNX STT..." && \
-        pip install --no-cache-dir sherpa-onnx==1.12.38; \
+        pip install --no-cache-dir sherpa-onnx==1.12.40; \
     fi
 
 RUN if [ "$INCLUDE_FASTER_WHISPER" = "true" ]; then \
@@ -116,7 +116,7 @@ RUN if [ "$INCLUDE_SILERO" = "true" ]; then \
 
 RUN if [ "$INCLUDE_LLAMA" = "true" ]; then \
         echo "📦 Installing llama-cpp-python LLM..." && \
-        pip install --no-cache-dir llama-cpp-python==0.3.16; \
+        pip install --no-cache-dir llama-cpp-python==0.3.21; \
     fi
 
 # Pre-install spacy model for Kokoro TTS (only if Kokoro included)

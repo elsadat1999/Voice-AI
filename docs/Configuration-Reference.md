@@ -59,7 +59,7 @@ Environment variables for selecting local STT/TTS backends:
 | Variable | Options | Default | Description |
 |----------|---------|---------|-------------|
 | `LOCAL_STT_BACKEND` | `vosk`, `sherpa`, `kroko`, `tone`, `faster_whisper`, `whisper_cpp` | `vosk` | Speech-to-text engine |
-| `LOCAL_TTS_BACKEND` | `piper`, `kokoro`, `melotts` | `piper` | Text-to-speech engine |
+| `LOCAL_TTS_BACKEND` | `piper`, `kokoro`, `melotts`, `silero` | `piper` | Text-to-speech engine |
 
 **STT Backends**:
 - **Vosk**: Offline ASR with good accuracy, multiple language models
@@ -147,6 +147,10 @@ Outbound calling is implemented as an **engine-driven scheduler + SQLite + ARI o
 |----------|---------|-------------|
 | `AAVA_OUTBOUND_EXTENSION_IDENTITY` | `6789` | Extension identity for FreePBX routing (sets `AMPUSER` + `CALLERID(num)` on originate) |
 | `AAVA_OUTBOUND_AMD_CONTEXT` | `aava-outbound-amd` | Dialplan context name used for AMD hop (`continueInDialplan`) |
+| `AAVA_OUTBOUND_PBX_TYPE` | `freepbx` | PBX-specific channel vars: `freepbx` \| `vicidial` \| `generic` |
+| `AAVA_OUTBOUND_DIAL_CONTEXT` | `from-internal` | Asterisk dialplan context for `Local/` channel origination |
+| `AAVA_OUTBOUND_DIAL_PREFIX` | (empty) | Dial prefix prepended to phone number for carrier selection (e.g. `911` for ViciDial) |
+| `AAVA_OUTBOUND_CHANNEL_TECH` | `auto` | Channel tech for extension probing: `auto` \| `pjsip` \| `sip` \| `local_only` |
 | `AAVA_MEDIA_DIR` | `/mnt/asterisk_media/ai-generated` | Where the Admin UI uploads voicemail drop `.ulaw` files |
 
 ### Dialplan requirements
@@ -182,7 +186,7 @@ See `docs/contributing/milestones/milestone-22-outbound-campaign-dialer.md` for 
 - audiosocket.host: Bind address for AudioSocket listener.
 - audiosocket.advertise_host: Address Asterisk connects to (optional; defaults to `audiosocket.host`). Use for NAT/VPN.
 - audiosocket.port: TCP port.
-- audiosocket.format: `slin` (**validated**, 16-bit signed linear @ 8 kHz). Other values may exist in code/config, but only `slin` is currently tested and documented as stable.
+- audiosocket.format: shipped YAML uses `slin` (16-bit signed linear @ 8 kHz) — this is what runs in production and is the validated default. The Pydantic code default is `slin16` if you remove the YAML override; `slin16`, `slin24`, `ulaw`, and `alaw` are also accepted by the validator but are not currently exercised in CI or the dev server. Stick with `slin` unless you have a specific reason.
 
 ## ExternalMedia
 

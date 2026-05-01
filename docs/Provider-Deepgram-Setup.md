@@ -50,8 +50,8 @@ providers:
     capabilities: ["stt", "llm", "tts"]
     greeting: "Hi {caller_name}, I'm Ava. How can I help you today?"
     
-    # Models
-    model: nova-2
+    # Models — see "Choosing models" below
+    model: nova-3                        # Deepgram's current recommended default
     tts_model: aura-2-thalia-en
     
     # Audio (telephony defaults)
@@ -66,9 +66,20 @@ providers:
 ```
 
 **Key Settings**:
-- `model`: Deepgram Voice Agent model (example: `nova-2`)
-- `tts_model`: Aura TTS model (example: `aura-2-thalia-en`)
+- `model`: Deepgram listen (STT) model — see **Choosing models** below
+- `tts_model`: Aura speak (TTS) voice (example: `aura-2-thalia-en`)
 - `input_encoding`/`input_sample_rate_hz`: what the engine receives from Asterisk (telephony defaults are μ-law @ 8 kHz)
+
+#### Choosing models
+
+| Model | Type | Status | When to use |
+|-------|------|--------|-------------|
+| `nova-3` | Listen (STT) | **GA — Deepgram's recommended default** | New deployments. Higher accuracy than nova-2, multilingual conversation, customizable vocabulary. |
+| `nova-2` | Listen (STT) | GA, still supported | Languages not yet supported by nova-3, or workloads that depend on filler-word identification. |
+| `flux` | Listen (STT) + turn detection | GA, conversational-focused | Voice-agent workloads that benefit from Deepgram's built-in turn detection (alternative to server VAD). Evaluate before flipping the default. |
+| `aura-2-thalia-en` | Speak (TTS) | GA | Default voice. Browse the full Aura-2 voice catalog at [developers.deepgram.com/docs/tts-models](https://developers.deepgram.com/docs/tts-models). |
+
+> **Repo state (2026-04-26):** the shipped `config/ai-agent.yaml` still ships `model: nova-2` for backward compatibility with existing deployments. The Twilio path in `src/providers/deepgram.py` already uses `nova-3`. New deployments should set `model: nova-3` explicitly in their config; the migration is config-only with no code change required.
 
 ### 4. Configure Asterisk Dialplan
 
@@ -186,7 +197,7 @@ providers:
 
 **Fix**:
 1. Check network: `ping api.deepgram.com`
-2. Use a faster model (example): `model: nova-2`
+2. Confirm you're on `model: nova-3` (faster and more accurate than nova-2 for most use cases)
 3. Verify API key not rate-limited
 
 ### Issue: "Tools Not Working"

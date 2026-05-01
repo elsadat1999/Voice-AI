@@ -1528,5 +1528,5 @@ See [docs/Transport-Mode-Compatibility.md](Transport-Mode-Compatibility.md) for 
 
 ---
 
-**Last Updated:** January 26, 2026  
-**Version:** 5.2.4
+**Last Updated:** April 26, 2026  
+**Version:** v6.4.2

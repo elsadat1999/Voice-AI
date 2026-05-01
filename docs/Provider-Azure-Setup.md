@@ -146,7 +146,7 @@ Popular telephony voices:
 - `en-US-AriaNeural` -- Expressive female
 - `es-ES-AlvaroNeural` -- Spanish male
 
-Browse all voices at: https://aka.ms/speech/voices
+Browse all voices at: https://learn.microsoft.com/en-us/azure/ai-services/speech-service/language-support?tabs=tts
 
 ### SSML Prosody Controls
 
@@ -223,14 +223,14 @@ providers:
 **Cause**: Invalid `voice_name` or voice not available in your region.
 
 **Fix**:
-1. Check available voices for your region: https://aka.ms/speech/voices
+1. Check available voices for your region: https://learn.microsoft.com/en-us/azure/ai-services/speech-service/language-support?tabs=tts
 2. Ensure the voice name matches exactly (e.g. `en-US-JennyNeural`, not `Jenny`)
 3. Neural voices require Standard S0 tier (not Free F0 for some voices)
 
 ## See Also
 
 - **Azure Speech Service docs**: https://learn.microsoft.com/azure/ai-services/speech-service/
-- **Voice gallery**: https://aka.ms/speech/voices
+- **Voice gallery**: https://learn.microsoft.com/en-us/azure/ai-services/speech-service/language-support?tabs=tts
 - **Configuration Reference**: `docs/Configuration-Reference.md`
 - **Tool Calling Guide**: `docs/TOOL_CALLING_GUIDE.md`
 

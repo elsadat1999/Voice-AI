@@ -6,13 +6,15 @@
   <img alt="Asterisk AI Voice Agent" src="assets/banner_light_mode.png?v=9" width="100%">
 </picture>
 
-![Version](https://img.shields.io/badge/version-6.3.2-blue.svg)
+![Version](https://img.shields.io/badge/version-6.4.2-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Python](https://img.shields.io/badge/python-3.11+-blue.svg)
 ![Docker](https://img.shields.io/badge/docker-compose-blue.svg)
 ![Asterisk](https://img.shields.io/badge/asterisk-18+-orange.svg)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/hkjarral/Asterisk-AI-Voice-Agent)
 [![Discord](https://dcbadge.limes.pink/api/server/ysg8fphxUe?style=plastic)](https://discord.gg/ysg8fphxUe)
+<br>
+<a href="https://www.producthunt.com/products/ava-ai-voice-agent-for-asterisk?embed=true&amp;utm_source=badge-featured&amp;utm_medium=badge&amp;utm_campaign=badge-ava-ai-voice-agent-for-asterisk" target="_blank" rel="noopener noreferrer"><img alt="AVA - AI Voice Agent for Asterisk - Open-source AI voice agent for any phone system | Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1120145&amp;theme=light&amp;t=1775845744279"></a>
 
 The most powerful, flexible open-source AI voice agent for Asterisk/FreePBX. Featuring a **modular pipeline architecture** that lets you mix and match STT, LLM, and TTS providers, plus **6 production-ready golden baselines** validated for enterprise deployment.
 
@@ -25,7 +27,7 @@ The most powerful, flexible open-source AI voice agent for Asterisk/FreePBX. Fea
 ## 📖 Table of Contents
 
 - [🚀 Quick Start](#-quick-start)
-- [🎉 What's New](#-whats-new-in-v632)
+- [🎉 What's New](#-whats-new-in-v642)
 - [🌟 Why Asterisk AI Voice Agent?](#-why-asterisk-ai-voice-agent)
 - [✨ Features](#-features)
 - [🎥 Demo](#-demo)
@@ -116,7 +118,7 @@ For users who prefer the command line or need headless setup.
 agent setup
 ```
 
-> Note: Legacy commands `agent init`, `agent doctor`, and `agent troubleshoot` remain available as hidden aliases in CLI v6.3.2.
+> Note: Legacy commands `agent init`, `agent doctor`, and `agent troubleshoot` remain available as hidden aliases in CLI v6.4.0.
 
 ### Option B: Manual Setup
 ```bash
@@ -159,30 +161,66 @@ docker compose -p asterisk-ai-voice-agent logs -f ai_engine
 
 ---
 
-## 🎉 What's New in v6.3.2
+## 🎉 What's New in v6.4.2
 
 <details open>
 <summary><b>Latest Updates</b></summary>
 
-### ☁️ New Providers (v6.3.2)
-- **Microsoft Azure Speech Service**: Full modular STT & TTS pipeline adapters — Fast REST batch, Realtime WebSocket with VAD, and SSML synthesis with streaming. Admin UI forms, quick-add templates, and security key injection.
-- **MiniMax LLM**: M2.5 models with 204K context window via OpenAI-compatible API. Tool-calling support and Admin UI integration.
+### 🗓️ Microsoft Calendar — Outlook / Microsoft 365 integration (NEW, v6.4.2)
+- **Device-code OAuth** for V1 (one work/school account per deployment) — no public redirect URL required, runs entirely from the Tools UI **Connect** button
+- **Native Microsoft Graph free/busy** by default with a working-hours mask (Mon–Fri 09:00–17:00, configurable) — operators don't need to seed "Open" availability events
+- **Per-context account binding** via `contexts.<name>.tool_overrides.microsoft_calendar.selected_accounts`
+- **Server-side delete fallback** absorbs LLMs that hallucinate or omit event_ids on reschedule (validated across Google Live, Deepgram, OpenAI Realtime, ElevenLabs)
+- Personal Outlook.com and tenant-wide application permissions are intentionally out of scope for V1
+- Setup guide: [docs/Microsoft-calendar-tool.md](docs/Microsoft-calendar-tool.md)
 
-### 🎧 Admin UI (v6.3.2)
-- **Call Recording Playback**: Play back Asterisk call recordings directly from the Call Details modal, auto-matched by channel unique ID.
-- **Google Calendar delete()**: Full delete event support with timezone fixes.
+### 📅 Google Calendar — major overhaul (v6.4.2)
+- **Multi-account / per-context binding** (#338): single deployments can serve multiple separate calendars (one per business line / agent persona); each Admin UI Context binds to exactly one calendar; cross-calendar `aggregate_mode` for shared availability use cases
+- **JSON upload + auto-discover**: per-row "📁 Upload JSON" button writes the SA file to `secrets/`, authenticates, lists shared calendars, auto-fills credentials path / calendar id / timezone — eliminates the SCP-and-paste workflow for the 90% case
+- **Domain-Wide Delegation** support: optional `subject` per calendar enables Workspace impersonation; UI exposes the SA `client_id` (the #1 setup pitfall) with copy-to-clipboard for paste-into-admin-console
+- **Tools UI polish**: `free_prefix` / `busy_prefix` / `min_slot_duration_minutes` now exposed as form fields (were YAML-only); per-calendar 🩺 **Verify access** button with distinct, actionable error codes (`forbidden_calendar`, `calendar_not_found`, `auth_failed`, `dwd_not_configured`, etc.)
+- **Native free/busy mode**: blank/absent `free_prefix` switches `get_free_slots` to Google's `freebusy.query()` API intersected with a working-hours mask
+- **Slot-count cap** (default 3, configurable) so the agent stops reading 20-slot lists; **event duration cap** (default 240 min) prevents 7-hour bookings from LLM math errors
 
-### 🛡️ Security & Reliability (v6.3.2)
-- Azure SSRF prevention with shared region validator across all layers
-- PII logging discipline — no transcript/text content in any log statement
-- Input validation hardening across backend and frontend
+### 🎯 Reschedule reliability across all providers (v6.4.2)
+- Server-side `event_id` tracking + 400/404 fallback eliminates duplicate bookings caused by LLMs hallucinating opaque IDs across conversation turns
+- Date/time prompt placeholders (`{today}`, `{current_date}`, `{current_weekday}`, `{current_time}`, `{current_datetime_iso}`) injected per-call so models stop reasoning with stale years (real bug observed: local_hybrid model thinking it's 2023, ElevenLabs/Claude saying "Tuesday April 27" when April 27 2026 is a Monday)
 
-For full release notes, see [CHANGELOG.md](CHANGELOG.md).
+### 🔧 Reliability fixes (v6.4.2)
+- **OpenAI Realtime — duplicate events (3x) on fast tools**: race condition between fast tool execution (~300–500ms) and `response.done` commit caused the LLM to retry the booking. Fixed by gating `function_call_output` on a per-`response_id` async event
+- **Per-context `tool_overrides` now actually take effect** on OpenAI Realtime, Deepgram, and Google Live (was silently ignored — only ElevenLabs honored it). Affected `selected_calendars`, custom transfer destinations, webhook URLs, etc.
+- **Google Live — 30-voice catalog** (#349): voice picker expanded from 8 hardcoded voices to all 30 native-audio voices with Google's official tone descriptors
+
+### Previously in v6.4.1
+- ⚡ Sentence-by-sentence LLM→TTS streaming reduces perceived latency from 3-10s to sub-2s on pipelines
+- Qwen 2.5-1.5B Instruct recommended for CPU (~15-30 tok/s vs Phi-3's ~0.8 tok/s)
+- Pipeline filler audio, direct PCM→µ-law conversion, preflight hardening
+
+For older releases, expand **Previous Versions** below. Full release notes in [CHANGELOG.md](CHANGELOG.md).
 
 </details>
 
 <details>
 <summary><b>Previous Versions</b></summary>
+
+#### v6.4.1 - CPU Latency Optimization
+- ⚡ Streaming LLM→TTS overlap — sentence-boundary token streaming, sub-2s perceived latency on pipelines
+- Pipeline filler audio (instant "One moment please" acknowledgment) configurable via Admin UI
+- Qwen 2.5-1.5B Instruct recommended for CPU; ~15-30 tok/s vs Phi-3's ~0.8 tok/s
+- Direct PCM→µ-law conversion in all 5 TTS backends (10-50ms saved per response)
+- Preflight hardening — Buildx detection, RAM/disk/network checks, GPU install gated behind `--apply-fixes`
+
+#### v6.4.0 - Attended Transfer & Russian Speech
+- 📞 Attended transfer with three screening modes: `basic_tts`, `ai_briefing`, `caller_recording`
+- ExternalMedia RTP streaming delivery; provider-agnostic transfer-target tool guidance
+- 🗣️ Russian speech backends: Sherpa Offline STT (VAD-gated), T-one STT, Silero TTS (multi-language)
+- 🎧 Admin UI: fullscreen dashboard panels, per-message conversation timestamps, JSONPath `[*]` HTTP-tool wildcards
+
+#### v6.3.2 - Azure Speech & MiniMax LLM
+- Microsoft Azure Speech Service STT & TTS pipeline adapters (REST batch, WebSocket streaming, SSML)
+- MiniMax LLM M2.7 via OpenAI-compatible API with tool-calling
+- Call Recording Playback in Admin UI Call Details modal
+- Azure SSRF prevention, PII logging discipline, input validation hardening
 
 #### v6.3.1 - Local AI Server & Guardrails
 - Backend enable/rebuild flow, model lifecycle UX, GPU ergonomics, CPU-first onboarding
@@ -283,9 +321,9 @@ For full release notes, see [CHANGELOG.md](CHANGELOG.md).
 ### Additional LLM Providers
 
 - **MiniMax LLM** (High-Performance Cost-Effective)
-   - Local STT/TTS + MiniMax M2.5 LLM with 204K context window.
+   - Local STT/TTS + MiniMax M2.7 LLM with enhanced reasoning and coding.
    - OpenAI-compatible API with tool-calling support.
-   - Models: `MiniMax-M2.5` (peak performance) and `MiniMax-M2.5-highspeed` (faster).
+   - Models: `MiniMax-M2.7` (default, latest flagship), `MiniMax-M2.7-highspeed` (low-latency), `MiniMax-M2.5`, `MiniMax-M2.5-highspeed`.
    - Activate: set `MINIMAX_API_KEY` in `.env`, then configure `providers.minimax_llm` in `config/ai-agent.yaml` (see the `minimax_llm` section with `enabled: true`).
    - *Best for: Long-context conversations, cost-effective high-performance LLM.*
 
@@ -642,6 +680,8 @@ Then open in [Windsurf](https://codeium.com/windsurf) and type: **"I want to con
 <td align="center"><a href="https://github.com/alemstrom"><img src="https://github.com/alemstrom.png" width="60" alt="alemstrom"><br><sub><b>alemstrom</b></sub></a><br>Docs — PBX Setup</td>
 <td align="center"><a href="https://github.com/gcsuri"><img src="https://github.com/gcsuri.png" width="60" alt="gcsuri"><br><sub><b>gcsuri</b></sub></a><br>Code — Google Calendar</td>
 <td align="center"><a href="https://github.com/octo-patch"><img src="https://github.com/octo-patch.png" width="60" alt="octo-patch"><br><sub><b>octo-patch</b></sub></a><br>MiniMax LLM Provider</td>
+<td align="center"><a href="https://github.com/neilruaro-camb"><img src="https://github.com/neilruaro-camb.png" width="60" alt="neilruaro-camb"><br><sub><b>neilruaro-camb</b></sub></a><br>CAMB AI TTS Provider</td>
+<td align="center"><a href="https://github.com/aoi-dev-0411"><img src="https://github.com/aoi-dev-0411.png" width="60" alt="aoi-dev-0411"><br><sub><b>aoi-dev-0411</b></sub></a><br>Transcript Search, Health Badges</td>
 </tr>
 </table>
 
