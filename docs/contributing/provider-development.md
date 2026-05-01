@@ -11,7 +11,7 @@ AAVA has two ways to integrate AI providers:
 Monolithic providers that handle STT+LLM+TTS as a single streaming session. These connect via WebSocket and manage the entire conversation flow.
 
 - **Location**: `src/providers/`
-- **Examples**: `openai_realtime.py`, `deepgram.py`, `google_live.py`, `elevenlabs.py`
+- **Examples**: `openai_realtime.py`, `deepgram.py`, `google_live.py`, `elevenlabs_agent.py`
 - **When to use**: When the provider offers an all-in-one voice API
 
 ### 2. Pipeline Adapters
@@ -19,7 +19,7 @@ Monolithic providers that handle STT+LLM+TTS as a single streaming session. Thes
 Modular components that slot into the STT/LLM/TTS pipeline. Each adapter handles one piece of the pipeline and can be mixed with other adapters.
 
 - **Location**: `src/pipelines/`
-- **Examples**: `google.py` (google_stt, google_tts), `elevenlabs_tts.py`, `groq.py`
+- **Examples**: `google.py` (google_stt, google_tts), `elevenlabs.py`, `groq.py`
 - **When to use**: When adding a standalone STT, LLM, or TTS service
 
 ## Tutorial: Adding a Pipeline Adapter

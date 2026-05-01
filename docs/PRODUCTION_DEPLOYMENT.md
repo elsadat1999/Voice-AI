@@ -812,7 +812,7 @@ echo "=== End Health Check ==="
 
 ### Upgrade Procedures
 
-**Minor Version Upgrade** (e.g., v6.1.0 → v6.1.1):
+**Minor Version Upgrade** (e.g., v6.4.1 → v6.4.2):
 
 ```bash
 # 1. Backup current state
@@ -820,10 +820,10 @@ echo "=== End Health Check ==="
 
 # 2. Pull latest code
 git fetch origin
-git checkout v6.3.1  # Or: git pull origin main
+git checkout v6.4.2  # Or: git pull origin main
 
 # 3. Compare configuration changes
-git diff v6.2.2..v6.3.1 config/ai-agent.example.yaml
+git diff v6.4.1..v6.4.2 config/ai-agent.example.yaml
 
 # 4. Update if needed
 # Review and update config/ai-agent.yaml

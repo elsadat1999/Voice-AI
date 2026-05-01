@@ -125,7 +125,7 @@ pipelines:
 
 **Transfer Types**:
 
-- **Extension**: Direct dial to specific agent (uses ARI `redirect`)
+- **Extension**: Direct dial to specific agent (uses ARI `continue` to the configured dialplan context, default `from-internal`)
 - **Queue**: Transfer to ACD queue for next available agent (uses ARI `continue` to `ext-queues`)
 - **Ring Group**: Transfer to ring group that rings multiple agents (uses ARI `continue` to `ext-group`)
 
@@ -1268,7 +1268,7 @@ docker logs ai_engine | grep "request_transcript"
 
 **Event Sequence**:
 1. OpenAI: `response.output_item.done` (function_call detected)
-2. Adapter: Parses `item.name="transfer_call"` (legacy alias) and maps it to `transfer`
+2. Adapter: Parses `item.name="transfer_call"` (legacy alias) and maps it to the canonical `blind_transfer`
 3. Registry: Routes to unified tool
 4. Tool: **Exact same execution** as Deepgram (504 lines of shared code)
 5. OpenAI: Receives function output, speaks confirmation
@@ -1443,7 +1443,7 @@ request_transcript:
 - `src/tools/adapters/openai.py` (215 lines) - OpenAI Realtime integration
 
 **Tools**:
-- `src/tools/telephony/unified_transfer.py` - Unified transfer tool (`transfer`)
+- `src/tools/telephony/unified_transfer.py` - Unified transfer tool (registered as `blind_transfer`; aliases: `transfer`, `transfer_call`, `transfer_to_queue`)
 - `src/tools/telephony/attended_transfer.py` - Warm transfer (`attended_transfer`)
 - `src/tools/telephony/cancel_transfer.py` - Cancel transfer tool
 - `src/tools/telephony/hangup.py` - Hangup call tool

@@ -207,16 +207,9 @@ Telnyx AI Inference supports:
 - **Telnyx-hosted open models** (work with `TELNYX_API_KEY` only)
 - **External providers** like OpenAI (require `api_key_ref` Integration Secrets)
 
-Pricing varies by model family and whether it’s hosted by Telnyx or routed to an external provider.
+Pricing varies by model family and whether it's hosted by Telnyx or routed to an external provider. Telnyx-hosted open models (Llama, Qwen, etc.) are billed per token at Telnyx's published rate; external providers (OpenAI, Anthropic) are passed through at provider rates plus any Telnyx margin.
 
-| Model | Telnyx (per 1M tokens) | Direct Provider |
-|-------|------------------------|-----------------|
-| gpt-4o-mini | ~$0.15 input / $0.60 output | $0.15 / $0.60 (OpenAI) |
-| gpt-4o | ~$2.50 input / $10.00 output | $2.50 / $10.00 (OpenAI) |
-| claude-3-5-sonnet | Competitive | Via Anthropic direct |
-| llama-3.1-70b | Competitive | Via various providers |
-
-**Note**: Check Telnyx portal for current pricing. Rates may be lower than direct providers due to volume agreements.
+**Always check the [Telnyx AI Inference pricing page](https://telnyx.com/pricing/inference) for current rates** — model lineups and per-token pricing change frequently and we don't republish them here to avoid drift.
 
 ## Why Telnyx for AI Inference?
 

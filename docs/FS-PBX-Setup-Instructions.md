@@ -9,7 +9,7 @@ sidebar_position: 1
 
 This guide will help you setup an Asterisk AI application server that has two way communication, though some entries are static, it will shed light on the usability of both FreePBX and FusionPBX.  The setup of this took two days of research, using various tools such as OpenAI, Claude, and Grok.
 
-Further documentation and setup is found by going to: https://github.com/hkjarral/Asterisk-AI-Voice-Agent/
+Further documentation and setup is found by going to: https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/
 
 Originally Published at: https://www.fspbx.com/docs/integrations/asterisk-ai/
 
@@ -124,8 +124,8 @@ Get the **Admin UI running in 2 minutes** while on the Debian instance, GIT shou
 
 ```bash
 # Clone repository
-git clone https://github.com/hkjarral/Asterisk-AI-Voice-Agent.git
-cd Asterisk-AI-Voice-Agent
+git clone https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk.git
+cd AVA-AI-Voice-Agent-for-Asterisk
 
 # Run preflight with auto-fix (creates .env, generates JWT_SECRET)
 sudo ./preflight.sh --apply-fixes

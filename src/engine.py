@@ -3980,7 +3980,20 @@ class Engine:
         - {call_direction}: "inbound" or "outbound" (default: "inbound")
         - {campaign_id}: Outbound campaign ID (default: "")
         - {lead_id}: Outbound lead/contact ID (default: "")
-        
+        - {current_date}: Today's date in ISO form, e.g. "2026-04-24"
+        - {current_weekday}: Today's day-of-week, e.g. "Friday"
+        - {current_time}: Current time HH:MM (24h)
+        - {current_datetime_iso}: Current UTC datetime in ISO form
+        - {today}: Human-readable date, e.g. "Friday, April 24, 2026"
+
+        The date/time placeholders matter for any prompt that involves
+        scheduling — without them, the LLM can't reliably map "tomorrow",
+        "next Tuesday", "April 28", etc. Live test calls revealed real
+        bugs from missing date context: local_hybrid passed time_min in
+        2023 (model thought current year was 2023), and elevenlabs said
+        "Tuesday April 27" when April 27, 2026 is actually a Monday.
+        Pinning today's date in the prompt fixes both classes of error.
+
         Unknown placeholders are left as-is (safe fallback).
         Uses regex-based substitution to handle partial matches correctly.
         """
@@ -3989,6 +4002,19 @@ class Engine:
         
         import re
         
+        # Single instant snapshot — derive both UTC and local from the same
+        # base so the date/time placeholders can't disagree across day
+        # boundaries (CodeRabbit minor finding: two separate datetime.now()
+        # calls could see e.g. 23:59:59 UTC and 00:00:00 local on the same
+        # rendering pass, producing inconsistent {today} vs
+        # {current_datetime_iso} values).
+        # Note on TZ: host TZ inside Docker is typically UTC; calendar TZ is
+        # tool-scoped and can differ. Calendar tool surfaces its own TZ
+        # explicitly via get_free_slots' calendar_timezone field, so the
+        # model can resolve any cross-zone mismatch when it matters.
+        _now_utc = datetime.now(timezone.utc)
+        _now_local = _now_utc.astimezone()
+
         substitutions = {
             "caller_name": getattr(session, 'caller_name', None) or "there",
             "caller_number": getattr(session, 'caller_number', None) or "unknown",
@@ -3998,6 +4024,12 @@ class Engine:
             "call_direction": "outbound" if getattr(session, 'is_outbound', False) else "inbound",
             "campaign_id": getattr(session, 'outbound_campaign_id', None) or "",
             "lead_id": getattr(session, 'outbound_lead_id', None) or "",
+            # Date/time placeholders — see docstring above for rationale.
+            "current_date": _now_local.strftime("%Y-%m-%d"),
+            "current_weekday": _now_local.strftime("%A"),
+            "current_time": _now_local.strftime("%H:%M"),
+            "current_datetime_iso": _now_utc.isoformat(timespec="seconds"),
+            "today": _now_local.strftime("%A, %B %d, %Y"),
         }
         
         # Add pre-call tool results (Milestone 24 - CRM enrichment variables)
@@ -13207,12 +13239,62 @@ class Engine:
                         prompt_override = overrides.get("prompt")
                         greeting_override = overrides.get("greeting")
 
+                        # Apply template substitution ({today}, {current_date}, etc.)
+                        # before sending to providers. Without this, the literal
+                        # placeholders reach the provider's LLM and the model has
+                        # no anchor for day-of-week reasoning — real bug observed
+                        # on deepgram during sanity testing where the agent
+                        # confidently said "April 27th, 2026 is a Tuesday" when
+                        # it's a Monday, and doubled down when the caller
+                        # corrected it. The other prompt-injection sites in this
+                        # file already substitute (engine.py:10093 for llm_options
+                        # system_prompt, e.g.); this provider_context path was
+                        # missed.
                         if isinstance(prompt_override, str) and prompt_override.strip():
-                            provider_context["prompt"] = prompt_override
-                            provider_context["instructions"] = prompt_override  # Alias for ElevenLabs
+                            substituted = self._apply_prompt_template_substitution(prompt_override, session)
+                            provider_context["prompt"] = substituted
+                            provider_context["instructions"] = substituted  # Alias for ElevenLabs
                         elif hasattr(context_config, 'prompt') and context_config.prompt:
-                            provider_context['prompt'] = context_config.prompt
-                            provider_context['instructions'] = context_config.prompt  # Alias for ElevenLabs
+                            substituted = self._apply_prompt_template_substitution(context_config.prompt, session)
+                            provider_context['prompt'] = substituted
+                            provider_context['instructions'] = substituted  # Alias for ElevenLabs
+
+                        try:
+                            from src.tools.runtime_guidance import build_in_call_tool_runtime_guidance
+
+                            runtime_tool_guidance = build_in_call_tool_runtime_guidance(
+                                self.config.dict(),
+                                provider_context.get("tools") or [],
+                            )
+                            if runtime_tool_guidance:
+                                runtime_tool_guidance = str(runtime_tool_guidance).strip()
+                                base_prompt = str(
+                                    provider_context.get("prompt")
+                                    or provider_context.get("instructions")
+                                    or ""
+                                ).strip()
+                                existing_guidance = str(provider_context.get("tool_runtime_guidance") or "").strip()
+                                if existing_guidance == runtime_tool_guidance or (
+                                    base_prompt and runtime_tool_guidance and runtime_tool_guidance in base_prompt
+                                ):
+                                    combined_prompt = base_prompt
+                                else:
+                                    combined_prompt = (
+                                        f"{base_prompt}\n\n{runtime_tool_guidance}".strip()
+                                        if base_prompt
+                                        else runtime_tool_guidance
+                                    )
+                                provider_context["prompt"] = combined_prompt
+                                provider_context["instructions"] = combined_prompt
+                                provider_context["tool_runtime_guidance"] = runtime_tool_guidance
+                                logger.debug(
+                                    "Injected runtime tool guidance into provider prompt",
+                                    call_id=call_id,
+                                    tool_count=len(provider_context.get("tools") or []),
+                                    guidance_length=len(runtime_tool_guidance),
+                                )
+                        except Exception:
+                            logger.debug("Failed to inject runtime tool guidance", call_id=call_id, exc_info=True)
 
                         try:
                             from src.tools.runtime_guidance import build_in_call_tool_runtime_guidance
@@ -13252,9 +13334,9 @@ class Engine:
                             logger.debug("Failed to inject runtime tool guidance", call_id=call_id, exc_info=True)
 
                         if isinstance(greeting_override, str) and greeting_override.strip():
-                            provider_context["greeting"] = greeting_override
+                            provider_context["greeting"] = self._apply_prompt_template_substitution(greeting_override, session)
                         elif hasattr(context_config, 'greeting') and context_config.greeting:
-                            provider_context['greeting'] = context_config.greeting
+                            provider_context['greeting'] = self._apply_prompt_template_substitution(context_config.greeting, session)
             except Exception as e:
                 logger.warning(f"Failed to build provider context: {e}", call_id=call_id, exc_info=True)
             
@@ -13269,6 +13351,7 @@ class Engine:
                     provider._caller_channel_id = session.caller_channel_id
                     provider._bridge_id = session.bridge_id
                     provider._called_number = getattr(session, 'called_number', None)
+                    provider._context_name = getattr(session, 'context_name', None)
                     provider._session_store = self.session_store
                     provider._ari_client = self.ari_client
                     provider._full_config = self.config.dict()  # Convert Pydantic model to dict

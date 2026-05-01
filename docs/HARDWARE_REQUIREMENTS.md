@@ -297,29 +297,31 @@ Tune `LOCAL_LLM_GPU_LAYERS=-1` (all layers) in `.env`. See [LOCAL_ONLY_SETUP.md]
 
 #### AWS EC2
 
-| Configuration | Instance Type | Monthly Cost (estimate) |
-|---------------|---------------|-------------------------|
+| Configuration | Instance Type | Monthly Cost |
+|---------------|---------------|--------------|
 | OpenAI Realtime | t3.medium (2 vCPU, 4GB) | ~$30 |
-| Deepgram | t3.large (2 vCPU, 8GB) | ~$60 |
-| Local Hybrid | c5.2xlarge (8 vCPU, 16GB) | ~$250 |
+| Deepgram | t3.large (2 vCPU, 8GB) | ~$61 |
+| Local Hybrid | c5.2xlarge (8 vCPU, 16GB) | ~$248 |
 
-**Note**: Add data transfer costs (~$0.09/GB egress)
+**Note**: Add data transfer costs (~$0.09/GB egress).
 
 #### Google Cloud (GCE)
 
-| Configuration | Machine Type | Monthly Cost (estimate) |
-|---------------|--------------|-------------------------|
-| OpenAI Realtime | e2-medium (2 vCPU, 4GB) | ~$25 |
-| Deepgram | e2-standard-2 (2 vCPU, 8GB) | ~$50 |
-| Local Hybrid | c2-standard-8 (8 vCPU, 32GB) | ~$240 |
+| Configuration | Machine Type | Monthly Cost |
+|---------------|--------------|--------------|
+| OpenAI Realtime | e2-medium (2 vCPU, 4GB) | ~$40 |
+| Deepgram | e2-standard-2 (2 vCPU, 8GB) | ~$49 |
+| Local Hybrid | c2-standard-8 (8 vCPU, 32GB) | ~$305 |
 
 #### Azure
 
-| Configuration | VM Size | Monthly Cost (estimate) |
-|---------------|---------|-------------------------|
+| Configuration | VM Size | Monthly Cost |
+|---------------|---------|--------------|
 | OpenAI Realtime | Standard_B2s (2 vCPU, 4GB) | ~$30 |
-| Deepgram | Standard_B2ms (2 vCPU, 8GB) | ~$60 |
-| Local Hybrid | Standard_F8s_v2 (8 vCPU, 16GB) | ~$280 |
+| Deepgram | Standard_B2ms (2 vCPU, 8GB) | ~$61 |
+| Local Hybrid | Standard_F8s_v2 (8 vCPU, 16GB) | ~$247 |
+
+> **Pricing basis (verified 2026-04):** on-demand / pay-as-you-go rates in `us-east-1` (AWS), `us-central1` (GCE), and East US (Azure), Linux. Excludes egress, storage, and any savings plans / SUD / reserved-instance discounts. Verify current rates with each provider's calculator before budgeting — prices can move 10-20% in either direction over a year.
 
 **Cloud Considerations**:
 - Local Hybrid is expensive in cloud (CPU-intensive)

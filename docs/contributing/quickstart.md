@@ -67,13 +67,15 @@ On your development machine:
 
 ```bash
 git clone https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk.git
-cd Asterisk-AI-Voice-Agent
+cd AVA-AI-Voice-Agent-for-Asterisk
 ```
 
-Make sure you are on the `develop` branch for active development:
+Branch from `main` for new work (per [CONTRIBUTING.md](../../CONTRIBUTING.md) — `develop` is no longer the active development branch):
 
 ```bash
-git checkout develop
+git checkout main
+git pull origin main
+git checkout -b your-feature-branch
 ```
 
 ---
@@ -269,7 +271,7 @@ For branching and PR details, also see `CONTRIBUTING.md`.
   - `docs/contributing/milestones/`
 - For tools and integrations:
   - `docs/TOOL_CALLING_GUIDE.md`
-  - `docs/ASTERISK_QUEUE_SETUP.md`
+  - `docs/contributing/tool-development.md`
 - For community-requested 4.2 features:
   - Join our [Discord server](https://discord.gg/ysg8fphxUe) for discussions
 

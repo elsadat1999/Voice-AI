@@ -112,6 +112,20 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         # Track whether ANY audio was emitted during a given response (response_id -> bool).
         # _in_audio_burst is only "currently emitting", and is often false by response.done.
         self._audio_seen_response_ids: set[str] = set()
+        # Per-response "done" events. A function_call handler must wait for its parent response's
+        # response.done before submitting function_call_output, otherwise OpenAI may reject the
+        # output with invalid_tool_call_id ("Tool call ID ... not found in conversation") — which
+        # in turn causes the LLM to retry and duplicate side-effectful tool calls (e.g. creating
+        # multiple calendar events). See _handle_function_call() for the wait logic.
+        self._response_done_events: dict[str, asyncio.Event] = {}
+        # Recently-observed function_call IDs (call_id -> monotonic timestamp). Used by the
+        # top-level error handler to decide whether an "invalid_tool_call_id" from the server
+        # refers to a known-benign race we just waited through (downgrade to warning) or to
+        # a call_id we don't recognize — which would indicate something actually went wrong
+        # (missed sentinel, reconnect-dropped output, timeout fallback) and must stay at
+        # ERROR level so it's visible in logs/metrics.
+        self._recent_tool_call_ids: dict[str, float] = {}
+        self._recent_tool_call_id_ttl_s: float = 30.0
         # For farewells, wait for output_audio.done before emitting HangupReady to avoid cutting off speech.
         self._farewell_waiting_for_audio_done: bool = False
         self._response_audio_start_time: Optional[float] = None  # Track when audio started for interruption cooldown
@@ -587,10 +601,73 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         except Exception:
             logger.error("Failed to send response.cancel", call_id=self._call_id, exc_info=True)
 
+    def _record_recent_tool_call_id(self, call_id: str) -> None:
+        """Record a function_call id we're about to submit output for, for
+        later correlation with potential invalid_tool_call_id rejections."""
+        try:
+            now = time.monotonic()
+            self._recent_tool_call_ids[call_id] = now
+            # Opportunistically evict expired entries to keep the map bounded.
+            cutoff = now - self._recent_tool_call_id_ttl_s
+            stale = [k for k, ts in self._recent_tool_call_ids.items() if ts < cutoff]
+            for k in stale:
+                self._recent_tool_call_ids.pop(k, None)
+        except Exception:
+            logger.debug("Failed to record recent tool_call_id", exc_info=True)
+
+    def _is_recent_tool_call_id(self, call_id: str) -> bool:
+        """Return True if this call_id was observed (via response.output_item.done)
+        within the TTL window. Used to downgrade the benign race warning."""
+        if not call_id:
+            return False
+        ts = self._recent_tool_call_ids.get(call_id)
+        if ts is None:
+            return False
+        return (time.monotonic() - ts) <= self._recent_tool_call_id_ttl_s
+
+    async def _await_parent_response_done(
+        self,
+        event_data: Dict[str, Any],
+        function_name: Optional[str] = None,
+        timeout: float = 5.0,
+    ) -> None:
+        """
+        Wait for the parent response.done before submitting function_call_output.
+
+        OpenAI Realtime's API only commits function_call items to the conversation
+        on response finalization; submitting either a success or an error
+        function_call_output prematurely produces an invalid_tool_call_id rejection
+        and, for non-idempotent tools, the LLM may retry with a fresh call_id and
+        duplicate side effects. Both the success and error paths in
+        _handle_function_call must go through this gate.
+
+        Does NOT remove the sentinel after waiting — a single response can emit
+        multiple function_call items, and each handler needs the same event to
+        remain signalable by a single response.done fire. The sentinel is cleaned
+        up centrally when response.{done,completed,cancelled,error} fires (and on
+        session/reconnect teardown).
+        """
+        parent_resp_id = event_data.get("response_id")
+        if not parent_resp_id:
+            return
+        done_evt = self._response_done_events.get(parent_resp_id)
+        if done_evt is None:
+            return
+        try:
+            await asyncio.wait_for(done_evt.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "response.done did not arrive within timeout; submitting function_call_output anyway",
+                call_id=self._call_id,
+                response_id=parent_resp_id,
+                tool=function_name,
+                timeout_s=timeout,
+            )
+
     async def _handle_function_call(self, event_data: Dict[str, Any]):
         """
         Handle function call request from OpenAI Realtime API.
-        
+
         Routes the function call to the appropriate tool via the tool adapter.
         """
         try:
@@ -601,6 +678,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 'caller_channel_id': getattr(self, '_caller_channel_id', None),
                 'bridge_id': getattr(self, '_bridge_id', None),
                 'called_number': getattr(self, '_called_number', None),
+                'context_name': getattr(self, '_context_name', None),
                 'session_store': getattr(self, '_session_store', None),
                 'ari_client': getattr(self, '_ari_client', None),
                 'config': getattr(self, '_full_config', None),
@@ -611,7 +689,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             
             # Execute tool via adapter
             result = await self.tool_adapter.handle_tool_call_event(event_data, context)
-            
+
             # Check if this is a hangup_call tool that will trigger hangup
             item = event_data.get("item", {})
             function_name = item.get("name")
@@ -626,7 +704,11 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                         function_name=function_name,
                         farewell=result.get("message")
                     )
-            
+
+            # Wait for response.done before submitting function_call_output (see
+            # _await_parent_response_done for the full rationale).
+            await self._await_parent_response_done(event_data, function_name=function_name)
+
             # Send result back to OpenAI
             await self.tool_adapter.send_tool_result(result, context)
 
@@ -712,7 +794,16 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             try:
                 item = event_data.get("item", {})
                 call_id_field = item.get("call_id")
+                function_name_for_error = item.get("name")
                 if call_id_field:
+                    # Apply the same response.done gate on the error path. Without
+                    # this, an exception during tool execution would submit the
+                    # error function_call_output before the parent response has
+                    # been committed, re-introducing the invalid_tool_call_id race
+                    # and possibly the LLM-retry / duplicate-tool-call cascade.
+                    await self._await_parent_response_done(
+                        event_data, function_name=function_name_for_error
+                    )
                     error_response = {
                         "type": "conversation.item.create",
                         "item": {
@@ -779,6 +870,14 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             self._keepalive_task = None
             self._greeting_vad_task = None
             self._background_tasks.clear()
+            # Unblock any pending function_call handlers and drop their sentinels so they
+            # exit cleanly instead of waiting for a response.done that will never arrive.
+            try:
+                for _evt in self._response_done_events.values():
+                    _evt.set()
+                self._response_done_events.clear()
+            except Exception:
+                logger.debug("Failed to release response.done sentinels on stop_session", exc_info=True)
             self.websocket = None
             self._call_id = None
             self._closing = False
@@ -1493,8 +1592,10 @@ class OpenAIRealtimeProvider(AIProviderInterface):
 
         # Log top-level error events with full payload to diagnose API contract issues
         if event_type == "error":
-            error_code = event.get("error", {}).get("code")
-            
+            error_info = event.get("error", {}) or {}
+            error_code = error_info.get("code")
+            error_message = error_info.get("message", "")
+
             # Handle expected errors gracefully
             if error_code == "response_cancel_not_active":
                 # Not an error - response already completed before cancellation
@@ -1504,7 +1605,51 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                     response_id=self._current_response_id
                 )
                 return
-            
+
+            # Known-benign race in the OpenAI Realtime GA API: after we submit
+            # conversation.item.create(function_call_output), the server occasionally
+            # reports "Tool call ID ... not found in conversation" because the
+            # function_call item from the just-completed response hasn't finished
+            # committing to the conversation state server-side. This does NOT affect
+            # user experience — our follow-up response.create (with explicit
+            # instructions to speak the tool's confirmation message) still generates
+            # audio, the caller hears the confirmation, and the LLM does not retry
+            # (which is what previously caused duplicate side-effectful tool calls,
+            # fixed by waiting for response.done before submitting the output).
+            # Only downgrade when the rejected call_id matches a function_call we
+            # recently observed — otherwise something actually went wrong (missed
+            # sentinel, reconnect-dropped submission, timeout fallback) and must
+            # stay at ERROR level so it's visible in logs/metrics.
+            if error_code == "invalid_tool_call_id":
+                # Extract the rejected call_id from the message so we can correlate.
+                # OpenAI's message format: "Tool call ID 'call_...' not found in conversation."
+                import re as _re
+                rejected_call_id = None
+                try:
+                    m = _re.search(r"'([^']+)'", error_message or "")
+                    if m:
+                        rejected_call_id = m.group(1)
+                except Exception:
+                    rejected_call_id = None
+                if rejected_call_id and self._is_recent_tool_call_id(rejected_call_id):
+                    logger.warning(
+                        "OpenAI rejected tool_call_id linkage (benign race — audio response still succeeds)",
+                        call_id=self._call_id,
+                        error_code=error_code,
+                        rejected_call_id=rejected_call_id,
+                        error_message=error_message,
+                    )
+                    return
+                # Unknown call_id — don't mask a real failure.
+                logger.error(
+                    "OpenAI rejected tool_call_id with NO recent matching submission",
+                    call_id=self._call_id,
+                    error_code=error_code,
+                    rejected_call_id=rejected_call_id,
+                    error_message=error_message,
+                )
+                return
+
             # Log other errors
             logger.error("OpenAI Realtime error event", call_id=self._call_id, error_event=event)
             return
@@ -1631,6 +1776,22 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             return
 
         if event_type in ("response.completed", "response.error", "response.cancelled", "response.done"):
+            # Signal any function_call handler waiting on this response. The server
+            # commits output items to the conversation on response finalization, so
+            # this is the earliest point a function_call_output can be safely submitted.
+            # Cleanup happens here (not in the waiter) so a single response with
+            # multiple function_call items doesn't have one handler pop the sentinel
+            # before its siblings observe it.
+            try:
+                ev_resp = event.get("response") or {}
+                done_resp_id = ev_resp.get("id") or self._current_response_id
+                if done_resp_id:
+                    done_evt = self._response_done_events.pop(done_resp_id, None)
+                    if done_evt:
+                        done_evt.set()
+            except Exception:
+                logger.debug("Failed to signal response.done event", exc_info=True)
+
             # Track whether ANY audio was emitted during this response (not just "currently emitting").
             current_response_id = self._current_response_id
             had_audio_for_response = bool(
@@ -1943,11 +2104,24 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             if item.get("type") == "function_call":
                 call_id_field = item.get("call_id")
                 function_name = item.get("name")
+                # Register a response.done sentinel for this response BEFORE we dispatch
+                # the tool handler. The handler will await this event before submitting
+                # function_call_output, so the parent response has time to commit to the
+                # conversation on the server side. Without this, fast tools race ahead of
+                # response.done and OpenAI rejects the output with invalid_tool_call_id.
+                resp_id = event.get("response_id") or self._current_response_id
+                if resp_id and resp_id not in self._response_done_events:
+                    self._response_done_events[resp_id] = asyncio.Event()
+                # Track the call_id so the error handler can correlate a later
+                # "invalid_tool_call_id" rejection back to a known submission.
+                if call_id_field:
+                    self._record_recent_tool_call_id(call_id_field)
                 logger.info(
                     "📞 OpenAI function call detected",
                     call_id=self._call_id,
                     function_call_id=call_id_field,
                     function_name=function_name,
+                    response_id=resp_id,
                 )
                 # Handle function call via tool adapter
                 task = asyncio.create_task(self._handle_function_call(event))
@@ -2280,6 +2454,19 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         call_id = self._call_id
         if not call_id:
             return
+        # Any in-flight _handle_function_call tasks were waiting on response.done
+        # sentinels for the OLD connection. Signal them now so they unblock and
+        # exit cleanly instead of later trying to submit a stale
+        # function_call_output on the NEW websocket — which would either raise
+        # (ws closed) or produce another invalid_tool_call_id rejection. We can't
+        # cancel them from here without risk (they may be mid-tool), so the best
+        # we can do is release the gate and clear the map.
+        try:
+            for _evt in self._response_done_events.values():
+                _evt.set()
+            self._response_done_events.clear()
+        except Exception:
+            logger.debug("Failed to release response.done sentinels on reconnect", exc_info=True)
         backoff = 0.5
         for attempt in range(1, 6):
             if self._closing or self._closed:

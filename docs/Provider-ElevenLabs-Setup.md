@@ -492,9 +492,9 @@ When the caller indicates they're done (goodbye, thanks, that's all, etc.):
 
 ### Issue: "Second Call Fails"
 
-**Cause**: Provider state not reset between calls (fixed in v4.4.1)
+**Cause**: Provider state not reset between calls.
 
-**Fix**: Update to latest version - this was fixed in commit e123a45.
+**Fix**: Update to the latest AAVA release.
 
 ## Production Considerations
 

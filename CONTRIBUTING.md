@@ -40,6 +40,10 @@ By participating, you agree to our [Code of Conduct](CODE_OF_CONDUCT.md).
 - **Roadmap**: See [docs/ROADMAP.md](docs/ROADMAP.md) for planned milestones with difficulty levels
 - **Discord**: Join [our server](https://discord.gg/ysg8fphxUe) and ask in #contributing
 
+### A note on `good first issue` tickets
+
+These are reserved for contributors making their first PR to AVA. If you've already had a PR merged — thank you — please pick up an issue without the `good first issue` label next time. This keeps the onboarding lane clear for people making their first contribution.
+
 ## Getting Started
 
 **New to the project?** Start here:
@@ -55,25 +59,25 @@ By participating, you agree to our [Code of Conduct](CODE_OF_CONDUCT.md).
 
 Active branches:
 - `develop`: Feature work and ongoing development
-- `staging`: Release prep and GA readiness (PRs typically target here)
+- `staging`: Release prep and GA readiness
 - `main`: Stable releases
 
 Recommended flow:
 
-1. Fork the repository and create a feature branch from `develop`
+1. Fork the repository and create a feature branch from `main`
 2. Make your changes in small, focused commits
-3. Open a Pull Request (PR) against `staging` (preferred) or `develop`
+3. Open a Pull Request (PR) against `main`
 4. Include a clear description and testing notes
 5. A maintainer will review, run CI/manual checks, and merge
 
-Releases are promoted from `staging` to `main` after golden baseline validation.
+Release candidates are staged on `staging` for golden baseline validation before being tagged from `main`.
 
 ## Development Setup
 
 ### Option A: AI-Assisted Setup (Recommended for Operators)
 
 ```bash
-git clone -b develop https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk.git
+git clone https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk.git
 cd Asterisk-AI-Voice-Agent
 ./scripts/setup-contributor.sh
 ```
@@ -83,7 +87,7 @@ Then open the folder in [Windsurf](https://codeium.com/windsurf) and type "I wan
 ### Option B: Traditional Setup (For Developers)
 
 ```bash
-git clone -b develop https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk.git
+git clone https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk.git
 cd Asterisk-AI-Voice-Agent
 ./install.sh   # guided setup; or follow README for manual steps
 ```
@@ -148,7 +152,7 @@ We use labels to categorize issues:
 
 | Label | Description |
 |-------|-------------|
-| `good first issue` | Good for newcomers |
+| `good first issue` | Good for newcomers — [first-PR policy](#a-note-on-good-first-issue-tickets) |
 | `help wanted` | Extra attention needed |
 | `difficulty: beginner` | No Asterisk experience needed |
 | `difficulty: intermediate` | Some domain knowledge needed |

@@ -10,6 +10,41 @@ import {
     normalizeGoogleLiveModelForUi,
 } from '../../../utils/googleLiveModels';
 
+const GOOGLE_LIVE_VOICE_OPTIONS = [
+    { value: 'Achernar', tone: 'Soft' },
+    { value: 'Achird', tone: 'Friendly' },
+    { value: 'Algenib', tone: 'Gravelly' },
+    { value: 'Algieba', tone: 'Smooth' },
+    { value: 'Alnilam', tone: 'Firm' },
+    { value: 'Aoede', tone: 'Breezy' },
+    { value: 'Autonoe', tone: 'Bright' },
+    { value: 'Callirrhoe', tone: 'Easy-going' },
+    { value: 'Charon', tone: 'Informative' },
+    { value: 'Despina', tone: 'Smooth' },
+    { value: 'Enceladus', tone: 'Breathy' },
+    { value: 'Erinome', tone: 'Clear' },
+    { value: 'Fenrir', tone: 'Excitable' },
+    { value: 'Gacrux', tone: 'Mature' },
+    { value: 'Iapetus', tone: 'Clear' },
+    { value: 'Kore', tone: 'Firm' },
+    { value: 'Laomedeia', tone: 'Upbeat' },
+    { value: 'Leda', tone: 'Youthful' },
+    { value: 'Orus', tone: 'Firm' },
+    { value: 'Puck', tone: 'Upbeat' },
+    { value: 'Pulcherrima', tone: 'Forward' },
+    { value: 'Rasalgethi', tone: 'Informative' },
+    { value: 'Sadachbia', tone: 'Lively' },
+    { value: 'Sadaltager', tone: 'Knowledgeable' },
+    { value: 'Schedar', tone: 'Even' },
+    { value: 'Sulafat', tone: 'Warm' },
+    { value: 'Umbriel', tone: 'Easy-going' },
+    { value: 'Vindemiatrix', tone: 'Gentle' },
+    { value: 'Zephyr', tone: 'Bright' },
+    { value: 'Zubenelgenubi', tone: 'Casual' },
+] as const;
+
+const GOOGLE_LIVE_SUPPORTED_VOICE_NAMES = GOOGLE_LIVE_VOICE_OPTIONS.map((v) => v.value);
+
 interface VertexRegion {
     value: string;
     label: string;
@@ -409,22 +444,20 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                             value={config.tts_voice_name || 'Aoede'}
                             onChange={(e) => handleChange('tts_voice_name', e.target.value)}
                         >
-                            <optgroup label="Female">
-                                <option value="Aoede">Aoede</option>
-                                <option value="Kore">Kore</option>
-                                <option value="Leda">Leda</option>
-                            </optgroup>
-                            <optgroup label="Male">
-                                <option value="Puck">Puck</option>
-                                <option value="Charon">Charon</option>
-                                <option value="Fenrir">Fenrir</option>
-                                <option value="Orus">Orus</option>
-                                <option value="Zephyr">Zephyr</option>
-                            </optgroup>
+                            {GOOGLE_LIVE_VOICE_OPTIONS.map((voice) => (
+                                <option key={voice.value} value={voice.value}>
+                                    {voice.value} — {voice.tone}
+                                </option>
+                            ))}
+                            {config.tts_voice_name && !GOOGLE_LIVE_SUPPORTED_VOICE_NAMES.includes(config.tts_voice_name) && (
+                                <optgroup label="Custom">
+                                    <option value={config.tts_voice_name}>{config.tts_voice_name}</option>
+                                </optgroup>
+                            )}
                         </select>
                         <p className="text-xs text-muted-foreground">
-                            Multilingual voices - auto-switches between 24 languages without configuration.
-                            <a href="https://firebase.google.com/docs/ai-logic/live-api/configuration" target="_blank" rel="noopener noreferrer" className="ml-1 text-blue-500 hover:underline">Voice Docs ↗</a>
+                            Multilingual voices — auto-switch across 70+ languages without configuration.
+                            <a href="https://ai.google.dev/gemini-api/docs/speech-generation" target="_blank" rel="noopener noreferrer" className="ml-1 text-blue-500 hover:underline">Voice Docs ↗</a>
                         </p>
                     </div>
                     <div className="space-y-2">

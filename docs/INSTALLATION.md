@@ -1,12 +1,12 @@
-# Asterisk AI Voice Agent - Installation Guide (v6.4.1)
+# Asterisk AI Voice Agent - Installation Guide (v6.4.2)
 
-This guide provides detailed instructions for setting up the Asterisk AI Voice Agent v6.4.1 on your server.
+This guide provides detailed instructions for setting up the Asterisk AI Voice Agent v6.4.2 on your server.
 
 ## Three Setup Paths
 
 Choose the path that best fits your experience level:
 
-## Upgrade to v6.4.1 (Existing Checkout)
+## Upgrade to v6.4.2 (Existing Checkout)
 
 This section is for operators upgrading an existing repo checkout (not a fresh install).
 
@@ -19,11 +19,11 @@ This section is for operators upgrading an existing repo checkout (not a fresh i
 
 ### 1) Pull the new release
 
-To upgrade to the tagged `v6.4.1` release (once the tag is published):
+To upgrade to the tagged `v6.4.2` release (once the tag is published):
 
 ```bash
 git fetch --tags
-git checkout v6.4.1
+git checkout v6.4.2
 ```
 
 If the tag is not published yet, track `main` temporarily:
@@ -168,7 +168,7 @@ If preflight reports warnings or failures, resolve them first, then re-run prefl
 - Re-run: `sudo ./preflight.sh --apply-fixes`
 - Verify: `agent check`
 
-### 3) Upgrade checklist (4.5.3 → 4.6.0)
+### 3) Legacy upgrade notes (4.x → 4.6)
 
 - `.env`:
   - Review ARI settings: `ASTERISK_ARI_PORT`, `ASTERISK_ARI_SCHEME`, `ASTERISK_ARI_SSL_VERIFY`
@@ -268,7 +268,7 @@ agent setup
 
 **Best for:** Headless servers, scripted deployments, CLI preference
 
-> Note: `agent quickstart` and `agent init` are still available for backward compatibility, but `agent setup` is the recommended CLI wizard for v6.4.1.
+> Note: `agent quickstart` and `agent init` are still available for backward compatibility, but `agent setup` is the recommended CLI wizard for v6.4.2.
 
 ---
 

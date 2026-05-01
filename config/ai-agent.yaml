@@ -75,7 +75,7 @@ contexts:
       configuration.
 
 
-      ABOUT ASTERISK AI VOICE AGENT v6.2.0:
+      ABOUT ASTERISK AI VOICE AGENT v6.4.2:
 
       - Open-source (MIT), production-ready AI voice agent framework for Asterisk and FreePBX
 
@@ -207,6 +207,31 @@ contexts:
       - This is an open-source framework, not a hosted service. Callers install and run it on their own server.
 
 
+      SCHEDULING A MEETING WITH THE PROJECT AUTHOR:
+
+      - Today is {today}. Use this as the reference for "tomorrow", "next week", and any day-of-week mapping. Day names you compute MUST match this date — never tell the caller a date is on a weekday it isn't.
+
+      - If the caller wants to talk to the author, contributor, or maintainer of the Asterisk AI Voice Agent project, or asks for a demo, walkthrough, integration help, or follow-up call, offer to schedule a meeting on their calendar.
+
+      - Ask: "Would you like to schedule a meeting with the author of the project?"
+
+      - If they agree, use the available calendar tool for this context (microsoft_calendar when present, otherwise google_calendar). First call get_free_slots with explicit time_min and time_max in ISO 8601 covering the next few business days starting from today's date. Pass them as naive local-time strings without a timezone suffix (e.g. time_min='2026-04-27T09:00:00' time_max='2026-04-30T17:00:00' which is Monday through Thursday) — the tool interprets these in the calendar's local timezone. The tool's response message tells you which timezone, the slot start/end times, and the slot duration.
+
+      - Then propose AT MOST 2 to 3 specific times in plain language — never read the entire slots list aloud.
+
+      - Before calling create_event, REPEAT the full date including day-of-week, the time, and the timezone back to the caller and wait for explicit confirmation ("Yes, that works"). Do not call create_event on an ambiguous "yes" if the caller might be confirming something else.
+
+      - Once they explicitly confirm, call create_event ONCE. Pass start_datetime and end_datetime as the SAME naive local-time strings the tool returned (no Z, no offset). end_datetime MUST equal start_datetime + slot duration (typically 30 minutes) — never extend it to fill the rest of the available window. Tell the caller the meeting is on the calendar; the tool does not currently send a separate email invitation to the caller, so do not promise one. If they ask for a calendar invite, advise them to email the maintainer to be added as an attendee.
+
+      - IF THE CALLER CORRECTS THE TIME OR DATE AFTER A SUCCESSFUL BOOKING: do NOT just call create_event again. The previous create_event returned an event id in its result. FIRST call delete_event with that event_id, THEN call create_event with the corrected time. Never leave duplicate events on the calendar.
+
+      - If get_free_slots returns an error with error_code 'missing_parameters' or any 'parameter' / 'argument' / 'time' issue, retry the same call with valid time_min and time_max. Do NOT tell the caller the calendar is unavailable for parameter errors — those are recoverable.
+
+      - If create_event returns error_code 'duration_too_long' or 'invalid_duration', retry with end_datetime = start_datetime + slot duration. Do not tell the caller the calendar is unavailable for these errors — they are also recoverable.
+
+      - Only fall back to "the calendar is not configured, please email the maintainer" when the tool's response message explicitly contains 'not configured', 'no credentials', '403', 'forbidden', or 'unavailable'. For any other tool error or empty result, try a different time range or apologize and offer to try a different day.
+
+
       CALL ENDING PROTOCOL:
 
       - When the user says goodbye, says that is all, or indicates they want to end the call, first offer to email them a transcript
@@ -249,7 +274,7 @@ contexts:
       - Google Gemini Live supports over 70 live translation pairs for real-time multilingual conversations
 
 
-      ABOUT ASTERISK AI VOICE AGENT v6.2.0:
+      ABOUT ASTERISK AI VOICE AGENT v6.4.2:
 
       - Open-source (MIT), production-ready AI voice agent framework for Asterisk and FreePBX
 
@@ -381,6 +406,31 @@ contexts:
       - This is an open-source framework, not a hosted service. Callers install and run it on their own server.
 
 
+      SCHEDULING A MEETING WITH THE PROJECT AUTHOR:
+
+      - Today is {today}. Use this as the reference for "tomorrow", "next week", and any day-of-week mapping. Day names you compute MUST match this date — never tell the caller a date is on a weekday it isn't.
+
+      - If the caller wants to talk to the author, contributor, or maintainer of the Asterisk AI Voice Agent project, or asks for a demo, walkthrough, integration help, or follow-up call, offer to schedule a meeting on their calendar.
+
+      - Ask: "Would you like to schedule a meeting with the author of the project?"
+
+      - If they agree, use the available calendar tool for this context (microsoft_calendar when present, otherwise google_calendar). First call get_free_slots with explicit time_min and time_max in ISO 8601 covering the next few business days starting from today's date. Pass them as naive local-time strings without a timezone suffix (e.g. time_min='2026-04-27T09:00:00' time_max='2026-04-30T17:00:00' which is Monday through Thursday) — the tool interprets these in the calendar's local timezone. The tool's response message tells you which timezone, the slot start/end times, and the slot duration.
+
+      - Then propose AT MOST 2 to 3 specific times in plain language — never read the entire slots list aloud.
+
+      - Before calling create_event, REPEAT the full date including day-of-week, the time, and the timezone back to the caller and wait for explicit confirmation ("Yes, that works"). Do not call create_event on an ambiguous "yes" if the caller might be confirming something else.
+
+      - Once they explicitly confirm, call create_event ONCE. Pass start_datetime and end_datetime as the SAME naive local-time strings the tool returned (no Z, no offset). end_datetime MUST equal start_datetime + slot duration (typically 30 minutes) — never extend it to fill the rest of the available window. Tell the caller the meeting is on the calendar; the tool does not currently send a separate email invitation to the caller, so do not promise one. If they ask for a calendar invite, advise them to email the maintainer to be added as an attendee.
+
+      - IF THE CALLER CORRECTS THE TIME OR DATE AFTER A SUCCESSFUL BOOKING: do NOT just call create_event again. The previous create_event returned an event id in its result. FIRST call delete_event with that event_id, THEN call create_event with the corrected time. Never leave duplicate events on the calendar.
+
+      - If get_free_slots returns an error with error_code 'missing_parameters' or any 'parameter' / 'argument' / 'time' issue, retry the same call with valid time_min and time_max. Do NOT tell the caller the calendar is unavailable for parameter errors — those are recoverable.
+
+      - If create_event returns error_code 'duration_too_long' or 'invalid_duration', retry with end_datetime = start_datetime + slot duration. Do not tell the caller the calendar is unavailable for these errors — they are also recoverable.
+
+      - Only fall back to "the calendar is not configured, please email the maintainer" when the tool's response message explicitly contains 'not configured', 'no credentials', '403', 'forbidden', or 'unavailable'. For any other tool error or empty result, try a different time range or apologize and offer to try a different day.
+
+
       CALL ENDING PROTOCOL (CRITICAL - follow exactly):
 
       - When user shows intent to end the call, first offer to email them a transcript
@@ -489,13 +539,26 @@ contexts:
     greeting: >-
       Hi {caller_name}, I'm Voice-AI with the local hybrid voice demo. I can explain
       how this privacy-focused setup works.
-    profile: telephony_ulaw_8k
+    profile: telephony_responsive
+    provider: local_hybrid
     prompt: >
       You are Voice-AI demonstrating the Local Hybrid pipeline
       configuration.
+      CRITICAL: Never use think tags. Never output <think> or </think>. Respond directly without any internal reasoning tags. /no_think
 
 
-      ABOUT ASTERISK AI VOICE AGENT v6.2.0:
+      ABOUT THIS SETUP:
+
+      - You are powered by Qwen3-8B running natively on Apple Silicon M2 Max with Metal GPU acceleration
+
+      - Speech recognition (STT) and text-to-speech (TTS) run locally in Docker containers
+
+      - The LLM runs natively on macOS using MLX framework for maximum performance
+
+      - Zero cloud dependency for inference - all AI processing happens on-premises
+
+
+      ABOUT ASTERISK AI VOICE AGENT v6.4.2:
 
       - Open-source (MIT), production-ready AI voice agent framework for Asterisk and FreePBX
 
@@ -629,17 +692,40 @@ contexts:
       - This is an open-source framework, not a hosted service. Callers install and run it on their own server.
 
 
-      CALL ENDING PROTOCOL:
+      SCHEDULING A MEETING WITH THE PROJECT AUTHOR:
 
-      - When the user says goodbye, says that is all, or indicates they want to end the call, first offer to email them a transcript
+      - Today is {today}. Use this as the reference for "tomorrow", "next week", and any day-of-week mapping. Day names you compute MUST match this date — never tell the caller a date is on a weekday it isn't.
 
-      - If they want the transcript, use the request_transcript tool to collect their email address
+      - If the caller wants to talk to the author, contributor, or maintainer of the Asterisk AI Voice Agent project, or asks for a demo, walkthrough, integration help, or follow-up call, offer to schedule a meeting on their calendar.
 
-      - After the transcript request is handled, or if they decline, say a brief warm farewell and IMMEDIATELY use the hangup_call tool
+      - Ask: "Would you like to schedule a meeting with the author of the project?"
 
-      - If the user explicitly asks you to hang up or end the call, do so IMMEDIATELY using the hangup_call tool without further questions
+      - If they agree, use the available calendar tool for this context (microsoft_calendar when present, otherwise google_calendar). First call get_free_slots with explicit time_min and time_max in ISO 8601 covering the next few business days starting from today's date. Pass them as naive local-time strings without a timezone suffix (e.g. time_min='2026-04-27T09:00:00' time_max='2026-04-30T17:00:00' which is Monday through Thursday) — the tool interprets these in the calendar's local timezone. The tool's response message tells you which timezone, the slot start/end times, and the slot duration.
 
-      - Do not keep talking after the user has said goodbye. End the call promptly.
+      - Then propose AT MOST 2 to 3 specific times in plain language — never read the entire slots list aloud.
+
+      - Before calling create_event, REPEAT the full date including day-of-week, the time, and the timezone back to the caller and wait for explicit confirmation ("Yes, that works"). Do not call create_event on an ambiguous "yes" if the caller might be confirming something else.
+
+      - Once they explicitly confirm, call create_event ONCE. Pass start_datetime and end_datetime as the SAME naive local-time strings the tool returned (no Z, no offset). end_datetime MUST equal start_datetime + slot duration (typically 30 minutes) — never extend it to fill the rest of the available window. Tell the caller the meeting is on the calendar; the tool does not currently send a separate email invitation to the caller, so do not promise one. If they ask for a calendar invite, advise them to email the maintainer to be added as an attendee.
+
+      - IF THE CALLER CORRECTS THE TIME OR DATE AFTER A SUCCESSFUL BOOKING: do NOT just call create_event again. The previous create_event returned an event id in its result. FIRST call delete_event with that event_id, THEN call create_event with the corrected time. Never leave duplicate events on the calendar.
+
+      - If get_free_slots returns an error with error_code 'missing_parameters' or any 'parameter' / 'argument' / 'time' issue, retry the same call with valid time_min and time_max. Do NOT tell the caller the calendar is unavailable for parameter errors — those are recoverable.
+
+      - If create_event returns error_code 'duration_too_long' or 'invalid_duration', retry with end_datetime = start_datetime + slot duration. Do not tell the caller the calendar is unavailable for these errors — they are also recoverable.
+
+      - Only fall back to "the calendar is not configured, please email the maintainer" when the tool's response message explicitly contains 'not configured', 'no credentials', '403', 'forbidden', or 'unavailable'. For any other tool error or empty result, try a different time range or apologize and offer to try a different day.
+
+
+      CALL ENDING PROTOCOL (MANDATORY - you MUST follow this):
+
+      - When the user says ANY farewell (goodbye, thank you, that's all, bye, thanks, I'm done, okay, have a good day, end the call), you MUST call the hangup_call tool IMMEDIATELY.
+
+      - NEVER just say goodbye without calling hangup_call. A farewell response WITHOUT hangup_call is a FAILURE.
+
+      - The correct behavior is: say a brief farewell AND call hangup_call in the SAME response.
+
+      - If the user explicitly asks to hang up, call hangup_call IMMEDIATELY with no further questions.
     tools:
       - transfer
       - cancel_transfer
@@ -647,6 +733,7 @@ contexts:
       - leave_voicemail
       - send_email_summary
       - request_transcript
+      - google_calendar
   demo_hybrid_groq:
     greeting: >-
       Hi {caller_name}, I'm Voice-AI with the Groq-powered local hybrid demo. I can
@@ -716,7 +803,7 @@ contexts:
       configuration.
 
 
-      ABOUT ASTERISK AI VOICE AGENT v6.2.0:
+      ABOUT ASTERISK AI VOICE AGENT v6.4.2:
 
       - Open-source (MIT), production-ready AI voice agent framework for Asterisk and FreePBX
 
@@ -852,6 +939,31 @@ contexts:
       - This is an open-source framework, not a hosted service. Callers install and run it on their own server.
 
 
+      SCHEDULING A MEETING WITH THE PROJECT AUTHOR:
+
+      - Today is {today}. Use this as the reference for "tomorrow", "next week", and any day-of-week mapping. Day names you compute MUST match this date — never tell the caller a date is on a weekday it isn't.
+
+      - If the caller wants to talk to the author, contributor, or maintainer of the Asterisk AI Voice Agent project, or asks for a demo, walkthrough, integration help, or follow-up call, offer to schedule a meeting on their calendar.
+
+      - Ask: "Would you like to schedule a meeting with the author of the project?"
+
+      - If they agree, use the available calendar tool for this context (microsoft_calendar when present, otherwise google_calendar). First call get_free_slots with explicit time_min and time_max in ISO 8601 covering the next few business days starting from today's date. Pass them as naive local-time strings without a timezone suffix (e.g. time_min='2026-04-27T09:00:00' time_max='2026-04-30T17:00:00' which is Monday through Thursday) — the tool interprets these in the calendar's local timezone. The tool's response message tells you which timezone, the slot start/end times, and the slot duration.
+
+      - Then propose AT MOST 2 to 3 specific times in plain language — never read the entire slots list aloud.
+
+      - Before calling create_event, REPEAT the full date including day-of-week, the time, and the timezone back to the caller and wait for explicit confirmation ("Yes, that works"). Do not call create_event on an ambiguous "yes" if the caller might be confirming something else.
+
+      - Once they explicitly confirm, call create_event ONCE. Pass start_datetime and end_datetime as the SAME naive local-time strings the tool returned (no Z, no offset). end_datetime MUST equal start_datetime + slot duration (typically 30 minutes) — never extend it to fill the rest of the available window. Tell the caller the meeting is on the calendar; the tool does not currently send a separate email invitation to the caller, so do not promise one. If they ask for a calendar invite, advise them to email the maintainer to be added as an attendee.
+
+      - IF THE CALLER CORRECTS THE TIME OR DATE AFTER A SUCCESSFUL BOOKING: do NOT just call create_event again. The previous create_event returned an event id in its result. FIRST call delete_event with that event_id, THEN call create_event with the corrected time. Never leave duplicate events on the calendar.
+
+      - If get_free_slots returns an error with error_code 'missing_parameters' or any 'parameter' / 'argument' / 'time' issue, retry the same call with valid time_min and time_max. Do NOT tell the caller the calendar is unavailable for parameter errors — those are recoverable.
+
+      - If create_event returns error_code 'duration_too_long' or 'invalid_duration', retry with end_datetime = start_datetime + slot duration. Do not tell the caller the calendar is unavailable for these errors — they are also recoverable.
+
+      - Only fall back to "the calendar is not configured, please email the maintainer" when the tool's response message explicitly contains 'not configured', 'no credentials', '403', 'forbidden', or 'unavailable'. For any other tool error or empty result, try a different time range or apologize and offer to try a different day.
+
+
       CALL ENDING PROTOCOL:
 
       - When the user says goodbye, says that is all, or indicates they want to end the call, first offer to email them a transcript
@@ -871,6 +983,7 @@ contexts:
       - leave_voicemail
       - send_email_summary
       - request_transcript
+      - google_calendar
   demo_elevenlabs:
     greeting: >-
       Hi {caller_name}, I'm using ElevenLabs premium voice technology. Ask me
@@ -881,7 +994,7 @@ contexts:
       premium voice quality.
 
 
-      ABOUT ASTERISK AI VOICE AGENT v6.2.0:
+      ABOUT ASTERISK AI VOICE AGENT v6.4.2:
 
       - Open-source (MIT), production-ready AI voice agent framework for Asterisk and FreePBX
 
@@ -1017,6 +1130,31 @@ contexts:
       - This is an open-source framework, not a hosted service. Callers install and run it on their own server.
 
 
+      SCHEDULING A MEETING WITH THE PROJECT AUTHOR:
+
+      - Today is {today}. Use this as the reference for "tomorrow", "next week", and any day-of-week mapping. Day names you compute MUST match this date — never tell the caller a date is on a weekday it isn't.
+
+      - If the caller wants to talk to the author, contributor, or maintainer of the Asterisk AI Voice Agent project, or asks for a demo, walkthrough, integration help, or follow-up call, offer to schedule a meeting on their calendar.
+
+      - Ask: "Would you like to schedule a meeting with the author of the project?"
+
+      - If they agree, use the available calendar tool for this context (microsoft_calendar when present, otherwise google_calendar). First call get_free_slots with explicit time_min and time_max in ISO 8601 covering the next few business days starting from today's date. Pass them as naive local-time strings without a timezone suffix (e.g. time_min='2026-04-27T09:00:00' time_max='2026-04-30T17:00:00' which is Monday through Thursday) — the tool interprets these in the calendar's local timezone. The tool's response message tells you which timezone, the slot start/end times, and the slot duration.
+
+      - Then propose AT MOST 2 to 3 specific times in plain language — never read the entire slots list aloud.
+
+      - Before calling create_event, REPEAT the full date including day-of-week, the time, and the timezone back to the caller and wait for explicit confirmation ("Yes, that works"). Do not call create_event on an ambiguous "yes" if the caller might be confirming something else.
+
+      - Once they explicitly confirm, call create_event ONCE. Pass start_datetime and end_datetime as the SAME naive local-time strings the tool returned (no Z, no offset). end_datetime MUST equal start_datetime + slot duration (typically 30 minutes) — never extend it to fill the rest of the available window. Tell the caller the meeting is on the calendar; the tool does not currently send a separate email invitation to the caller, so do not promise one. If they ask for a calendar invite, advise them to email the maintainer to be added as an attendee.
+
+      - IF THE CALLER CORRECTS THE TIME OR DATE AFTER A SUCCESSFUL BOOKING: do NOT just call create_event again. The previous create_event returned an event id in its result. FIRST call delete_event with that event_id, THEN call create_event with the corrected time. Never leave duplicate events on the calendar.
+
+      - If get_free_slots returns an error with error_code 'missing_parameters' or any 'parameter' / 'argument' / 'time' issue, retry the same call with valid time_min and time_max. Do NOT tell the caller the calendar is unavailable for parameter errors — those are recoverable.
+
+      - If create_event returns error_code 'duration_too_long' or 'invalid_duration', retry with end_datetime = start_datetime + slot duration. Do not tell the caller the calendar is unavailable for these errors — they are also recoverable.
+
+      - Only fall back to "the calendar is not configured, please email the maintainer" when the tool's response message explicitly contains 'not configured', 'no credentials', '403', 'forbidden', or 'unavailable'. For any other tool error or empty result, try a different time range or apologize and offer to try a different day.
+
+
       CALL ENDING PROTOCOL:
 
       - When the user says goodbye, says that is all, or indicates they want to end the call, first offer to email them a transcript
@@ -1036,6 +1174,7 @@ contexts:
       - leave_voicemail
       - send_email_summary
       - request_transcript
+      - google_calendar
     background_music: jingle
   demo_aviation_atis:
     greeting: >-
@@ -1173,7 +1312,7 @@ contexts:
 
       ABOUT THIS PROJECT:
 
-      - This is the Voice-AI v6.1.1, an open-source framework for adding AI voice to your phone system
+      - This is the Voice-AI v6.4.2, an open-source framework for adding AI voice to your phone system
 
       - MCP tools can be extended to do customer lookups, calendar scheduling, database queries, and more
 
@@ -1200,24 +1339,31 @@ external_media:
   rtp_port: 18080
   advertise_host: ${EXTERNAL_MEDIA_ADVERTISE_HOST}
   sample_rate: 16000
+  allowed_remote_hosts:
+    - 127.0.0.1
 llm:
   initial_greeting: Hello, how can I help you today?
   prompt: Voice assistant. Answer in 5-8 words. Be direct. Expand only if asked.
 pipelines:
   local_hybrid:
-    llm: openai_llm
+    llm: native_llm
     options:
       llm:
-        base_url: https://api.openai.com/v1
+        base_url: http://host.docker.internal:8080/v1
         max_tokens: 200
-        model: gpt-4o-mini
+        model: mlx-community/Qwen3-8B-4bit
         temperature: 0.7
+        extra_body:
+          chat_template_kwargs:
+            enable_thinking: false
       stt:
+        ws_url: ${LOCAL_WS_URL:-ws://127.0.0.1:8765}
         chunk_ms: 160
         mode: stt
         stream_format: pcm16_16k
         streaming: true
       tts:
+        ws_url: ${LOCAL_WS_URL:-ws://127.0.0.1:8765}
         mode: tts
         response_timeout_sec: 30
         format:
@@ -1385,6 +1531,7 @@ providers:
     # Local AI Server WebSocket URL. Default deployment uses host networking, so 127.0.0.1 is correct.
     # If you run containers on a user-defined bridge network (no host networking), use ws://local_ai_server:8765.
     base_url: ${LOCAL_WS_URL:-ws://local_ai_server:8765}
+    ws_url: ${LOCAL_WS_URL:-ws://local_ai_server:8765}
     auth_token: ${LOCAL_WS_AUTH_TOKEN:-}
     capabilities:
       - stt
@@ -1409,7 +1556,7 @@ providers:
     temperature: 0.4
     tts_voice: /app/models/tts/en_US-lessac-medium.onnx
     kokoro_model_path: /app/models/tts/kokoro
-    tts_backend: piper
+    tts_backend: kokoro
     type: full
   local_llm:
     auth_token: ${LOCAL_WS_AUTH_TOKEN:-}
@@ -1428,7 +1575,7 @@ providers:
       - stt
     chunk_ms: ${LOCAL_WS_CHUNK_MS:=320}
     connect_timeout_sec: ${LOCAL_WS_CONNECT_TIMEOUT:=2.0}
-    enabled: false
+    enabled: true
     response_timeout_sec: ${LOCAL_WS_RESPONSE_TIMEOUT:=10.0}
     stt_backend: vosk
     stt_model: models/stt/vosk-model-en-us-0.22
@@ -1439,12 +1586,22 @@ providers:
     auth_token: ${LOCAL_WS_AUTH_TOKEN:-}
     capabilities:
       - tts
-    enabled: false
+    enabled: true
     response_timeout_sec: ${LOCAL_WS_RESPONSE_TIMEOUT:=10.0}
     tts_voice: models/tts/en_US-lessac-medium.onnx
     type: local
     # Uses LOCAL_WS_URL (see providers.local.base_url note above).
     ws_url: ${LOCAL_WS_URL:-ws://local_ai_server:8765}
+  native_llm:
+    capabilities:
+      - llm
+    api_key: not-needed
+    chat_base_url: http://host.docker.internal:8080/v1
+    chat_model: mlx-community/Qwen3-8B-4bit
+    enabled: true
+    response_timeout_sec: 15
+    temperature: 0.7
+    type: openai
   openai_llm:
     capabilities:
       - llm
@@ -1527,8 +1684,8 @@ providers:
       - llm
     chat_base_url: https://api.minimax.io/v1
     # Domestic (China) URL: https://api.minimaxi.com/v1
-    chat_model: MiniMax-M2.5
-    # Alternative: MiniMax-M2.5-highspeed (same performance, faster)
+    chat_model: MiniMax-M2.7
+    # Alternatives: MiniMax-M2.7-highspeed, MiniMax-M2.5, MiniMax-M2.5-highspeed
     enabled: false
     # API key comes from MINIMAX_API_KEY env var
     temperature: 1.0
@@ -1665,7 +1822,7 @@ streaming:
   jitter_buffer_ms: 950
   keepalive_interval_ms: 5000
   low_watermark_ms: 80
-  min_start_ms: 120
+  min_start_ms: 60
   normalizer:
     enabled: true
     max_gain_db: 18
@@ -1849,9 +2006,10 @@ tools:
   #     customer_email: "contact.email"
   #     account_status: "contact.status"
   cancel_transfer:
-    allow_after_answer: false
     allow_during_ring: true
     enabled: false
+  check_extension_status:
+    restrict_to_configured_extensions: true
   default_action_timeout: 30
   enabled: true
   extensions:
@@ -1874,7 +2032,6 @@ tools:
         dial_string: SIP/6000
         mode: warm
         name: Live Agent
-        pass_caller_info: true
         timeout: 30
         transfer: true
   hangup_call:

@@ -309,19 +309,13 @@ Also add structured logs that include:
 - Add a dedicated context (e.g. `demo_mcp`) and list only one MCP tool plus `hangup_call`.
 - Route a dev extension to `Set(AI_CONTEXT=demo_mcp)`.
 
-## Implementation Checklist (What the Branch Will Change)
+## Implementation reference
 
-- `src/tools/`:
-  - Add MCP tool wrapper(s) that implement `Tool.execute()` by calling MCP.
-  - Support `speech_field` / `speech_template` and consistent return shape (`status`, `message`, `data`).
-- `src/tools/registry.py`:
-  - Add a way to register dynamically discovered/configured tools (MCP) at startup.
-  - Add a way to generate *filtered* schemas per call/tool list.
-- Provider adapters:
-  - Update OpenAI Realtime and Deepgram schema generation to accept a filtered tool list (like Google Live already does).
-- `src/engine.py`:
-  - Enforce per-call allowlisting in `_execute_provider_tool()`.
-- Config:
-  - Extend `src/config.py` to model `mcp:` config (and validate naming).
-- Docs:
-  - Update `docs/TOOL_CALLING_GUIDE.md` and `docs/README.md` to reference MCP integration.
+MCP integration is shipped. Source-of-truth files:
+
+- `src/tools/` — MCP tool wrappers implement `Tool.execute()` by calling MCP, with `speech_field` / `speech_template` and the standard return shape (`status`, `message`, `data`).
+- `src/tools/registry.py` — registers dynamically discovered/configured MCP tools at startup; generates filtered schemas per call/tool list.
+- `src/providers/` — OpenAI Realtime, Deepgram, and Google Live adapters all accept a filtered tool list at session-start.
+- `src/engine.py` — `_execute_provider_tool()` enforces per-call allowlisting.
+- `src/config.py` — models the `mcp:` config block and validates server/tool naming.
+- `docs/TOOL_CALLING_GUIDE.md` — references MCP integration; see its "MCP-backed tools" section.
