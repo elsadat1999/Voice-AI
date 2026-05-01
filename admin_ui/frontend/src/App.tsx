@@ -4,6 +4,7 @@ import { Toaster } from 'sonner';
 import { ConfirmDialogProvider } from './hooks/useConfirmDialog';
 import AppShell from './components/layout/AppShell';
 import Dashboard from './pages/Dashboard';
+import LiveSystemTopologyPage from './pages/LiveSystemTopologyPage';
 import CallHistoryPage from './pages/CallHistoryPage';
 import CallSchedulingPage from './pages/CallSchedulingPage';
 import axios from 'axios';
@@ -120,63 +121,64 @@ function App() {
     return (
         <AuthProvider>
             <ConfirmDialogProvider>
-            <Toaster position="top-right" richColors closeButton />
-            <Router>
-                <Routes>
-                    <Route path="/login" element={<LoginPage />} />
+                <Toaster position="top-right" richColors closeButton />
+                <Router>
+                    <Routes>
+                        <Route path="/login" element={<LoginPage />} />
 
-                    <Route path="*" element={
-                        <RequireAuth>
-                            <SetupGuard>
-                                <Suspense fallback={<PageLoader />}>
-                                    <Routes>
-                                        {/* Setup Wizard Route (lazy) */}
-                                        <Route path="/wizard" element={<Wizard />} />
+                        <Route path="*" element={
+                            <RequireAuth>
+                                <SetupGuard>
+                                    <Suspense fallback={<PageLoader />}>
+                                        <Routes>
+                                            {/* Setup Wizard Route (lazy) */}
+                                            <Route path="/wizard" element={<Wizard />} />
 
-                                        {/* Main Application Layout */}
-                                        <Route element={<AppShell />}>
-                                            <Route path="/" element={<Dashboard />} />
-                                            <Route path="/history" element={<CallHistoryPage />} />
-                                            <Route path="/scheduling" element={<CallSchedulingPage />} />
+                                            {/* Main Application Layout */}
+                                            <Route element={<AppShell />}>
+                                                <Route path="/" element={<Dashboard />} />
+                                                <Route path="/topology" element={<LiveSystemTopologyPage />} />
+                                                <Route path="/history" element={<CallHistoryPage />} />
+                                                <Route path="/scheduling" element={<CallSchedulingPage />} />
 
-                                            {/* Core Configuration */}
-                                            <Route path="/providers" element={<ProvidersPage />} />
-                                            <Route path="/pipelines" element={<PipelinesPage />} />
-                                            <Route path="/contexts" element={<ContextsPage />} />
-                                            <Route path="/profiles" element={<ProfilesPage />} />
-                                            <Route path="/tools" element={<ToolsPage />} />
-                                            <Route path="/mcp" element={<MCPPage />} />
+                                                {/* Core Configuration */}
+                                                <Route path="/providers" element={<ProvidersPage />} />
+                                                <Route path="/pipelines" element={<PipelinesPage />} />
+                                                <Route path="/contexts" element={<ContextsPage />} />
+                                                <Route path="/profiles" element={<ProfilesPage />} />
+                                                <Route path="/tools" element={<ToolsPage />} />
+                                                <Route path="/mcp" element={<MCPPage />} />
 
-                                            {/* Advanced Settings */}
-                                            <Route path="/vad" element={<VADPage />} />
-                                            <Route path="/streaming" element={<StreamingPage />} />
-                                            <Route path="/llm" element={<LLMPage />} />
-                                            <Route path="/transport" element={<TransportPage />} />
-                                            <Route path="/barge-in" element={<BargeInPage />} />
-                                            <Route path="/yaml" element={<RawYamlPage />} />
+                                                {/* Advanced Settings */}
+                                                <Route path="/vad" element={<VADPage />} />
+                                                <Route path="/streaming" element={<StreamingPage />} />
+                                                <Route path="/llm" element={<LLMPage />} />
+                                                <Route path="/transport" element={<TransportPage />} />
+                                                <Route path="/barge-in" element={<BargeInPage />} />
+                                                <Route path="/yaml" element={<RawYamlPage />} />
 
-                                            {/* System Management */}
-                                            <Route path="/env" element={<EnvPage />} />
-                                            <Route path="/docker" element={<DockerPage />} />
-                                            <Route path="/asterisk" element={<AsteriskPage />} />
-                                            <Route path="/logs" element={<LogsPage />} />
-                                            <Route path="/terminal" element={<TerminalPage />} />
-                                            <Route path="/models" element={<ModelsPage />} />
-                                            <Route path="/updates" element={<UpdatesPage />} />
+                                                {/* System Management */}
+                                                <Route path="/env" element={<EnvPage />} />
+                                                <Route path="/docker" element={<DockerPage />} />
+                                                <Route path="/asterisk" element={<AsteriskPage />} />
+                                                <Route path="/logs" element={<LogsPage />} />
+                                                <Route path="/terminal" element={<TerminalPage />} />
+                                                <Route path="/models" element={<ModelsPage />} />
+                                                <Route path="/updates" element={<UpdatesPage />} />
 
-                                            {/* Help */}
-                                            <Route path="/help" element={<HelpPage />} />
+                                                {/* Help */}
+                                                <Route path="/help" element={<HelpPage />} />
 
-                                            {/* Fallback */}
-                                            <Route path="*" element={<Navigate to="/" replace />} />
-                                        </Route>
-                                    </Routes>
-                                </Suspense>
-                            </SetupGuard>
-                        </RequireAuth>
-                    } />
-                </Routes>
-            </Router>
+                                                {/* Fallback */}
+                                                <Route path="*" element={<Navigate to="/" replace />} />
+                                            </Route>
+                                        </Routes>
+                                    </Suspense>
+                                </SetupGuard>
+                            </RequireAuth>
+                        } />
+                    </Routes>
+                </Router>
             </ConfirmDialogProvider>
         </AuthProvider>
     );

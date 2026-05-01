@@ -25,7 +25,8 @@ import {
     Phone,
     CalendarClock,
     LogOut,
-    Lock
+    Lock,
+    Network
 } from 'lucide-react';
 import { useAuth } from '../../auth/AuthContext';
 import ChangePasswordModal from '../auth/ChangePasswordModal';
@@ -83,6 +84,7 @@ const Sidebar = () => {
             <div className="flex-1 overflow-y-auto py-6 px-3">
                 <SidebarGroup title="Overview">
                     <SidebarItem to="/" icon={LayoutDashboard} label="Dashboard" end />
+                    <SidebarItem to="/topology" icon={Network} label="Live System Topology" />
                     <SidebarItem to="/history" icon={Phone} label="Call History" />
                     <SidebarItem to="/scheduling" icon={CalendarClock} label="Call Scheduling" />
                     <SidebarItem to="/wizard" icon={Zap} label="Setup Wizard" />

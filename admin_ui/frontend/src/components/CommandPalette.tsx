@@ -24,6 +24,7 @@ import {
     Phone,
     CalendarClock,
     Search,
+    Network,
 } from 'lucide-react';
 
 type PageEntry = {
@@ -36,6 +37,7 @@ type PageEntry = {
 
 const pages: PageEntry[] = [
     { label: 'Dashboard', path: '/', icon: LayoutDashboard, group: 'Overview' },
+    { label: 'Live System Topology', path: '/topology', icon: Network, group: 'Overview' },
     { label: 'Call History', path: '/history', icon: Phone, group: 'Overview', keywords: ['calls', 'phone'] },
     { label: 'Call Scheduling', path: '/scheduling', icon: CalendarClock, group: 'Overview', keywords: ['schedule', 'calendar'] },
     { label: 'Setup Wizard', path: '/wizard', icon: Zap, group: 'Overview', keywords: ['setup', 'onboard'] },
@@ -184,11 +186,10 @@ const CommandPalette: React.FC = () => {
                             return (
                                 <button
                                     key={page.path}
-                                    className={`w-full flex items-center gap-3 px-4 py-2.5 text-sm text-left transition-colors ${
-                                        i === selectedIndex
-                                            ? 'bg-accent text-accent-foreground'
-                                            : 'text-foreground hover:bg-accent/50'
-                                    }`}
+                                    className={`w-full flex items-center gap-3 px-4 py-2.5 text-sm text-left transition-colors ${i === selectedIndex
+                                        ? 'bg-accent text-accent-foreground'
+                                        : 'text-foreground hover:bg-accent/50'
+                                        }`}
                                     onClick={() => selectItem(i)}
                                     onMouseEnter={() => setSelectedIndex(i)}
                                 >
