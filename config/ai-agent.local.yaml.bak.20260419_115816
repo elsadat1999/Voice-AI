@@ -1,0 +1,8 @@
+pipelines:
+  local_hybrid:
+    tools: null
+vad:
+  webrtc_aggressiveness: 3
+  noise_adaptation_rate: 0.1
+  upstream_squelch_noise_factor: 3.5
+  upstream_squelch_noise_ema_alpha: 0.15
