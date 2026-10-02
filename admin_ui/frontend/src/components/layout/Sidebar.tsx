@@ -125,7 +125,7 @@ const Sidebar = () => {
                         <img
                             src="/logo.svg"
                             alt="voice-ai"
-                            className="w-9 h-9 object-contain shrink-0 rounded-xl"
+                            className="w-8 h-8 object-contain shrink-0"
                         />
                         {!collapsed && (
                             <div className="flex flex-col leading-none flex-1 min-w-0">

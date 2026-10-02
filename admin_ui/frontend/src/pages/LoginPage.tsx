@@ -36,7 +36,7 @@ const LoginPage: React.FC = () => {
                         <img
                             src="/logo.svg"
                             alt="voice-ai"
-                            className="w-16 h-16 mb-2 rounded-2xl shadow-md"
+                            className="w-16 h-16 mb-2 object-contain"
                         />
                         <h2 className="text-3xl font-bold text-foreground">voice-ai</h2>
                     </div>
