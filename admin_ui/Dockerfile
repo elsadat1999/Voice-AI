@@ -55,6 +55,7 @@ COPY admin_ui/backend/ .
 # Admin image has a separate runtime tree, so copy the dependency-free shared
 # policy into its import root from the same repository source file.
 COPY src/config_apply.py ./config_apply.py
+COPY src/ ./src/
 
 # Copy built frontend assets to backend's static directory
 COPY --from=frontend-builder /app/frontend/dist ./static
