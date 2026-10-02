@@ -93,7 +93,7 @@ UPDATE kvstore_Sipsettings SET val=\"${host_ip}\" WHERE \`key\`=\"externip.val\"
   docker exec "$FREEPBX_CONTAINER" bash -lc "mysql -u root -e 'USE asterisk;
 UPDATE sipsettings SET data=\"${host_ip}\" WHERE keyword=\"externip_val\";' 2>/dev/null || true"
 
-  docker cp "$TMP_OVERRIDES" "${FREEPBX_CONTAINER}:/etc/asterisk/pjsip.endpoint_custom.conf"
+  docker cp "$TMP_OVERRIDES" "${FREEPBX_CONTAINER}:/etc/asterisk/pjsip.endpoint_custom_post.conf"
 
   docker exec "$FREEPBX_CONTAINER" bash -lc "fwconsole reload"
 
