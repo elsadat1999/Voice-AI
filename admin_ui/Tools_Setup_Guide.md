@@ -1,8 +1,8 @@
 # HTTP Tools Setup Guide (Admin UI)
 
-**Version**: 1.0.0  
-**Last Updated**: January 2026  
-**Applies to**: v5.3.1+
+**Version**: 1.1.0
+**Last Updated**: July 2026
+**Applies to**: v7.4+
 
 ---
 
@@ -57,7 +57,7 @@ Fill in the following fields:
 |-------|-------------|---------|
 | **Name** | Unique identifier for this tool | `ghl_contact_lookup` |
 | **Enabled** | Toggle to enable/disable | ✓ |
-| **Global** | Run for all contexts (can be opted out per context) | ☐ |
+| **Global** | Run for all Agents (an Agent can opt out) | ☐ |
 | **URL** | API endpoint URL | `https://api.example.com/contacts/lookup` |
 | **Method** | HTTP method | `GET` |
 | **Timeout (ms)** | Request timeout | `2000` |
@@ -91,7 +91,7 @@ Output variables map API response fields to prompt variables:
 | `customer_company` | `contacts[0].companyName` | Company name |
 
 **Important**:
-- The **Variable Name** is what you reference later as a template variable (e.g., `{customer_name}`) in prompts, other tools, and context fields.
+- The **Variable Name** is what you reference later as a template variable (e.g., `{customer_name}`) in prompts, other tools, and Agent fields.
 - The **Response Path** is only used to extract data from the HTTP response (e.g., `contacts[0].email`). It is **not** a template variable.
 - In the Admin UI, variable names that are safe to reference elsewhere are highlighted to reduce confusion.
 
@@ -240,7 +240,7 @@ Enter your JSON payload template in the **Payload Template** field:
   "caller_name": "{caller_name}",
   "duration_seconds": {call_duration},
   "outcome": "{call_outcome}",
-  "summary": "{summary}",
+  "summary": {summary_json},
   "summary_json": {summary_json},
   "transcript": {transcript_json},
   "pre_call_results": {pre_call_results_json},
@@ -250,14 +250,21 @@ Enter your JSON payload template in the **Payload Template** field:
 
 ### Step 5: Enable AI Summary (Optional)
 
-Toggle **Generate Summary** to have the AI create a summary of the conversation:
+Toggle **Generate AI Summary** to have one configured LLM summarize the conversation before the webhook is sent:
 
-| Field | Description |
-|-------|-------------|
-| **Generate Summary** | ✓ Enable |
-| **Max Words** | `100` |
+| Field | Description | Example |
+|-------|-------------|---------|
+| **Generate AI Summary** | Enable summary generation | ✓ |
+| **Summary Provider** | Enabled modular LLM that receives the transcript | `deepseek_llm` |
+| **Max Summary Words** | Requested maximum summary length | `100` |
+| **Summary Timeout (ms)** | Independent LLM timeout before the webhook request starts | `15000` |
+| **Summary Prompt** | Per-webhook instructions; `{max_words}` inserts the configured word limit | `Write a factual CRM note...` |
 
-When enabled, `{summary}` contains an AI-generated summary and `{summary_json}` contains the same summary as a JSON string (safe for unquoted insertion).
+The provider selector shows the configured model and whether its API key is ready. Configure or upload cloud-provider credentials under **Providers**; credentials are never stored in the webhook. A new or changed summary configuration cannot be saved with a disabled provider or a missing API key. Providers that do not require a key are identified as ready without one.
+
+Existing upgraded webhooks without a **Summary Provider** continue to display and use **OpenAI (legacy default)** with `OPENAI_API_KEY` and `gpt-4o-mini` until another provider is selected. An explicit provider never falls back to a different LLM if it fails. The webhook is still sent with an empty summary, and the failure details are available in Call History.
+
+When enabled, `{summary}` contains the generated text and `{summary_json}` contains the same summary as a JSON string (safe for unquoted insertion). Use **Reset to recommended** to restore the default prompt.
 
 ### Step 6: Save
 
@@ -265,14 +272,14 @@ Click **Save Configuration** to apply changes.
 
 ---
 
-## Part 4: Using Variables in Contexts
+## Part 4: Using Variables in Agents
 
-After setting up lookups and webhooks, you need to use the output variables in your AI context prompts.
+After setting up lookups and webhooks, use their output variables in Agent prompts.
 
-### Step 1: Navigate to Contexts
+### Step 1: Navigate to Agents
 
-1. Go to **Contexts**
-2. Select an existing context or click **Add Context**
+1. Go to **Agents**
+2. Edit an existing Agent or click **Add Agent**
 
 ### Step 2: Use Pre-Call Variables in Prompts
 
@@ -290,7 +297,7 @@ Greet the customer by name and provide personalized assistance.
 If the customer name is empty, ask for their name politely.
 ```
 
-### Step 3: Enable Tools for the Context
+### Step 3: Enable Tools for the Agent
 
 In the **Tools Configuration** section, enable tools per phase:
 
@@ -298,13 +305,15 @@ In the **Tools Configuration** section, enable tools per phase:
 - **In-Call Tools**: select callable tools for the live conversation (`tools`).
 - **Post-Call Tools**: select webhooks/actions to run after hangup (`post_call_tools`).
 
-> **Global tools** run for all contexts by default. Per context you can opt out via:
+> **Global tools** run for all Agents by default. An Agent can opt out via its advanced settings:
 > - `disable_global_pre_call_tools`
 > - `disable_global_post_call_tools`
 
-### Step 4: Save Context
+### Step 4: Save the Agent and apply inventory changes
 
-Click **Save** to apply the context configuration.
+Click **Save** in the Agent editor. If you also changed a tool definition or global
+inventory, return to **Tools** and click **Save & Apply**. New calls capture the new tool
+generation; active calls keep the generation they started with.
 
 ---
 
@@ -528,7 +537,7 @@ GoHighLevel API endpoints and authentication details can change; validate reques
 ### Webhook Not Triggering
 
 1. **Check Enabled**: Ensure webhook is enabled
-2. **Check Global**: If not global, ensure it's enabled in the context
+2. **Check Global**: If not global, ensure it is enabled on the Agent
 3. **Check Logs**: View ai_engine logs for errors:
    ```bash
    docker logs ai_engine | grep webhook

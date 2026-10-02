@@ -170,11 +170,14 @@ class OpenAIToolAdapter:
             call_id=context['call_id'],
             caller_channel_id=context.get('caller_channel_id'),
             bridge_id=context.get('bridge_id'),
+            caller_number=context.get('caller_number'),
+            caller_name=context.get('caller_name'),
             called_number=context.get('called_number'),
             context_name=context.get('context_name'),
             session_store=context['session_store'],
             ari_client=context['ari_client'],
             config=context.get('config'),
+            tool_registry=self.registry,
             provider_name="openai_realtime",
             user_input=context.get('user_input')
         )
@@ -189,7 +192,7 @@ class OpenAIToolAdapter:
         # Execute tool
         try:
             result = await tool.execute(parameters, exec_context)
-            sanitized = sanitize_tool_result_for_json_string(result)
+            sanitized = sanitize_tool_result_for_json_string(result, tool_name=function_name)
             logger.info(
                 "Tool executed",
                 call_id=context.get("call_id"),
@@ -260,7 +263,7 @@ class OpenAIToolAdapter:
         
         try:
             # Step 1: Send function_call_output
-            safe_result = sanitize_tool_result_for_json_string(result, max_bytes=12000)
+            safe_result = sanitize_tool_result_for_json_string(result, max_bytes=12000, tool_name=function_name)
             output_event = {
                 "type": "conversation.item.create",
                 "item": {

@@ -10,6 +10,7 @@ Tests cover:
 
 import pytest
 from src.config import GoogleProviderConfig
+from src.providers.google_live import build_vertex_live_websocket_url
 
 
 # ---------------------------------------------------------------------------
@@ -46,33 +47,33 @@ def test_google_provider_config_vertex_fields_set():
 # Vertex AI endpoint URL construction
 # ---------------------------------------------------------------------------
 
-def _build_vertex_endpoint(location: str) -> str:
-    """Mirror the endpoint construction logic from google_live.py start_session()."""
-    return (
-        f"wss://{location}-aiplatform.googleapis.com"
-        f"/ws/google.cloud.aiplatform.v1beta1.LlmBidiService/BidiGenerateContent"
-    )
-
-
 def test_vertex_endpoint_default_location():
-    url = _build_vertex_endpoint("us-central1")
+    url = build_vertex_live_websocket_url("us-central1")
     assert url == (
         "wss://us-central1-aiplatform.googleapis.com"
-        "/ws/google.cloud.aiplatform.v1beta1.LlmBidiService/BidiGenerateContent"
+        "/ws/google.cloud.aiplatform.v1.LlmBidiService/BidiGenerateContent"
     )
 
 
 def test_vertex_endpoint_custom_location():
-    url = _build_vertex_endpoint("europe-west4")
+    url = build_vertex_live_websocket_url("europe-west4")
     assert url == (
         "wss://europe-west4-aiplatform.googleapis.com"
-        "/ws/google.cloud.aiplatform.v1beta1.LlmBidiService/BidiGenerateContent"
+        "/ws/google.cloud.aiplatform.v1.LlmBidiService/BidiGenerateContent"
     )
 
 
-def test_vertex_endpoint_uses_v1beta1_not_v1beta():
-    url = _build_vertex_endpoint("us-central1")
-    assert "v1beta1" in url
+@pytest.mark.parametrize("location", ["us", "eu"])
+def test_vertex_multi_region_endpoint(location):
+    assert build_vertex_live_websocket_url(location) == (
+        f"wss://aiplatform.{location}.rep.googleapis.com"
+        "/ws/google.cloud.aiplatform.v1.LlmBidiService/BidiGenerateContent"
+    )
+
+
+def test_vertex_endpoint_uses_v1_not_v1beta():
+    url = build_vertex_live_websocket_url("us-central1")
+    assert ".v1.LlmBidiService" in url
     assert "v1beta.GenerativeService" not in url
 
 

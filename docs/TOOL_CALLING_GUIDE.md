@@ -12,6 +12,7 @@ Complete guide to AI tool calling in Asterisk AI Voice Agent—enabling AI agent
 
 - [Overview](#overview)
 - [Supported Providers](#supported-providers)
+- [Post-Call Reporting Contract](#post-call-reporting-contract)
 - [Available Tools](#available-tools)
 - [Pre-Call Tools (HTTP Lookups)](#pre-call-tools-http-lookups)
 - [In-Call HTTP Tools](#in-call-http-tools)
@@ -52,16 +53,74 @@ Tool calling enables AI agents to perform real-world actions during conversation
 | **OpenAI Realtime** | ✅ Full Support | Production validated (Nov 9, 2025) |
 | **Deepgram Voice Agent** | ✅ Full Support | Production validated (Nov 9, 2025) |
 | **Google Gemini Live** | ✅ Full Support | Production validated (Nov 2025) |
+| **xAI Grok Voice Agent** | ✅ Full Support (v6.5.2) | Custom function-tools identical to OpenAI Realtime schema. xAI-native tools (`web_search`, `x_search`, `file_search`, `mcp`) accepted via YAML `extra_tools` escape hatch — forwarded verbatim to the session. |
+| **ElevenLabs Agent** | ✅ Full Support | Full-agent provider |
 | **Modular Pipelines (local_hybrid)** | ✅ Full Support | Production validated (Nov 19, 2025) - AAVA-85 |
 
 All tools work identically across supported providers—no code changes needed when switching providers.
+
+## Post-Call Reporting Contract
+
+The call-detail API returns terminal in-call executions in the persisted
+`tool_calls` array. `conversation_history` remains transcript-only and must not
+be used as a tool telemetry stream.
+
+Starting with v7.5.3, new entries retain the legacy UI fields and add a stable,
+append-only reduction contract:
+
+```json
+{
+  "type": "tool_result",
+  "call_id": "1785299332.302",
+  "tool_call_id": "provider-call-7",
+  "name": "blind_transfer",
+  "action": "blind_transfer",
+  "status": "success",
+  "target_id": "***REDACTED***",
+  "params": {"destination": "***REDACTED***"},
+  "result": "success",
+  "message": "Transfer accepted for ***REDACTED***",
+  "redaction_mode": "strict",
+  "redacted_fields": ["params.destination", "target_id", "message"],
+  "timestamp": "2026-07-29T04:00:00+00:00",
+  "duration_ms": 121.4
+}
+```
+
+- Native provider identifiers are preserved exactly. Local or pipeline calls
+  without an upstream identifier receive a unique `generated-*` id per
+  invocation; the former `local-{tool_name}` collision is not retained.
+- A provider retry that reuses its tool-call id produces another terminal entry
+  with that same id. Consumers should reduce by `tool_call_id`, not count raw
+  success entries.
+- `target_id` prefers an identifier returned by the tool and falls back to an
+  identifier supplied to compensating actions. This lets a calendar
+  `create_event` followed by `delete_event` reconcile to zero net creations.
+- `status` is normalized to `success` or `failure`; `result` retains the legacy
+  raw status for backward compatibility.
+- `params` is a diagnostic view, not an execution replay payload. Its persistence
+  policy is controlled by `CALL_HISTORY_TOOL_REDACTION_MODE`: `strict` (the
+  default) redacts credentials, caller PII/free text, and routing targets;
+  `show_routing` preserves destinations/extensions/queues/mailboxes while still
+  redacting credentials and caller data; `off` stores tool diagnostics verbatim.
+  Invalid values fail closed to `strict`. The original parameters are always used
+  for execution, regardless of the persistence policy.
+- New entries include `redaction_mode` and `redacted_fields`. Under `strict`, a
+  routing-derived top-level `target_id` is redacted along with its parameter;
+  resource identifiers needed for reducers (for example, calendar event ids)
+  remain available. Messages that echo a redacted parameter are sanitized too.
+  Policy changes affect future entries only, and historical `***REDACTED***` values
+  cannot be recovered.
+- The event records the tool execution fact only. A successful voicemail route
+  does not claim that a message was recorded, and a successful transfer does
+  not claim that a human answered.
 
 ### MCP Tools (Experimental)
 
 This repo is adding support for **MCP-backed tools** (Model Context Protocol) that can be called the same way as built-in tools, using the existing `ToolRegistry` + provider adapters.
 
 - Design + branch guide: `docs/MCP_INTEGRATION.md`
-- Key constraint: MCP tools must be exposed with **provider-safe names** (no `.` namespacing), and must respect `contexts.<name>.tools` allowlisting.
+- Key constraint: MCP tools must be exposed with **provider-safe names** (no `.` namespacing) and respect the selected Agent's tool allowlist.
 
 ### Modular Pipeline Tool Execution
 
@@ -125,9 +184,9 @@ pipelines:
 
 **Transfer Types**:
 
-- **Extension**: Direct dial to specific agent (uses ARI `continue` to the configured dialplan context, default `from-internal`)
-- **Queue**: Transfer to ACD queue for next available agent (uses ARI `continue` to `ext-queues`)
-- **Ring Group**: Transfer to ring group that rings multiple agents (uses ARI `continue` to `ext-group`)
+- **Extension**: Direct dial to specific agent (uses ARI `continue` to the destination/default dialplan context, default `from-internal`)
+- **Queue**: Transfer to ACD queue for next available agent (uses ARI `continue` to the destination/default dialplan context, default `ext-queues`)
+- **Ring Group**: Transfer to ring group that rings multiple agents (uses ARI `continue` to the destination/default dialplan context, default `ext-group`)
 
 **Key Features**:
 - Single unified interface for all transfer types
@@ -154,7 +213,8 @@ AI: "Transferring you to Sales team ring group now."
 ```
 
 **Technical Implementation**:
-- Extension transfers use `continue` to the configured dialplan context (e.g., `from-internal`)
+- Transfer tools can defer the ARI action until caller-facing playback completes, so the handoff sentence is not cut off
+- Dialplan context precedence is `destinations.<key>.dialplan_context`, then the type default (`extension_context`, `queue_context`, `ringgroup_context`), then built-in FreePBX defaults
 - Queue/Ring Group transfers use `continue` (channel leaves Stasis, `transfer_active` flag prevents premature hangup)
 - All transfer types verified in production
 
@@ -221,8 +281,32 @@ AI: "Thank you for calling. Goodbye!"
 - Queries ARI device states (`GET /ari/deviceStates/{deviceStateName}`), typically using `<TECH>/<EXT>`:
   - `PJSIP/2765`
   - `SIP/6000`
+- Also queries any operator-configured custom device states for that extension (see `device_states` below), so a single check can cover both the native SIP/PJSIP device and any custom devstate an operator projects onto it.
+- Each raw device-state value is classified into a `free` / `busy` / `unavailable` bucket via the configurable `state_mapping` (see below), and the tool returns a labeled `availability_status` (`available`, `in_call`, `dnd`, `away`, `on_hold`, `ringing`, `unavailable`) plus an `availability_reason` and a full `device_states[]` breakdown of every value that was checked.
 
-**Configuration (optional but recommended)**:
+**ARI limitation — device state, not presence**: Asterisk's ARI only exposes **device state** (`NOT_INUSE`, `INUSE`, `BUSY`, `RINGING`, `UNAVAILABLE`, etc.), not the AMI presence layer. There is no ARI-native way to read a "Do Not Disturb" or "Away" presence flag. To make DND/away visible to this tool, project it onto a **custom device state** that ARI can see:
+```text
+; Flip a custom devstate from the dialplan, a feature code, or a script:
+devstate change Custom:DND102 BUSY
+```
+or expose it as a hint:
+```text
+exten => 1000,hint,PJSIP/alice,CustomPresence:alice
+```
+Then map that custom device state to the extension in `device_states` (below) with a `status` of `dnd` or `away`. AMI presence itself remains out of scope — only device states are read.
+
+**Configuration — global state mapping (optional)**: `tools.check_extension_status.state_mapping` controls which raw device-state values count as free, busy, or unavailable. Values not listed in `free` or `busy` are treated as `unavailable` (fail-closed).
+```yaml
+tools:
+  check_extension_status:
+    restrict_to_configured_extensions: true
+    state_mapping:
+      free: ["NOT_INUSE"]
+      busy: ["INUSE", "BUSY", "RINGING", "RINGINUSE", "ONHOLD"]
+      unavailable: ["UNAVAILABLE", "INVALID", "UNKNOWN"]
+```
+
+**Configuration — per-extension device states (optional but recommended)**: in addition to the native `dial_string`/`device_state_tech` device, an extension can list additional device states to check (e.g. a custom DND devstate) and the `availability_status` label each should resolve to.
 ```yaml
 tools:
   extensions:
@@ -230,10 +314,27 @@ tools:
       "2765":
         dial_string: "PJSIP/2765"
         device_state_tech: "PJSIP"  # auto | PJSIP | SIP | IAX2 | DAHDI
+        device_states:
+          - id: "Custom:DND2765"
+            status: "dnd"
+          - id: "Custom:Away2765"
+            status: "away"
 ```
 
+> **Use the full ARI device-state name, including the `Custom:` prefix.** The `id`
+> is looked up verbatim over ARI (`GET /deviceStates/{id}`). `Custom:DND2765` resolves;
+> a bare `DND2765` does not exist, returns `INVALID`, and — being fail-closed — would
+> report the extension **unavailable on every call**. Verify the exact name with
+> `asterisk -rx "devstate list" | grep -i dnd`.
+>
+> **FreePBX:** dialing the DND feature code (`*78`) flips `Custom:DND<ext>` to `BUSY`
+> (e.g. `*78` on 2765 → `Custom:DND2765 = BUSY`), so `id: "Custom:DND<ext>"` with
+> `status: dnd` is the value to configure. The native `PJSIP/<ext>` device state does
+> **not** reflect DND — it stays `NOT_INUSE` unless the endpoint is actually on a call —
+> which is why the custom state must be listed explicitly.
+
 **Tool output**:
-- Returns `device_state` and `available` (boolean).
+- Returns `device_state` and `available` (boolean) for backward compatibility, plus `availability_status`, `availability_reason`, and `device_states[]` (each entry's raw id, value, and resolved bucket/status).
 
 ### Business Tools
 
@@ -327,7 +428,26 @@ tools:
       customer_name: "contacts[0].firstName"
       customer_email: "contacts[0].email"
       account_type: "contacts[0].customFields.account_type"
+    call_metadata_fields:
+      account_type:
+        persist: true
+        correctable: true
+        description: "Caller-confirmed account type"
+        max_length: 64
 ```
+
+`output_variables` remain prompt-only by default. Under **Tools → Pre-Call HTTP
+Lookups**, enable **Persist in Call History** on an individual output to copy it
+into the bounded `call_metadata` object. Enable **Allow Agent to correct** only
+when the value is safe for the caller to correct, then explicitly assign the
+built-in `update_call_metadata` tool to the Agent. The correction tool is not
+global and is absent from a live call unless that call has at least one selected,
+correctable field.
+
+Call metadata is intentionally non-authoritative: reserved caller, routing,
+consent/DNC, transfer, disposition, provider, and credential-like names are
+rejected. Values are scalar and bounded. Corrections apply only to the active
+call; they do not write back to the CRM or affect another call.
 
 **Variable Substitution**:
 
@@ -489,8 +609,9 @@ contexts:
 In-call HTTP tools have access to three types of variables:
 
 1. **Context variables** (auto-injected): `{caller_number}`, `{called_number}`, `{call_id}`, etc.
-2. **Pre-call variables** (from pre-call HTTP lookups): `{customer_id}`, `{customer_name}`, etc.
-3. **AI parameters** (provided at runtime): Whatever the AI passes when invoking the tool
+2. **Effective call metadata**, when selected: corrected values such as `{customer_id}`
+3. **Pre-call variables** (from pre-call HTTP lookups): `{customer_id}`, `{customer_name}`, etc.
+4. **AI parameters** (provided at runtime): Whatever the AI passes when invoking the tool
 
 This means you can use data fetched by pre-call tools in your in-call tool requests. For example, if a pre-call lookup fetches `customer_id`, you can use `{customer_id}` in the in-call tool's body template.
 
@@ -619,7 +740,7 @@ tools:
         "start_time": "{call_start_time}",
         "end_time": "{call_end_time}",
         "transcript": {transcript_json},
-        "summary": "{summary}",
+        "summary": {summary_json},
         "summary_json": {summary_json}
       }
 ```
@@ -633,18 +754,27 @@ tools:
     enabled: true
     is_global: true
     url: "https://api.crm.com/calls"
-    generate_summary: true        # Generate AI summary using OpenAI
-    summary_max_words: 100        # Limit summary length
+    generate_summary: true
+    summary_provider: deepseek_llm # Enabled providers.<name> modular LLM key
+    summary_max_words: 100
+    summary_timeout_ms: 15000
+    summary_prompt: |-
+      Write a factual CRM note in {max_words} words or less. Include the
+      caller's request, commitments, and final outcome.
     payload_template: |
       {
         "phone": "{caller_number}",
-        "summary": "{summary}",
+        "summary": {summary_json},
         "summary_json": {summary_json},
         "transcript": {transcript_json}
       }
 ```
 
-When `generate_summary: true`, the tool uses OpenAI to create a concise summary of the conversation before sending the webhook.
+When `generate_summary: true`, the tool invokes the exact configured `summary_provider` before sending the webhook. The transcript is passed as user content and `summary_prompt` is passed as the system instruction; `{max_words}` is the only supported prompt placeholder. If the selected provider is disabled, missing credentials, times out, or fails, the webhook still runs with an empty `{summary}` and records summary diagnostics in Call History. It never falls back to another provider, which prevents unintended transcript egress.
+
+Provider API keys are configured under **Admin UI → Providers**, not on the webhook. Cloud modular LLMs support provider-scoped key uploads stored as owner-only files. Provider/credential changes require an AI Engine restart; tool prompt, provider selection, word-limit, and timeout changes hot-reload for new calls.
+
+Existing webhook definitions that enable summaries but omit `summary_provider` keep the legacy `OPENAI_API_KEY` with `gpt-4o-mini` behavior for backward compatibility. Set an explicit provider to use the configurable path.
 
 **Payload Variables**:
 
@@ -658,6 +788,13 @@ When `generate_summary: true`, the tool uses OpenAI to create a concise summary 
 | `{provider}` | string | AI provider (deepgram, openai_realtime, etc.) |
 | `{call_direction}` | string | "inbound" or "outbound" |
 | `{call_duration}` | number | Duration in seconds |
+| `{pre_call_results_json}` | JSON string | Original pre-call lookup snapshot; never rewritten by corrections |
+| `{call_metadata_json}` | JSON string | Final selected metadata values after any in-call corrections |
+
+Individual selected metadata fields are also available by name. Their final
+value overrides the same custom pre-call placeholder, while built-in call fields
+always win. Call History supports exact field/value filtering and includes the
+final object in CSV and JSON exports.
 | `{call_outcome}` | string | Outcome (completed, transferred, etc.) |
 | `{call_start_time}` | string | ISO timestamp |
 | `{call_end_time}` | string | ISO timestamp |
@@ -773,13 +910,25 @@ tools:
   # ----------------------------------------------------------------------------
   transfer:
     enabled: true
+    technology: "PJSIP"                    # Channel technology for direct extension dialing
+    defer_until_playback_complete: true    # Speak handoff text before blind/live/attended transfer actions
+    deferred_strategy: "drain_then_dial"   # Or "predial_then_bridge" to dial while handoff audio plays
+    deferred_audio_drain_timeout_sec: 15   # Safety ceiling; timeout cancels the transfer and resumes the AI
+    deferred_audio_drain_quiet_ms: 500     # Require this much quiet after the caller-facing queue drains
+    predial_bridge_wait_timeout_sec: 10    # Wait after handoff audio for a predialed destination answer
+    predial_timeout_seconds: 30            # Asterisk originate timeout for predialed destination leg
+    predial_wait_moh_class: "default"      # MOH class while waiting for predial destination answer
+    extension_context: "from-internal"     # Default for extension destinations
+    queue_context: "ext-queues"            # Default for queue destinations
+    ringgroup_context: "ext-group"         # Default for ring group destinations
     destinations:
-      # Direct extension transfers (using redirect - stays in Stasis)
+      # Direct extension transfers
       sales_agent:
         type: extension
         target: "2765"
         description: "Sales agent"
-        attended_allowed: true         # Allows attended_transfer (warm transfer) to this destination
+        dialplan_context: "from-internal"  # Optional per-destination override
+        attended_allowed: true             # Allows attended_transfer (warm transfer) to this destination
       
       support_agent:
         type: extension
@@ -792,6 +941,7 @@ tools:
         type: queue
         target: "300"
         description: "Sales team queue"
+        dialplan_context: "ext-queues"  # Optional per-destination override
       
       support_queue:
         type: queue
@@ -808,6 +958,7 @@ tools:
         type: ringgroup
         target: "600"
         description: "Sales team ring group"
+        dialplan_context: "ext-group"  # Optional per-destination override
       
       support_team:
         type: ringgroup
@@ -902,6 +1053,9 @@ tools:
     enabled: true
     require_confirmation: false        # Don't ask "shall I hang up?"
     farewell_message: "Thank you for calling. Goodbye!"
+    # Global end-of-call intent markers remain the default for every Agent.
+    # Agents can inherit, extend, or replace them in:
+    # Admin UI → Agents → Edit Agent → Tools → Hangup Guardrail.
   
   # ----------------------------------------------------------------------------
   # LEAVE_VOICEMAIL - Send caller to voicemail
@@ -924,17 +1078,17 @@ tools:
     from_email: "agent@yourdomain.com"
     from_name: "AI Voice Agent"
     admin_email: "admin@yourdomain.com"
-    # Optional: route different contexts to different inboxes
+    # Legacy YAML routing maps (v7.4 operators normally configure email on Agents)
     # admin_email_by_context:
     #   support: "support@yourdomain.com"
     #   sales: "sales@yourdomain.com"
-    # Optional: route sender address per context
+    # Legacy sender routing map
     # from_email_by_context:
     #   support: "support-bot@yourdomain.com"
     #   sales: "sales-bot@yourdomain.com"
     include_transcript: true
     include_metadata: true
-    # Optional: subject prefix and per-context overrides
+    # Optional: subject prefix and legacy per-context overrides
     # subject_prefix: "[AAVA]"
     # subject_prefix_by_context:
     #   support: "[Support]"
@@ -975,6 +1129,20 @@ tools:
     # html_template: |
     #   <html>...</html>
 ```
+
+**Farewell completion:** The engine waits for caller-facing audio to drain before
+hanging up. The legacy root-level and provider-level `farewell_hangup_delay_sec`
+fields are deprecated and ignored; existing values remain loadable but add no
+extra pause. They are no longer editable in the Admin UI. For Local AI,
+`farewell_mode` and `farewell_timeout_sec` remain supported and have separate
+purposes.
+
+The modular pipeline also handles a spoken farewell without a `hangup_call`
+tool invocation when both caller end-of-call intent and an assistant farewell
+are recognized. It plays the response, drains audio, and hangs up. This fallback
+does not depend on `farewell_hangup_delay_sec` and is not a guarantee that every
+model response will be recognized as a closing.
+
 
 ### Enable Tools per Context / Pipeline (Allowlisting)
 
@@ -1092,14 +1260,14 @@ exten => s,1,NoOp(AI Agent - Basic)
 ```asterisk
 [from-ai-agent-support]
 exten => s,1,NoOp(AI Agent - Support Line)
- same => n,Set(AI_CONTEXT=support)           ; Support persona
+ same => n,Set(AI_AGENT=support)             ; Support Agent slug
  same => n,Set(AI_PROVIDER=openai_realtime)  ; Fast provider
  same => n,Stasis(asterisk-ai-voice-agent)
  same => n,Hangup()
 
 [from-ai-agent-sales]
 exten => s,1,NoOp(AI Agent - Sales Line)
- same => n,Set(AI_CONTEXT=sales)
+ same => n,Set(AI_AGENT=sales)
  same => n,Stasis(asterisk-ai-voice-agent)
  same => n,Hangup()
 ```
@@ -1194,6 +1362,7 @@ You: "Please transfer me to support"
 Expected: Caller hears MOH while agent is contacted
 Expected: Destination hears announcement + DTMF prompt
 Expected: Agent presses 1 → caller bridged to destination; AI audio removed
+Expected with FreePBX pickup groups: a different group phone may answer the ringing destination with the configured pickup feature code; that pickup phone receives the same announcement and must still press the configured acceptance digit before bridging
 ```
 
 **3. Verify in Logs**:
@@ -1441,6 +1610,7 @@ request_transcript:
 **Provider Adapters**:
 - `src/tools/adapters/deepgram.py` (202 lines) - Deepgram integration
 - `src/tools/adapters/openai.py` (215 lines) - OpenAI Realtime integration
+- `src/tools/adapters/grok.py` (266 lines) - xAI Grok integration (OpenAI-Realtime-compatible function schema + `extra_tools` escape hatch for xAI-native tools)
 
 **Tools**:
 - `src/tools/telephony/unified_transfer.py` - Unified transfer tool (registered as `blind_transfer`; aliases: `transfer`, `transfer_call`, `transfer_to_queue`)

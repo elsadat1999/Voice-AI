@@ -30,6 +30,11 @@ spec.loader.exec_module(_parent_config)
 AsteriskConfig = _parent_config.AsteriskConfig
 ExternalMediaConfig = _parent_config.ExternalMediaConfig
 AudioSocketConfig = _parent_config.AudioSocketConfig
+WebSocketMediaAuthConfig = _parent_config.WebSocketMediaAuthConfig
+WebSocketMediaTLSConfig = _parent_config.WebSocketMediaTLSConfig
+WebSocketMediaConfig = _parent_config.WebSocketMediaConfig
+supports_media_websocket = _parent_config.supports_media_websocket
+media_websocket_capability_reason = _parent_config.media_websocket_capability_reason
 LocalProviderConfig = _parent_config.LocalProviderConfig
 DeepgramProviderConfig = _parent_config.DeepgramProviderConfig
 OpenAIProviderConfig = _parent_config.OpenAIProviderConfig
@@ -40,7 +45,9 @@ GroqSTTProviderConfig = _parent_config.GroqSTTProviderConfig
 GroqTTSProviderConfig = _parent_config.GroqTTSProviderConfig
 ElevenLabsProviderConfig = _parent_config.ElevenLabsProviderConfig
 CambAiProviderConfig = _parent_config.CambAiProviderConfig
+FishAudioProviderConfig = _parent_config.FishAudioProviderConfig
 OpenAIRealtimeProviderConfig = _parent_config.OpenAIRealtimeProviderConfig
+GrokProviderConfig = _parent_config.GrokProviderConfig
 AzureSTTProviderConfig = _parent_config.AzureSTTProviderConfig
 AzureTTSProviderConfig = _parent_config.AzureTTSProviderConfig
 validate_azure_region = _parent_config.validate_azure_region
@@ -52,6 +59,7 @@ MCPServerDefaultsConfig = _parent_config.MCPServerDefaultsConfig
 BargeInConfig = _parent_config.BargeInConfig
 LLMConfig = _parent_config.LLMConfig
 VADConfig = _parent_config.VADConfig
+NoInputConfig = _parent_config.NoInputConfig
 StreamingConfig = _parent_config.StreamingConfig
 LoggingConfig = _parent_config.LoggingConfig
 PipelineEntry = _parent_config.PipelineEntry
@@ -63,6 +71,11 @@ __all__ = [
     'AsteriskConfig',
     'ExternalMediaConfig',
     'AudioSocketConfig',
+    'WebSocketMediaAuthConfig',
+    'WebSocketMediaTLSConfig',
+    'WebSocketMediaConfig',
+    'supports_media_websocket',
+    'media_websocket_capability_reason',
     'LocalProviderConfig',
     'DeepgramProviderConfig',
     'OpenAIProviderConfig',
@@ -73,7 +86,9 @@ __all__ = [
     'GroqTTSProviderConfig',
     'ElevenLabsProviderConfig',
     'CambAiProviderConfig',
+    'FishAudioProviderConfig',
     'OpenAIRealtimeProviderConfig',
+    'GrokProviderConfig',
     'AzureSTTProviderConfig',
     'AzureTTSProviderConfig',
     'validate_azure_region',
@@ -85,6 +100,7 @@ __all__ = [
     'BargeInConfig',
     'LLMConfig',
     'VADConfig',
+    'NoInputConfig',
     'StreamingConfig',
     'LoggingConfig',
     'PipelineEntry',

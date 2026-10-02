@@ -1,6 +1,8 @@
 import asyncio
 import base64
+import io
 import json
+import wave
 
 import pytest
 
@@ -138,17 +140,26 @@ async def test_google_llm_adapter_generate(monkeypatch):
     )
 
     await adapter.start()
+    summary_prompt = "Summarize the call. Do not use the agent persona."
     reply = await adapter.generate(
         "call-1",
         "hello there",
-        {"system_prompt": "You are friendly."},
-        {"temperature": 0.2},
+        {"system_prompt": summary_prompt},
+        {
+            "temperature": 0.2,
+            "system_prompt": summary_prompt,
+            "instructions": summary_prompt,
+        },
     )
     assert reply.text == "response from gemini"
 
     request = fake_session.requests[0]
     assert request["params"]["key"] == "test-google-key"
     assert request["json"]["generationConfig"]["temperature"] == 0.2
+    assert request["json"]["systemInstruction"] == {
+        "parts": [{"text": summary_prompt}],
+    }
+    assert request["json"]["contents"][0]["parts"][0]["text"] == "hello there"
 
 
 @pytest.mark.asyncio
@@ -179,6 +190,26 @@ async def test_google_tts_adapter_synthesizes_chunks():
     request = fake_session.requests[0]
     assert request["params"]["key"] == "test-google-key"
     assert request["json"]["voice"]["name"] == "en-US-Neural2-C"
+
+
+def test_google_tts_strips_linear16_wav_container_before_playback():
+    pcm_audio = b"\x00\x10" * 320
+    wav_buffer = io.BytesIO()
+    with wave.open(wav_buffer, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(16000)
+        wav_file.writeframes(pcm_audio)
+
+    converted = GoogleTTSAdapter._convert_audio(
+        wav_buffer.getvalue(),
+        "LINEAR16",
+        16000,
+        "linear16",
+        16000,
+    )
+
+    assert converted == pcm_audio
 
 
 @pytest.mark.asyncio

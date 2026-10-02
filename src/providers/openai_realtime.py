@@ -13,6 +13,7 @@ import asyncio
 import base64
 import contextlib
 import json
+import os
 import time
 import uuid
 import audioop
@@ -30,12 +31,14 @@ from ..audio import (
     convert_pcm16le_to_target_format,
     mulaw_to_pcm16le,
     resample_audio,
+    resolve_output_resampler_policy,
 )
 from ..config import OpenAIRealtimeProviderConfig
 
 # Tool calling support
 from src.tools.registry import tool_registry
 from src.tools.adapters.openai import OpenAIToolAdapter
+from src.tools.execution_history import record_in_call_tool_result
 
 logger = get_logger(__name__)
 
@@ -69,6 +72,12 @@ _OPENAI_SESSION_AUDIO_INFO = Info(
     "OpenAI Realtime session audio format assumptions and provider acknowledgements",
 )
 
+# GA voice catalog (closed list) — single-sourced from the shared voice
+# catalog; used to soft-validate per-agent voice overrides. An unknown value
+# falls back to the provider's configured voice instead of reaching the OpenAI
+# session, because the agent voice field was free-text/display-only pre-7.3.0.
+from ..utils.voice_catalog import OPENAI_GA_VOICES  # noqa: E402  (re-exported)
+
 
 class OpenAIRealtimeProvider(AIProviderInterface):
     """
@@ -90,22 +99,36 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         gating_manager=None,
     ):
         super().__init__(on_event)
+        self.set_provider_identity(provider_key="openai_realtime", provider_kind="openai_realtime")
         self.config = config
         self.websocket: Optional[ClientConnection] = None
         self._receive_task: Optional[asyncio.Task] = None
         self._keepalive_task: Optional[asyncio.Task] = None
         self._send_lock = asyncio.Lock()
 
+        # One-shot guard for the api_version=beta deprecation warning.
+        # OpenAI sunset the Beta Realtime API on 2026-05-12; we log a single
+        # warning per provider lifetime when a config still pins beta so
+        # operators can correlate the OpenAI 'beta_api_shape_disabled' error
+        # back to the YAML override. See _warn_if_beta_deprecated().
+        self._beta_warned: bool = False
+
         self._call_id: Optional[str] = None
+        self._session_voice: Optional[str] = None  # Per-call voice override from agent/context
         self._pending_response: bool = False
         self._current_response_id: Optional[str] = None  # Track active response for cancellation
         self._greeting_response_id: Optional[str] = None  # Track greeting to protect from barge-in
         self._greeting_completed: bool = False  # Track if greeting has finished
+        # GA server VAD cannot be disabled for the greeting. Keep caller input
+        # silent until the engine confirms caller-facing transport drain.
+        self._greeting_transport_guard_active: bool = False
+        self._greeting_guard_silence_logged: bool = False
         # Debounce engine-level barge-in signals (prevents flush storms).
         self._last_barge_in_emit_ts: float = 0.0
         self._farewell_response_id: Optional[str] = None  # Track farewell response for hangup
         self._hangup_after_response: bool = False  # Flag to trigger hangup after next response
         self._farewell_timeout_task: Optional[asyncio.Task] = None  # Timeout fallback for hangup
+        self._farewell_timeout_seconds: float = 5.0
         self._greeting_vad_task: Optional[asyncio.Task] = None
         self._background_tasks: set[asyncio.Task] = set()
         self._in_audio_burst: bool = False
@@ -128,6 +151,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         self._recent_tool_call_id_ttl_s: float = 30.0
         # For farewells, wait for output_audio.done before emitting HangupReady to avoid cutting off speech.
         self._farewell_waiting_for_audio_done: bool = False
+        self._farewell_response_done: bool = False
         self._response_audio_start_time: Optional[float] = None  # Track when audio started for interruption cooldown
         self._min_response_time_before_interrupt: float = 2.5  # Minimum seconds of audio before allowing interruption (increased for farewells)
         self._first_output_chunk_logged: bool = False
@@ -136,7 +160,26 @@ class OpenAIRealtimeProvider(AIProviderInterface):
 
         self._input_resample_state: Optional[tuple] = None
         self._output_resample_state: Optional[tuple] = None
-        self._transcript_buffer: str = ""
+        self._output_resampler_environment_variable = "AAVA_OPENAI_OUTPUT_RESAMPLER"
+        configured_output_resampler, output_resampler_source = (
+            resolve_output_resampler_policy(
+                profile_mode="linear",
+                provider_mode=getattr(config, "output_resampler", "inherit"),
+                environment_mode=os.getenv(
+                    self._output_resampler_environment_variable
+                ),
+            )
+        )
+        if output_resampler_source.endswith("invalid-fallback"):
+            logger.warning(
+                "Invalid OpenAI output resampler; using compatibility default",
+                source=output_resampler_source,
+                fallback="linear",
+            )
+        self._output_resampler_mode: str = configured_output_resampler
+        self._output_resampler_source: str = output_resampler_source
+        self._output_resampler_logged: bool = False
+        self._assistant_transcript_buffers: Dict[str, str] = {}
         self._input_info_logged: bool = False
         self._allowed_tools: Optional[List[str]] = None
         
@@ -290,7 +333,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         return ProviderCapabilities(
             # Audio format capabilities
             input_encodings=["ulaw", "linear16"],
-            input_sample_rates_hz=[8000, 16000],
+            input_sample_rates_hz=[24000, 16000, 8000],
             # Output depends on session.update and downstream target; we advertise both
             output_encodings=["mulaw", "pcm16"],
             output_sample_rates_hz=[8000, 24000],
@@ -302,6 +345,10 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             has_native_barge_in=True,  # Handles interruptions via cancel_response
             has_native_aec=False,  # AEC only available on client-side WebRTC paths, not server-side WebSocket
             requires_continuous_audio=True,  # Needs continuous audio for server-side VAD
+            wideband_input_encoding="linear16",
+            wideband_input_sample_rate_hz=24000,
+            wideband_output_encoding="pcm16",
+            wideband_output_sample_rate_hz=24000,
         )
     
     def parse_ack(self, event_data: Dict[str, Any]) -> Optional[ProviderCapabilities]:
@@ -366,10 +413,17 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         self._call_id = call_id
         self._pending_response = False
         self._in_audio_burst = False
+        self._current_response_id = None
+        self._farewell_response_id = None
+        self._farewell_waiting_for_audio_done = False
+        self._farewell_response_done = False
+        self._hangup_after_response = False
+        self._audio_seen_response_ids.clear()
         self._first_output_chunk_logged = False
         self._input_resample_state = None
         self._output_resample_state = None
-        self._transcript_buffer = ""
+        self._output_resampler_logged = False
+        self._assistant_transcript_buffers.clear()
         self._closing = False
         self._closed = False
         
@@ -385,10 +439,13 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         else:
             self._allowed_tools = []
 
+        self._set_session_voice_from_context(context)
+
         self._reset_output_meter()
 
         url = self._build_ws_url()
         use_beta = getattr(self.config, 'api_version', 'ga').lower() == 'beta'
+        self._warn_if_beta_deprecated(call_id)
         headers = [
             ("Authorization", f"Bearer {self.config.api_key}"),
         ]
@@ -559,6 +616,15 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             
             if not pcm16:
                 return
+
+            if self._greeting_transport_guard_active:
+                pcm16 = b"\x00" * len(pcm16)
+                if not self._greeting_guard_silence_logged:
+                    logger.info(
+                        "Silencing OpenAI caller input until greeting transport drains",
+                        call_id=self._call_id,
+                    )
+                    self._greeting_guard_silence_logged = True
             
             # ECHO GATING for speakerphone support:
             # Gate input ONLY while we're outputting real audio from OpenAI.
@@ -567,7 +633,11 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             # 
             # When _pacer_underruns > 0, we're just emitting silence - allow input.
             try:
-                if self._in_audio_burst and self._pacer_underruns == 0:
+                if (
+                    not self._greeting_transport_guard_active
+                    and self._in_audio_burst
+                    and self._pacer_underruns == 0
+                ):
                     # Agent is outputting REAL audio - gate input to prevent echo
                     return
             except Exception:
@@ -581,6 +651,63 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             await self._reconnect_with_backoff()
         except Exception:
             logger.error("Failed to send audio to OpenAI Realtime", call_id=self._call_id, exc_info=True)
+
+    async def release_greeting_transport_guard(self) -> None:
+        """Resume real caller input after the greeting is fully emitted to the caller."""
+        if not self._greeting_transport_guard_active:
+            return
+        try:
+            async with self._audio_lock:
+                self._pending_audio_provider_rate.clear()
+            if self.websocket and self.websocket.state.name == "OPEN":
+                await self._send_json(
+                    {
+                        "type": "input_audio_buffer.clear",
+                        "event_id": f"clear-greeting-{uuid.uuid4()}",
+                    }
+                )
+        except Exception:
+            logger.warning(
+                "Failed clearing OpenAI input buffer at greeting drain boundary",
+                call_id=self._call_id,
+                exc_info=True,
+            )
+        finally:
+            self._greeting_transport_guard_active = False
+            self._greeting_guard_silence_logged = False
+            logger.info(
+                "OpenAI greeting transport guard released",
+                call_id=self._call_id,
+            )
+
+    async def speak_text(self, text: str) -> bool:
+        """Create a tools-disabled response in the active configured voice."""
+        if not text or not self.websocket or self.websocket.state.name != "OPEN":
+            return False
+        response: Dict[str, Any] = {
+            "instructions": (
+                "Speak exactly the sentence between <message> tags. Do not add, remove, "
+                f"or paraphrase words. Do not call tools. <message>{text}</message>"
+            ),
+            "tools": [],
+        }
+        if not self._is_ga:
+            response["modalities"] = self._response_modalities
+            response["input"] = []
+        try:
+            await self._send_json(
+                {
+                    "type": "response.create",
+                    "event_id": f"resp-no-input-{uuid.uuid4()}",
+                    "response": response,
+                }
+            )
+            self._pending_response = True
+            logger.info("Sent no-input announcement to OpenAI", call_id=self._call_id, text_preview=text[:80])
+            return True
+        except Exception:
+            logger.warning("Failed to send no-input announcement to OpenAI", call_id=self._call_id, exc_info=True)
+            return False
 
     async def cancel_response(self):
         """Cancel any in-progress response generation (for barge-in)."""
@@ -670,6 +797,19 @@ class OpenAIRealtimeProvider(AIProviderInterface):
 
         Routes the function call to the appropriate tool via the tool adapter.
         """
+        item = event_data.get("item", {})
+        function_name = item.get("name")
+        function_call_id = item.get("call_id")
+        raw_parameters = item.get("arguments", {})
+        try:
+            parameters = json.loads(raw_parameters) if isinstance(raw_parameters, str) else raw_parameters
+        except (TypeError, json.JSONDecodeError):
+            parameters = {}
+        if not isinstance(parameters, dict):
+            parameters = {}
+        tool_started_at = time.time()
+        tool_result_recorded = False
+
         try:
             # Build context for tool execution
             # These will be injected by the engine when it sets up the provider
@@ -677,6 +817,8 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 'call_id': self._call_id,
                 'caller_channel_id': getattr(self, '_caller_channel_id', None),
                 'bridge_id': getattr(self, '_bridge_id', None),
+                'caller_number': getattr(self, '_caller_number', None),
+                'caller_name': getattr(self, '_caller_name', None),
                 'called_number': getattr(self, '_called_number', None),
                 'context_name': getattr(self, '_context_name', None),
                 'session_store': getattr(self, '_session_store', None),
@@ -691,8 +833,6 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             result = await self.tool_adapter.handle_tool_call_event(event_data, context)
 
             # Check if this is a hangup_call tool that will trigger hangup
-            item = event_data.get("item", {})
-            function_name = item.get("name")
             if function_name == "hangup_call" and result:
                 # Check if tool result indicates hangup will occur
                 # Tool adapter returns result directly in top-level dict
@@ -704,6 +844,26 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                         function_name=function_name,
                         farewell=result.get("message")
                     )
+
+            tool_result_recorded = True
+            try:
+                await record_in_call_tool_result(
+                    session_store=getattr(self, "_session_store", None),
+                    call_id=self._call_id,
+                    tool_call_id=function_call_id,
+                    tool_name=function_name,
+                    canonical_name=tool_registry.canonicalize_tool_name(function_name),
+                    parameters=parameters,
+                    result=result,
+                    duration_ms=(time.time() - tool_started_at) * 1000,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to persist OpenAI tool result",
+                    call_id=self._call_id,
+                    tool_call_id=function_call_id,
+                    exc_info=True,
+                )
 
             # Wait for response.done before submitting function_call_output (see
             # _await_parent_response_done for the full rationale).
@@ -760,29 +920,27 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                     except Exception:
                         logger.debug("Failed to send farewell response.create", call_id=self._call_id, exc_info=True)
             
-            # Log tool call to session for call history (Milestone 21)
-            try:
-                session_store = getattr(self, '_session_store', None)
-                if session_store and self._call_id and function_name:
-                    from datetime import datetime
-                    session = await session_store.get_by_call_id(self._call_id)
-                    if session:
-                        tool_record = {
-                            "name": function_name,
-                            "params": item.get("arguments", {}),
-                            "result": result.get("status", "unknown") if isinstance(result, dict) else "success",
-                            "message": result.get("message", "") if isinstance(result, dict) else str(result),
-                            "timestamp": datetime.now().isoformat(),
-                            "duration_ms": 0,
-                        }
-                        if not hasattr(session, 'tool_calls') or session.tool_calls is None:
-                            session.tool_calls = []
-                        session.tool_calls.append(tool_record)
-                        await session_store.upsert_call(session)
-                        logger.debug("Tool call logged to session", call_id=self._call_id, tool=function_name)
-            except Exception as log_err:
-                logger.debug(f"Failed to log tool call to session: {log_err}", call_id=self._call_id)
-            
+        except asyncio.CancelledError:
+            if not tool_result_recorded:
+                try:
+                    await record_in_call_tool_result(
+                        session_store=getattr(self, "_session_store", None),
+                        call_id=self._call_id,
+                        tool_call_id=function_call_id,
+                        tool_name=function_name,
+                        canonical_name=tool_registry.canonicalize_tool_name(function_name),
+                        parameters=parameters,
+                        result={"status": "cancelled", "message": "Tool execution cancelled"},
+                        duration_ms=(time.time() - tool_started_at) * 1000,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to persist cancelled OpenAI tool result",
+                        call_id=self._call_id,
+                        tool_call_id=function_call_id,
+                        exc_info=True,
+                    )
+            raise
         except Exception as e:
             logger.error(
                 "Function call handling failed",
@@ -790,6 +948,25 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 error=str(e),
                 exc_info=True
             )
+            if not tool_result_recorded:
+                try:
+                    await record_in_call_tool_result(
+                        session_store=getattr(self, "_session_store", None),
+                        call_id=self._call_id,
+                        tool_call_id=function_call_id,
+                        tool_name=function_name,
+                        canonical_name=tool_registry.canonicalize_tool_name(function_name),
+                        parameters=parameters,
+                        result={"status": "error", "message": str(e)},
+                        duration_ms=(time.time() - tool_started_at) * 1000,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to persist failed OpenAI tool result",
+                        call_id=self._call_id,
+                        tool_call_id=function_call_id,
+                        exc_info=True,
+                    )
             # Send error response to OpenAI in correct format
             try:
                 item = event_data.get("item", {})
@@ -839,6 +1016,13 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             
             # Cancel farewell timeout if active
             self._cancel_farewell_timeout()
+            farewell_response_id = self._farewell_response_id
+            self._farewell_response_id = None
+            self._farewell_waiting_for_audio_done = False
+            self._farewell_response_done = False
+            self._hangup_after_response = False
+            if farewell_response_id:
+                self._audio_seen_response_ids.discard(farewell_response_id)
 
             if self._greeting_vad_task and not self._greeting_vad_task.done():
                 self._greeting_vad_task.cancel()
@@ -880,13 +1064,18 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 logger.debug("Failed to release response.done sentinels on stop_session", exc_info=True)
             self.websocket = None
             self._call_id = None
+            self._session_voice = None
             self._closing = False
             self._closed = True
             self._pending_response = False
             self._in_audio_burst = False
+            self._current_response_id = None
+            self._audio_seen_response_ids.clear()
+            self._greeting_transport_guard_active = False
+            self._greeting_guard_silence_logged = False
             self._input_resample_state = None
             self._output_resample_state = None
-            self._transcript_buffer = ""
+            self._assistant_transcript_buffers.clear()
             logger.info("OpenAI Realtime session stopped")
             self._clear_metrics(previous_call_id)
 
@@ -895,9 +1084,35 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             "name": "OpenAIRealtimeProvider",
             "type": "cloud",
             "model": self.config.model,
-            "voice": self.config.voice,
+            "voice": self._session_voice or self.config.voice,
             "supported_codecs": self.supported_codecs,
         }
+
+    def _set_session_voice_from_context(self, context: Optional[Dict[str, Any]]) -> None:
+        """Apply a per-agent/per-call voice override with soft validation.
+
+        Unknown values (the field was display-only free text before v7.3.0)
+        fall back to the configured provider voice; the call never fails.
+        """
+        self._session_voice = None
+        raw = (context or {}).get("voice")
+        if not isinstance(raw, str) or not raw.strip():
+            return
+        candidate = raw.strip().lower()
+        if candidate not in OPENAI_GA_VOICES:
+            logger.warning(
+                "Agent voice not in OpenAI GA catalog; falling back to provider default",
+                call_id=self._call_id,
+                requested_voice=raw.strip(),
+                fallback_voice=self.config.voice,
+            )
+            return
+        self._session_voice = candidate
+        logger.info(
+            "Using per-call OpenAI voice override",
+            call_id=self._call_id,
+            voice=candidate,
+        )
 
     def is_ready(self) -> bool:
         return bool(self.config.api_key)
@@ -937,6 +1152,31 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             base = "wss://api.openai.com/v1/realtime"
         base = base.rstrip("/")
         return f"{base}?model={self.config.model}"
+
+    def _warn_if_beta_deprecated(self, call_id: Optional[str]) -> None:
+        """One-shot warning when api_version=beta is configured.
+
+        OpenAI sunset the Beta Realtime API on 2026-05-12; calls with
+        api_version=beta now fail with `beta_api_shape_disabled` on the
+        first session frame. We can't tell the operator's YAML override
+        from a real outage, so we log a single warning per provider
+        lifetime so the cause is unambiguous in the logs.
+
+        Gated by self._beta_warned to fire exactly once across both
+        start_session() and the reconnect path — code paths share the
+        same provider instance.
+        """
+        use_beta = getattr(self.config, 'api_version', 'ga').lower() == 'beta'
+        if not use_beta or self._beta_warned:
+            return
+        logger.warning(
+            "OpenAI Realtime api_version=beta is set, but OpenAI sunset the "
+            "Beta Realtime API on 2026-05-12. Calls will fail with "
+            "beta_api_shape_disabled. Change api_version to 'ga' in your "
+            "config — see docs/MIGRATION.md.",
+            call_id=call_id,
+        )
+        self._beta_warned = True
 
     async def _send_session_update(self):
         # Map config modalities to output_modalities per latest guide
@@ -1002,7 +1242,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                     "input": audio_input,
                     "output": {
                         "format": {"type": "audio/pcm", "rate": 24000},
-                        "voice": self.config.voice,
+                        "voice": self._session_voice or self.config.voice,
                     },
                 },
             }
@@ -1023,7 +1263,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 "modalities": output_modalities,
                 "input_audio_format": in_fmt,
                 "output_audio_format": out_fmt,
-                "voice": self.config.voice,
+                "voice": self._session_voice or self.config.voice,
                 "input_audio_transcription": {
                     "model": "whisper-1"
                 },
@@ -1162,6 +1402,10 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         )
 
         await self._send_json(response_payload)
+        # Activate only after response.create is accepted by the websocket.
+        # A failed greeting request must not leave caller input muted forever.
+        self._greeting_transport_guard_active = True
+        self._greeting_guard_silence_logged = False
         self._pending_response = True
         
         logger.info(
@@ -1191,7 +1435,10 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                     call_id=self._call_id
                 )
                 self._greeting_completed = True
-                await self._re_enable_vad()
+                try:
+                    await self._re_enable_vad()
+                finally:
+                    await self.release_greeting_transport_guard()
         except asyncio.CancelledError:
             pass  # Task cancelled on session stop
         except Exception:
@@ -1277,27 +1524,65 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             "⏱️  Farewell timeout started (5s fallback)",
             call_id=self._call_id
         )
+
+    def _claim_farewell_hangup(self, *, force_cleanup: bool = False) -> Optional[str]:
+        """Atomically claim the pending farewell's terminal notification.
+
+        Claiming before an awaited callback prevents the no-audio timer and the
+        normal audio-complete path from both emitting HangupReady. The engine
+        remains the sole owner of caller-facing transport drain and ARI hangup.
+        """
+        response_id = self._farewell_response_id
+        if not self._farewell_waiting_for_audio_done or response_id is None:
+            return None
+
+        response_done = self._farewell_response_done
+        self._farewell_waiting_for_audio_done = False
+        self._farewell_response_id = None
+        self._farewell_response_done = False
+        self._hangup_after_response = False
+        self._cancel_farewell_timeout()
+        if force_cleanup or response_done:
+            self._audio_seen_response_ids.discard(response_id)
+            if self._current_response_id == response_id:
+                self._current_response_id = None
+        return response_id
     
     def _cancel_farewell_timeout(self):
         """Cancel the farewell timeout if it's still running."""
-        if self._farewell_timeout_task and not self._farewell_timeout_task.done():
-            self._farewell_timeout_task.cancel()
+        task = self._farewell_timeout_task
+        self._farewell_timeout_task = None
+        if task and not task.done() and task is not asyncio.current_task():
+            task.cancel()
             logger.debug(
                 "⏱️  Farewell timeout cancelled",
                 call_id=self._call_id
             )
-            self._farewell_timeout_task = None
     
     async def _farewell_timeout_handler(self):
-        """Wait 5 seconds, then trigger hangup if farewell audio wasn't generated."""
+        """Bound farewell completion when audio or its done signal never arrives."""
         try:
-            await asyncio.sleep(5.0)
-            
-            # If we reach here, timeout expired without being cancelled
-            logger.warning(
-                "⏱️  Farewell timeout expired - OpenAI did not generate audio within 5s, triggering hangup anyway",
-                call_id=self._call_id
+            await asyncio.sleep(self._farewell_timeout_seconds)
+
+            response_id = self._farewell_response_id
+            had_audio = bool(
+                response_id and response_id in self._audio_seen_response_ids
             )
+            if self._claim_farewell_hangup(force_cleanup=True) is None:
+                return
+
+            if had_audio:
+                logger.warning(
+                    "⏱️  Farewell timeout expired after audio began - triggering bounded hangup",
+                    call_id=self._call_id,
+                    response_id=response_id,
+                )
+            else:
+                logger.warning(
+                    "⏱️  Farewell timeout expired - OpenAI did not generate audio within 5s, triggering hangup anyway",
+                    call_id=self._call_id,
+                    response_id=response_id,
+                )
             
             # Emit HangupReady event to trigger hangup
             try:
@@ -1306,7 +1591,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                         "type": "HangupReady",
                         "call_id": self._call_id,
                         "reason": "farewell_timeout",
-                        "had_audio": False
+                        "had_audio": had_audio,
                     })
             except Exception as e:
                 logger.error(
@@ -1405,7 +1690,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 {
                     "type": "ProviderBargeIn",
                     "call_id": self._call_id,
-                    "provider": "openai_realtime",
+                    "provider": self.provider_event_name(),
                     "event": event_type,
                 }
             )
@@ -1677,6 +1962,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 # Mark response as farewell if hangup was requested
                 elif self._hangup_after_response:
                     self._farewell_response_id = response_id
+                    self._farewell_response_done = False
                     logger.info(
                         "🔚 Farewell response created - will trigger hangup on completion",
                         call_id=self._call_id,
@@ -1699,14 +1985,13 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 if audio_b64:
                     await self._handle_output_audio(audio_b64)
             elif delta_type == "output_audio.done":
-                await self._emit_audio_done()
+                await self._emit_audio_done(farewell_audio_complete=True)
             elif delta_type == "output_text.delta":
                 text = delta.get("text")
                 if text:
-                    await self._emit_transcript(text, is_final=False)
+                    await self._emit_assistant_transcript(event, text, is_final=False)
             elif delta_type == "output_text.done":
-                if self._transcript_buffer:
-                    await self._emit_transcript("", is_final=True)
+                await self._emit_assistant_transcript(event, "", is_final=True)
             return
 
         # Modern event naming variants (top-level types)
@@ -1724,7 +2009,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             return
 
         if event_type == "response.output_audio.done":
-            await self._emit_audio_done()
+            await self._emit_audio_done(farewell_audio_complete=True)
             return
 
         # Additional modern variant used by some previews
@@ -1753,7 +2038,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             # Do NOT re-enable VAD here - it will trigger too early!
             # VAD re-enable handled in response.done event
             
-            await self._emit_audio_done()
+            await self._emit_audio_done(farewell_audio_complete=True)
             return
 
         if event_type == "response.audio_transcript.delta":
@@ -1765,14 +2050,11 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 elif isinstance(delta, str):
                     text = delta
             if text:
-                await self._emit_transcript(text, is_final=False)
+                await self._emit_assistant_transcript(event, text, is_final=False)
             return
 
         if event_type == "response.audio_transcript.done":
-            if self._transcript_buffer:
-                # Track assistant conversation for email tools
-                await self._track_conversation("assistant", self._transcript_buffer)
-                await self._emit_transcript("", is_final=True)
+            await self._emit_assistant_transcript(event, "", is_final=True)
             return
 
         if event_type in ("response.completed", "response.error", "response.cancelled", "response.done"):
@@ -1797,6 +2079,16 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             had_audio_for_response = bool(
                 current_response_id and current_response_id in self._audio_seen_response_ids
             )
+            is_terminal_farewell = bool(
+                self._farewell_response_id is not None
+                and current_response_id == self._farewell_response_id
+            )
+            if is_terminal_farewell:
+                self._farewell_response_done = True
+            is_completed_farewell = bool(
+                is_terminal_farewell
+                and event_type in ("response.completed", "response.done")
+            )
             
             # Reset audio start time when response fully completes - allows interruption for next response
             self._response_audio_start_time = None
@@ -1805,7 +2097,12 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             # (moved from here for standardized measurement across providers)
             
             await self._emit_audio_done()
-            
+            # response.audio.done can fire once per audio segment. Preserve FIR
+            # history across those segment boundaries and reset it only when the
+            # complete response reaches a terminal event.
+            self._output_resample_state = None
+            self._output_resampler_logged = False
+
             # Only emit additional audio_done if this response actually had audio output
             # This prevents premature hangup when tool responses complete (no audio yet)
             # The farewell response will emit audio_done when IT completes with audio
@@ -1845,7 +2142,9 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 # Re-enable turn_detection now that greeting is fully generated
                 await self._re_enable_vad()
 
-                # Request early TTS gating clear so caller audio can flow after greeting
+                # AgentAudioDone retains greeting gating through caller-facing
+                # drain. A no-audio greeting has nothing to drain and clears
+                # immediately through the same event contract.
                 try:
                     if self.on_event and self._call_id:
                         await self.on_event(
@@ -1853,8 +2152,11 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                                 "type": "ClearTtsGating",
                                 "call_id": self._call_id,
                                 "reason": "greeting_completed",
+                                "defer_until_drain": had_audio_for_response,
                             }
                         )
+                    if not had_audio_for_response:
+                        await self.release_greeting_transport_guard()
                 except Exception:
                     logger.debug(
                         "Failed to emit ClearTtsGating event",
@@ -1864,13 +2166,8 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             
             # Check if this was the farewell response
             # CRITICAL: Check farewell_response_id is not None to prevent None == None false positive
-            if (self._farewell_response_id is not None and 
-                self._current_response_id == self._farewell_response_id and 
-                event_type in ("response.completed", "response.done")):
-                
-                # Cancel timeout if it's still running
-                self._cancel_farewell_timeout()
-                
+            if is_completed_farewell:
+
                 # If farewell has audio, we hang up on output_audio.done (not response.done) so we don't
                 # cut off the end of the spoken goodbye (provider can deliver audio faster than real-time).
                 if had_audio_for_response:
@@ -1886,41 +2183,46 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                         call_id=self._call_id,
                         response_id=self._current_response_id
                     )
-                    
-                    # Emit HangupReady event immediately since there's no audio to wait for
-                    try:
-                        if self.on_event:
-                            await self.on_event({
-                                "type": "HangupReady",
-                                "call_id": self._call_id,
-                                "reason": "farewell_no_audio",
-                                "had_audio": False
-                            })
-                    except Exception as e:
-                        logger.error(
-                            "Failed to emit HangupReady event for no-audio farewell",
-                            call_id=self._call_id,
-                            error=str(e),
-                            exc_info=True,
-                        )
-                
-                # Reset hangup marker; HangupReady will be emitted on output_audio.done if we had audio.
-                if not had_audio_for_response:
-                    self._farewell_waiting_for_audio_done = False
-                    self._farewell_response_id = None
-                self._hangup_after_response = False
+
+                    # Claim before awaiting the callback so the timeout cannot
+                    # concurrently emit a second terminal notification.
+                    if self._claim_farewell_hangup() is not None:
+                        try:
+                            if self.on_event:
+                                await self.on_event({
+                                    "type": "HangupReady",
+                                    "call_id": self._call_id,
+                                    "reason": "farewell_no_audio",
+                                    "had_audio": False
+                                })
+                        except Exception as e:
+                            logger.error(
+                                "Failed to emit HangupReady event for no-audio farewell",
+                                call_id=self._call_id,
+                                error=str(e),
+                                exc_info=True,
+                            )
+
+                # HangupReady will be emitted on output_audio.done if we had audio.
+                if had_audio_for_response:
+                    self._hangup_after_response = False
             
             # Drop per-response audio tracking to avoid unbounded growth.
             try:
-                if current_response_id:
+                preserve_farewell_correlation = bool(
+                    had_audio_for_response
+                    and self._farewell_waiting_for_audio_done
+                    and current_response_id == self._farewell_response_id
+                )
+                if current_response_id and not preserve_farewell_correlation:
                     self._audio_seen_response_ids.discard(current_response_id)
             except Exception:
-                pass
+                preserve_farewell_correlation = False
 
             self._pending_response = False
-            self._current_response_id = None  # Clear response ID after completion
-            if self._transcript_buffer:
-                await self._emit_transcript("", is_final=True)
+            await self._emit_assistant_transcript(event, "", is_final=True)
+            if not preserve_farewell_correlation:
+                self._current_response_id = None  # Clear response ID after completion
             return
 
         if event_type == "conversation.item.input_audio_transcription.completed":
@@ -1949,10 +2251,14 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             return
 
         if event_type == "response.output_text.delta":
-            delta = event.get("delta") or {}
-            text = delta.get("text")
+            delta = event.get("delta")
+            text = delta.get("text") if isinstance(delta, dict) else delta
             if text:
-                await self._emit_transcript(text, is_final=False)
+                await self._emit_assistant_transcript(event, text, is_final=False)
+            return
+
+        if event_type == "response.output_text.done":
+            await self._emit_assistant_transcript(event, "", is_final=True)
             return
 
         # Optional acks/telemetry for audio buffer operations
@@ -1966,7 +2272,10 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             # Handle barge-in: cancel ongoing response when user starts speaking
             elif event_type == "input_audio_buffer.speech_started" and self._current_response_id:
                 # Protect greeting response from barge-in cancellation
-                if self._current_response_id == self._greeting_response_id and not self._greeting_completed:
+                if self._greeting_transport_guard_active or (
+                    self._current_response_id == self._greeting_response_id
+                    and not self._greeting_completed
+                ):
                     logger.info(
                         "🛡️  Barge-in blocked - protecting greeting response",
                         call_id=self._call_id,
@@ -2006,7 +2315,9 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 # we still want the platform to flush local playback immediately on speech_started.
                 if event_type == "input_audio_buffer.speech_started":
                     # Never interrupt the greeting turn via platform flush.
-                    if self._greeting_response_id and not self._greeting_completed:
+                    if self._greeting_transport_guard_active or (
+                        self._greeting_response_id and not self._greeting_completed
+                    ):
                         logger.info(
                             "🛡️  Barge-in blocked - protecting greeting response",
                             call_id=self._call_id,
@@ -2045,14 +2356,11 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             elif isinstance(delta, str):
                 text = delta
             if text:
-                await self._emit_transcript(text, is_final=False)
+                await self._emit_assistant_transcript(event, text, is_final=False)
             return
 
         if event_type == "response.output_audio_transcript.done":
-            if self._transcript_buffer:
-                # Track assistant conversation for email tools
-                await self._track_conversation("assistant", self._transcript_buffer)
-                await self._emit_transcript("", is_final=True)
+            await self._emit_assistant_transcript(event, "", is_final=True)
             return
 
         # CRITICAL FIX #1: Handle session.updated ACK (following Deepgram pattern)
@@ -2262,7 +2570,24 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 source_rate,
                 target_rate,
                 state=self._output_resample_state,
+                mode=self._output_resampler_mode,
             )
+            if not self._output_resampler_logged:
+                alias_safe = bool(
+                    self._output_resampler_mode == "bandlimited"
+                    and source_rate > target_rate
+                    and source_rate % target_rate == 0
+                )
+                logger.info(
+                    "OpenAI output resampler selected",
+                    call_id=self._call_id,
+                    configured_mode=self._output_resampler_mode,
+                    active_mode=("bandlimited" if alias_safe else "linear"),
+                    source_rate_hz=source_rate,
+                    target_rate_hz=target_rate,
+                    alias_safe=alias_safe,
+                )
+                self._output_resampler_logged = True
 
             outbound = convert_pcm16le_to_target_format(pcm_target, self.config.target_encoding)
             if not outbound:
@@ -2303,16 +2628,40 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 except Exception:
                     logger.error("Failed to emit AgentAudio event", call_id=self._call_id, exc_info=True)
 
-    async def _emit_audio_done(self):
+    async def _emit_audio_done(self, *, farewell_audio_complete: bool = False):
         if not self.on_event or not self._call_id:
             return
+
+        # AgentAudioDone may block while downstream WebSocket playback reaches
+        # its correlated boundary. Claim and cancel the no-audio fallback first
+        # once this farewell has demonstrably produced audio, then emit the
+        # terminal event only after the callback returns.
+        farewell_response_id = self._farewell_response_id
+        farewell_completed = bool(
+            farewell_audio_complete
+            and self._farewell_waiting_for_audio_done
+            and farewell_response_id is not None
+            and self._current_response_id == farewell_response_id
+            and farewell_response_id in self._audio_seen_response_ids
+        )
+        if farewell_completed:
+            farewell_completed = self._claim_farewell_hangup() is not None
+
         try:
             if self._in_audio_burst:
+                is_greeting = bool(
+                    self._greeting_response_id
+                    and self._current_response_id == self._greeting_response_id
+                )
                 await self.on_event(
                     {
                         "type": "AgentAudioDone",
                         "streaming_done": True,
                         "call_id": self._call_id,
+                        # Provider generation can finish before paced caller
+                        # playback. Retain greeting echo protection until the
+                        # engine confirms that transport has drained.
+                        "defer_tts_gating_until_drain": is_greeting,
                     }
                 )
         except Exception:
@@ -2326,17 +2675,10 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                     self._pacer_task.cancel()
             except Exception:
                 logger.debug("Failed to pause pacer on AgentAudioDone", call_id=self._call_id, exc_info=True)
-            self._output_resample_state = None
             self._first_output_chunk_logged = False
 
         # If a hangup was requested and we just finished emitting the farewell audio, trigger hangup now.
-        if self._farewell_waiting_for_audio_done and self._farewell_response_id is not None:
-            # CRITICAL: Cancel the farewell timeout BEFORE emitting HangupReady to prevent
-            # race condition where both farewell_completed and farewell_timeout fire.
-            self._cancel_farewell_timeout()
-            
-            self._farewell_waiting_for_audio_done = False
-            self._farewell_response_id = None
+        if farewell_completed:
             try:
                 await self.on_event(
                     {
@@ -2353,13 +2695,10 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         if not self.on_event or not self._call_id:
             return
 
-        if text:
-            self._transcript_buffer += text
-
         payload = {
             "type": "Transcript",
             "call_id": self._call_id,
-            "text": text or self._transcript_buffer,
+            "text": text,
             "is_final": is_final,
         }
         try:
@@ -2367,8 +2706,61 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         except Exception:
             logger.error("Failed to emit transcript event", call_id=self._call_id, exc_info=True)
 
-        if is_final:
-            self._transcript_buffer = ""
+
+    def _assistant_transcript_key(self, event: Dict[str, Any]) -> str:
+        response = event.get("response") or {}
+        response_id = event.get("response_id") or response.get("id") or self._current_response_id
+        item_id = event.get("item_id")
+        response_key = response_id or "unscoped"
+        if item_id:
+            return f"{response_key}:{item_id}"
+        return str(response_key)
+
+    async def _emit_assistant_transcript(
+        self,
+        event: Dict[str, Any],
+        text: str,
+        *,
+        is_final: bool,
+    ) -> None:
+        """Accumulate/finalize only the matching assistant response item.
+
+        Caller-final events bypass this state entirely, so an interleaved input
+        transcription cannot erase an assistant prefix.
+        """
+        key = self._assistant_transcript_key(event)
+        if text:
+            self._assistant_transcript_buffers[key] = (
+                self._assistant_transcript_buffers.get(key, "") + text
+            )
+            if not is_final:
+                await self._emit_transcript(text, is_final=False)
+                return
+
+        if not is_final:
+            return
+        keys = [key]
+        if not event.get("item_id"):
+            prefix = f"{key}:"
+            keys.extend(
+                candidate
+                for candidate in self._assistant_transcript_buffers
+                if candidate.startswith(prefix)
+            )
+        parts = [
+            self._assistant_transcript_buffers.pop(candidate, "")
+            for candidate in dict.fromkeys(keys)
+        ]
+        parts = [part for part in parts if part]
+        complete = ""
+        for part in parts:
+            if complete and not complete[-1].isspace() and not part[0].isspace():
+                complete += " "
+            complete += part
+        if not complete:
+            return
+        await self._track_conversation("assistant", complete)
+        await self._emit_transcript(complete, is_final=True)
 
     async def _track_conversation(self, role: str, text: str):
         """Track conversation turns for email tools (similar to Deepgram implementation)."""
@@ -2474,6 +2866,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             try:
                 url = self._build_ws_url()
                 use_beta = getattr(self.config, 'api_version', 'ga').lower() == 'beta'
+                self._warn_if_beta_deprecated(self._call_id)
                 headers = [
                     ("Authorization", f"Bearer {self.config.api_key}"),
                 ]
@@ -2488,7 +2881,11 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 # Reset minor state
                 self._pending_response = False
                 self._in_audio_burst = False
+                self._greeting_transport_guard_active = False
+                self._greeting_guard_silence_logged = False
                 self._first_output_chunk_logged = False
+                self._output_resample_state = None
+                self._output_resampler_logged = False
                 # Send session update again and restart loops
                 await self._send_session_update()
                 self._log_session_assumptions()

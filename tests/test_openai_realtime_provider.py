@@ -1,8 +1,12 @@
+import asyncio
 import time
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from src.config import OpenAIRealtimeProviderConfig
+import src.providers.openai_realtime as openai_realtime_module
 from src.providers.openai_realtime import (
     OpenAIRealtimeProvider,
     _OPENAI_ASSUMED_OUTPUT_RATE,
@@ -33,6 +37,455 @@ def openai_config():
 
 def _cleanup_metrics(call_id: str) -> None:
     return
+
+
+def test_capabilities_include_telephony_pcm16_input_rate(openai_config):
+    capabilities = OpenAIRealtimeProvider(
+        openai_config, on_event=AsyncMock()
+    ).get_capabilities()
+
+    assert 16000 in capabilities.input_sample_rates_hz
+
+
+@pytest.mark.asyncio
+async def test_greeting_audio_done_defers_tts_gating_until_transport_drain(openai_config):
+    events = []
+
+    async def on_event(event):
+        events.append(event)
+
+    provider = OpenAIRealtimeProvider(openai_config, on_event=on_event)
+    provider._call_id = "call-greeting-drain"
+    provider._greeting_response_id = "resp-greeting"
+    provider._current_response_id = "resp-greeting"
+    provider._in_audio_burst = True
+
+    await provider._emit_audio_done()
+
+    assert events == [
+        {
+            "type": "AgentAudioDone",
+            "streaming_done": True,
+            "call_id": "call-greeting-drain",
+            "defer_tts_gating_until_drain": True,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_greeting_transport_guard_sends_silence_until_engine_releases(openai_config):
+    provider = OpenAIRealtimeProvider(openai_config, on_event=AsyncMock())
+    provider._call_id = "call-greeting-input-guard"
+    provider.websocket = _OpenWebSocket()
+    provider._greeting_transport_guard_active = True
+    provider._in_audio_burst = True
+    provider._pacer_underruns = 0
+    provider._send_audio_to_openai = AsyncMock()
+
+    caller_audio = b"\x01\x02" * 160
+    await provider.send_audio(
+        caller_audio,
+        sample_rate=24000,
+        encoding="linear16",
+    )
+
+    provider._send_audio_to_openai.assert_awaited_once_with(b"\x00" * len(caller_audio))
+
+
+@pytest.mark.asyncio
+async def test_greeting_transport_guard_clears_buffer_before_release(openai_config):
+    provider = OpenAIRealtimeProvider(openai_config, on_event=AsyncMock())
+    provider._call_id = "call-greeting-input-release"
+    provider.websocket = _OpenWebSocket()
+    provider._greeting_transport_guard_active = True
+    provider._pending_audio_provider_rate.extend(b"stale-audio")
+    provider._send_json = AsyncMock()
+
+    await provider.release_greeting_transport_guard()
+
+    assert provider._greeting_transport_guard_active is False
+    assert provider._pending_audio_provider_rate == bytearray()
+    payload = provider._send_json.await_args.args[0]
+    assert payload["type"] == "input_audio_buffer.clear"
+    assert payload["event_id"].startswith("clear-greeting-")
+
+
+@pytest.mark.asyncio
+async def test_greeting_vad_fallback_releases_transport_guard(
+    openai_config, monkeypatch
+):
+    provider = OpenAIRealtimeProvider(openai_config, on_event=AsyncMock())
+    provider._call_id = "call-greeting-fallback"
+    provider._greeting_completed = False
+    provider._greeting_transport_guard_active = True
+    provider._re_enable_vad = AsyncMock()
+    provider.release_greeting_transport_guard = AsyncMock()
+    monkeypatch.setattr(openai_realtime_module.asyncio, "sleep", AsyncMock())
+
+    await provider._greeting_vad_fallback()
+
+    assert provider._greeting_completed is True
+    provider._re_enable_vad.assert_awaited_once_with()
+    provider.release_greeting_transport_guard.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_greeting_vad_fallback_releases_guard_when_vad_update_fails(
+    openai_config, monkeypatch
+):
+    provider = OpenAIRealtimeProvider(openai_config, on_event=AsyncMock())
+    provider._call_id = "call-greeting-fallback-error"
+    provider._greeting_completed = False
+    provider._greeting_transport_guard_active = True
+    provider._re_enable_vad = AsyncMock(side_effect=RuntimeError("socket closed"))
+    provider.release_greeting_transport_guard = AsyncMock()
+    monkeypatch.setattr(openai_realtime_module.asyncio, "sleep", AsyncMock())
+
+    await provider._greeting_vad_fallback()
+
+    assert provider._greeting_completed is True
+    provider.release_greeting_transport_guard.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_farewell_audio_done_cancels_timeout_before_delayed_drain_callback(
+    openai_config,
+):
+    events = []
+    drain_started = asyncio.Event()
+    release_drain = asyncio.Event()
+
+    async def on_event(event):
+        events.append(event)
+        if event["type"] == "AgentAudioDone":
+            drain_started.set()
+            await release_drain.wait()
+
+    provider = OpenAIRealtimeProvider(openai_config, on_event=on_event)
+    provider._call_id = "call-farewell-drain"
+    provider._current_response_id = "resp-farewell"
+    provider._farewell_response_id = "resp-farewell"
+    provider._farewell_waiting_for_audio_done = True
+    provider._hangup_after_response = True
+    provider._audio_seen_response_ids.add("resp-farewell")
+    provider._in_audio_burst = True
+    provider._farewell_timeout_seconds = 0.01
+    provider._start_farewell_timeout()
+
+    done_task = asyncio.create_task(
+        provider._emit_audio_done(farewell_audio_complete=True)
+    )
+    await asyncio.wait_for(drain_started.wait(), timeout=0.2)
+    await asyncio.sleep(0.03)
+
+    assert [event["type"] for event in events] == ["AgentAudioDone"]
+    assert provider._farewell_timeout_task is None
+
+    release_drain.set()
+    await asyncio.wait_for(done_task, timeout=0.2)
+
+    assert events[-1] == {
+        "type": "HangupReady",
+        "call_id": "call-farewell-drain",
+        "reason": "farewell_completed",
+        "had_audio": True,
+    }
+    assert len([event for event in events if event["type"] == "HangupReady"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_farewell_response_done_preserves_correlation_until_audio_done(
+    openai_config,
+):
+    events = []
+
+    async def on_event(event):
+        events.append(event)
+
+    provider = OpenAIRealtimeProvider(openai_config, on_event=on_event)
+    provider._call_id = "call-farewell-response-first"
+    provider._current_response_id = "resp-farewell"
+    provider._farewell_response_id = "resp-farewell"
+    provider._farewell_waiting_for_audio_done = True
+    provider._hangup_after_response = True
+    provider._audio_seen_response_ids.add("resp-farewell")
+    provider._in_audio_burst = True
+    provider._farewell_timeout_seconds = 1.0
+    provider._start_farewell_timeout()
+    timeout_task = provider._farewell_timeout_task
+
+    await provider._handle_event(_response_done_event("resp-farewell"))
+
+    assert [event["type"] for event in events] == ["AgentAudioDone"]
+    assert provider._current_response_id == "resp-farewell"
+    assert provider._farewell_response_id == "resp-farewell"
+    assert provider._farewell_response_done is True
+    assert "resp-farewell" in provider._audio_seen_response_ids
+
+    await provider._handle_event({"type": "response.output_audio.done"})
+    await asyncio.gather(timeout_task, return_exceptions=True)
+
+    assert events[-1] == {
+        "type": "HangupReady",
+        "call_id": "call-farewell-response-first",
+        "reason": "farewell_completed",
+        "had_audio": True,
+    }
+    assert len([event for event in events if event["type"] == "HangupReady"]) == 1
+    assert provider._current_response_id is None
+    assert provider._farewell_response_id is None
+    assert provider._farewell_response_done is False
+    assert "resp-farewell" not in provider._audio_seen_response_ids
+
+
+@pytest.mark.asyncio
+async def test_farewell_timeout_emits_once_when_no_audio_arrives(openai_config):
+    events = []
+
+    async def on_event(event):
+        events.append(event)
+
+    provider = OpenAIRealtimeProvider(openai_config, on_event=on_event)
+    provider._call_id = "call-farewell-timeout"
+    provider._current_response_id = "resp-farewell"
+    provider._farewell_response_id = "resp-farewell"
+    provider._farewell_waiting_for_audio_done = True
+    provider._hangup_after_response = True
+    provider._farewell_timeout_seconds = 0.01
+    provider._start_farewell_timeout()
+    timeout_task = provider._farewell_timeout_task
+
+    await asyncio.wait_for(timeout_task, timeout=0.2)
+
+    assert events == [
+        {
+            "type": "HangupReady",
+            "call_id": "call-farewell-timeout",
+            "reason": "farewell_timeout",
+            "had_audio": False,
+        }
+    ]
+    assert provider._farewell_timeout_task is None
+    assert provider._farewell_response_id is None
+    assert provider._farewell_waiting_for_audio_done is False
+    assert provider._hangup_after_response is False
+
+
+@pytest.mark.asyncio
+async def test_farewell_timeout_reports_audio_when_completion_never_arrives(
+    openai_config,
+):
+    events = []
+
+    async def on_event(event):
+        events.append(event)
+
+    provider = OpenAIRealtimeProvider(openai_config, on_event=on_event)
+    provider._call_id = "call-farewell-missing-done"
+    provider._current_response_id = "resp-farewell"
+    provider._farewell_response_id = "resp-farewell"
+    provider._farewell_waiting_for_audio_done = True
+    provider._audio_seen_response_ids.add("resp-farewell")
+    provider._farewell_timeout_seconds = 0.01
+    provider._start_farewell_timeout()
+    timeout_task = provider._farewell_timeout_task
+
+    await asyncio.wait_for(timeout_task, timeout=0.2)
+
+    assert events == [
+        {
+            "type": "HangupReady",
+            "call_id": "call-farewell-missing-done",
+            "reason": "farewell_timeout",
+            "had_audio": True,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_farewell_timeout_after_response_done_preserves_audio_evidence(
+    openai_config,
+):
+    events = []
+
+    async def on_event(event):
+        events.append(event)
+
+    provider = OpenAIRealtimeProvider(openai_config, on_event=on_event)
+    provider._call_id = "call-farewell-response-done-timeout"
+    provider._current_response_id = "resp-farewell"
+    provider._farewell_response_id = "resp-farewell"
+    provider._farewell_waiting_for_audio_done = True
+    provider._audio_seen_response_ids.add("resp-farewell")
+    provider._in_audio_burst = True
+    provider._farewell_timeout_seconds = 0.01
+    provider._start_farewell_timeout()
+    timeout_task = provider._farewell_timeout_task
+
+    await provider._handle_event(_response_done_event("resp-farewell"))
+    await asyncio.wait_for(timeout_task, timeout=0.2)
+
+    assert events[-1] == {
+        "type": "HangupReady",
+        "call_id": "call-farewell-response-done-timeout",
+        "reason": "farewell_timeout",
+        "had_audio": True,
+    }
+    assert provider._current_response_id is None
+    assert provider._farewell_response_id is None
+    assert "resp-farewell" not in provider._audio_seen_response_ids
+
+
+@pytest.mark.asyncio
+async def test_no_audio_response_done_cancels_timeout_before_callback(openai_config):
+    events = []
+    callback_started = asyncio.Event()
+    release_callback = asyncio.Event()
+
+    async def on_event(event):
+        events.append(event)
+        if event["type"] == "HangupReady":
+            callback_started.set()
+            await release_callback.wait()
+
+    provider = OpenAIRealtimeProvider(openai_config, on_event=on_event)
+    provider._call_id = "call-farewell-no-audio"
+    provider._current_response_id = "resp-farewell"
+    provider._farewell_response_id = "resp-farewell"
+    provider._farewell_waiting_for_audio_done = True
+    provider._hangup_after_response = True
+    provider._farewell_timeout_seconds = 0.01
+    provider._start_farewell_timeout()
+
+    done_task = asyncio.create_task(
+        provider._handle_event(_response_done_event("resp-farewell"))
+    )
+    await asyncio.wait_for(callback_started.wait(), timeout=0.2)
+    await asyncio.sleep(0.03)
+
+    assert events == [
+        {
+            "type": "HangupReady",
+            "call_id": "call-farewell-no-audio",
+            "reason": "farewell_no_audio",
+            "had_audio": False,
+        }
+    ]
+    assert provider._farewell_timeout_task is None
+
+    release_callback.set()
+    await asyncio.wait_for(done_task, timeout=0.2)
+    assert len(events) == 1
+
+
+@pytest.mark.asyncio
+async def test_stop_session_cancels_farewell_without_terminal_callback(openai_config):
+    events = []
+
+    async def on_event(event):
+        events.append(event)
+
+    provider = OpenAIRealtimeProvider(openai_config, on_event=on_event)
+    provider._call_id = "call-farewell-stop"
+    provider._current_response_id = "resp-farewell"
+    provider._farewell_response_id = "resp-farewell"
+    provider._farewell_waiting_for_audio_done = True
+    provider._audio_seen_response_ids.add("resp-farewell")
+    provider._in_audio_burst = True
+    provider._farewell_timeout_seconds = 0.01
+    provider._start_farewell_timeout()
+    timeout_task = provider._farewell_timeout_task
+
+    await provider.stop_session()
+    await asyncio.gather(timeout_task, return_exceptions=True)
+
+    assert [event["type"] for event in events] == ["AgentAudioDone"]
+    assert provider._farewell_timeout_task is None
+    assert provider._farewell_response_id is None
+    assert provider._farewell_waiting_for_audio_done is False
+    assert provider._farewell_response_done is False
+    assert provider._current_response_id is None
+    assert provider._audio_seen_response_ids == set()
+
+
+@pytest.mark.asyncio
+async def test_speech_started_cannot_flush_openai_greeting_transport_tail(openai_config):
+    events = []
+
+    async def on_event(event):
+        events.append(event)
+
+    provider = OpenAIRealtimeProvider(openai_config, on_event=on_event)
+    provider._call_id = "call-greeting-tail-vad"
+    provider._greeting_response_id = "resp-greeting"
+    provider._greeting_completed = True
+    provider._current_response_id = None
+    provider._greeting_transport_guard_active = True
+    provider._outbuf.extend(b"greeting-tail")
+
+    await provider._handle_event({"type": "input_audio_buffer.speech_started"})
+
+    assert provider._outbuf == bytearray(b"greeting-tail")
+    assert events == []
+
+
+def _function_call_event(response_id="resp-1", call_id="call-1", name="lookup"):
+    return {
+        "type": "response.output_item.done",
+        "response_id": response_id,
+        "item": {
+            "type": "function_call",
+            "call_id": call_id,
+            "name": name,
+            "arguments": "{}",
+        },
+    }
+
+
+def _response_done_event(response_id="resp-1"):
+    return {
+        "type": "response.done",
+        "response": {"id": response_id},
+    }
+
+
+class _OpenWebSocket:
+    state = SimpleNamespace(name="OPEN")
+
+
+class _ToolAdapter:
+    def __init__(self, *, result=None, error=None):
+        self.result = {"status": "ok"} if result is None else result
+        self.error = error
+        self.sent_results = []
+
+    async def handle_tool_call_event(self, event_data, context):
+        if self.error:
+            raise self.error
+        return self.result
+
+    async def send_tool_result(self, result, context):
+        self.sent_results.append((result, context))
+
+
+class _RecordingLogger:
+    def __init__(self):
+        self.warning_calls = []
+        self.error_calls = []
+        self.debug_calls = []
+        self.info_calls = []
+
+    def warning(self, *args, **kwargs):
+        self.warning_calls.append((args, kwargs))
+
+    def error(self, *args, **kwargs):
+        self.error_calls.append((args, kwargs))
+
+    def debug(self, *args, **kwargs):
+        self.debug_calls.append((args, kwargs))
+
+    def info(self, *args, **kwargs):
+        self.info_calls.append((args, kwargs))
 
 
 def test_output_rate_drift_adjusts_active_rate(openai_config):
@@ -87,6 +540,12 @@ async def test_session_requests_pcm_when_ga_mode(openai_config):
 @pytest.mark.asyncio
 async def test_session_requests_g711_when_beta_mode():
     """Beta mode uses flat output_audio_format string tokens."""
+    # NOTE: Intentionally keeps api_version="beta" + a legacy model literal here
+    # to assert that the beta wire-protocol code path is still preserved (we did
+    # NOT delete the beta branch in v6.5.4 — we only flipped the default to ga).
+    # OpenAI will reject the real WS connection with beta_api_shape_disabled,
+    # but the code under test in this fixture is the URL-and-header builder,
+    # not the live socket. See _warn_if_beta_deprecated() for the one-shot log.
     beta_config = OpenAIRealtimeProviderConfig(
         api_key="test-key",
         api_version="beta",
@@ -118,3 +577,258 @@ async def test_session_requests_g711_when_beta_mode():
     assert session.get("output_audio_format") == "pcm16"
     assert provider._provider_output_format == "pcm16"
     assert provider._session_output_bytes_per_sample == 2
+
+
+@pytest.mark.asyncio
+async def test_function_call_event_registers_shared_response_done_sentinel(openai_config):
+    provider = OpenAIRealtimeProvider(openai_config, on_event=None)
+    handled = []
+
+    async def fake_handle(event):
+        handled.append(event)
+
+    provider._handle_function_call = fake_handle
+
+    await provider._handle_event(_function_call_event("resp-shared", "call-a"))
+    first_sentinel = provider._response_done_events["resp-shared"]
+    await provider._handle_event(_function_call_event("resp-shared", "call-b"))
+
+    assert provider._response_done_events["resp-shared"] is first_sentinel
+    assert provider._is_recent_tool_call_id("call-a") is True
+    assert provider._is_recent_tool_call_id("call-b") is True
+
+    await asyncio.sleep(0)
+    assert [event["item"]["call_id"] for event in handled] == ["call-a", "call-b"]
+
+
+@pytest.mark.asyncio
+async def test_response_done_signals_and_removes_sentinel(openai_config):
+    provider = OpenAIRealtimeProvider(openai_config, on_event=None)
+
+    async def fake_handle(event):
+        return None
+
+    provider._handle_function_call = fake_handle
+
+    await provider._handle_event(_function_call_event("resp-done", "call-a"))
+    sentinel = provider._response_done_events["resp-done"]
+
+    await provider._handle_event(_response_done_event("resp-done"))
+
+    assert sentinel.is_set()
+    assert "resp-done" not in provider._response_done_events
+
+
+@pytest.mark.asyncio
+async def test_await_parent_response_done_returns_after_sentinel_is_set(openai_config):
+    provider = OpenAIRealtimeProvider(openai_config, on_event=None)
+    sentinel = asyncio.Event()
+    provider._response_done_events["resp-ready"] = sentinel
+    sentinel.set()
+
+    await asyncio.wait_for(
+        provider._await_parent_response_done(
+            _function_call_event("resp-ready", "call-ready"),
+            timeout=0.1,
+        ),
+        timeout=0.2,
+    )
+
+
+@pytest.mark.asyncio
+async def test_await_parent_response_done_times_out_without_raising(openai_config):
+    provider = OpenAIRealtimeProvider(openai_config, on_event=None)
+    provider._response_done_events["resp-missing"] = asyncio.Event()
+
+    await asyncio.wait_for(
+        provider._await_parent_response_done(
+            _function_call_event("resp-missing", "call-timeout"),
+            timeout=0.01,
+        ),
+        timeout=0.2,
+    )
+
+
+@pytest.mark.asyncio
+async def test_stop_session_releases_pending_response_done_sentinels(openai_config):
+    provider = OpenAIRealtimeProvider(openai_config, on_event=None)
+    sentinel = asyncio.Event()
+    provider._response_done_events["resp-stop"] = sentinel
+
+    await provider.stop_session()
+
+    assert sentinel.is_set()
+    assert provider._response_done_events == {}
+
+
+@pytest.mark.asyncio
+async def test_reconnect_releases_pending_response_done_sentinels(openai_config):
+    provider = OpenAIRealtimeProvider(openai_config, on_event=None)
+    sentinel = asyncio.Event()
+    provider._call_id = "call-reconnect"
+    provider._closing = True
+    provider._response_done_events["resp-reconnect"] = sentinel
+
+    await provider._reconnect_with_backoff()
+
+    assert sentinel.is_set()
+    assert provider._response_done_events == {}
+
+
+def test_recent_tool_call_ids_respect_ttl_and_evict_expired(openai_config, monkeypatch):
+    provider = OpenAIRealtimeProvider(openai_config, on_event=None)
+    provider._recent_tool_call_id_ttl_s = 30.0
+    now = 100.0
+    monkeypatch.setattr(openai_realtime_module.time, "monotonic", lambda: now)
+
+    provider._recent_tool_call_ids["old-call"] = 69.0
+    provider._record_recent_tool_call_id("new-call")
+
+    assert "old-call" not in provider._recent_tool_call_ids
+    assert provider._is_recent_tool_call_id("new-call") is True
+
+    now = 131.0
+
+    assert provider._is_recent_tool_call_id("new-call") is False
+
+
+@pytest.mark.asyncio
+async def test_invalid_tool_call_id_is_downgraded_only_for_recent_call_ids(
+    openai_config, monkeypatch
+):
+    provider = OpenAIRealtimeProvider(openai_config, on_event=None)
+    provider._record_recent_tool_call_id("call-known")
+    logger = _RecordingLogger()
+    monkeypatch.setattr(openai_realtime_module, "logger", logger)
+
+    await provider._handle_event(
+        {
+            "type": "error",
+            "error": {
+                "code": "invalid_tool_call_id",
+                "message": "Tool call ID 'call-known' not found in conversation.",
+            },
+        }
+    )
+    await provider._handle_event(
+        {
+            "type": "error",
+            "error": {
+                "code": "invalid_tool_call_id",
+                "message": "Tool call ID 'call-unknown' not found in conversation.",
+            },
+        }
+    )
+
+    assert len(logger.warning_calls) == 1
+    assert logger.warning_calls[0][1]["rejected_call_id"] == "call-known"
+    assert len(logger.error_calls) == 1
+    assert logger.error_calls[0][1]["rejected_call_id"] == "call-unknown"
+
+
+@pytest.mark.asyncio
+async def test_success_tool_result_waits_for_parent_response_done(openai_config):
+    provider = OpenAIRealtimeProvider(openai_config, on_event=None)
+    session = SimpleNamespace(tool_calls=[], conversation_history=[])
+    adapter = _ToolAdapter(result={"status": "ok", "message": "done"})
+    sentinel = asyncio.Event()
+    provider.websocket = _OpenWebSocket()
+    provider.tool_adapter = adapter
+    provider._call_id = "session-success"
+    provider._session_store = SimpleNamespace(
+        get_by_call_id=AsyncMock(return_value=session),
+        upsert_call=AsyncMock(),
+    )
+    provider._response_done_events["resp-gated"] = sentinel
+
+    task = asyncio.create_task(
+        provider._handle_function_call(_function_call_event("resp-gated", "call-gated"))
+    )
+    await asyncio.sleep(0.05)
+
+    assert adapter.sent_results == []
+
+    sentinel.set()
+    await asyncio.wait_for(task, timeout=0.5)
+
+    assert len(adapter.sent_results) == 1
+    assert adapter.sent_results[0][0]["status"] == "ok"
+    assert session.conversation_history == []
+    assert session.tool_calls[0]["tool_call_id"] == "call-gated"
+    assert session.tool_calls[0]["status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_success_tool_result_delivery_survives_audit_failure(openai_config, monkeypatch):
+    provider = OpenAIRealtimeProvider(openai_config, on_event=None)
+    adapter = _ToolAdapter(result={"status": "ok", "message": "done"})
+    provider.websocket = _OpenWebSocket()
+    provider.tool_adapter = adapter
+    provider._call_id = "session-audit-failure"
+    provider._session_store = SimpleNamespace()
+    provider._response_done_events["resp-audit-failure"] = asyncio.Event()
+    provider._response_done_events["resp-audit-failure"].set()
+
+    async def fail_audit(**_kwargs):
+        raise RuntimeError("audit unavailable")
+
+    monkeypatch.setattr(
+        openai_realtime_module,
+        "record_in_call_tool_result",
+        fail_audit,
+    )
+
+    await provider._handle_function_call(
+        _function_call_event("resp-audit-failure", "call-audit-failure")
+    )
+
+    assert len(adapter.sent_results) == 1
+    assert adapter.sent_results[0][0] == {"status": "ok", "message": "done"}
+
+
+@pytest.mark.asyncio
+async def test_error_tool_output_waits_for_parent_response_done(openai_config):
+    provider = OpenAIRealtimeProvider(openai_config, on_event=None)
+    session = SimpleNamespace(tool_calls=[], conversation_history=[])
+    sentinel = asyncio.Event()
+    sent_payloads = []
+    provider.websocket = _OpenWebSocket()
+    provider.tool_adapter = _ToolAdapter(error=RuntimeError("boom"))
+    provider._call_id = "session-error"
+    provider._session_store = SimpleNamespace(
+        get_by_call_id=AsyncMock(return_value=session),
+        upsert_call=AsyncMock(),
+    )
+    provider._response_done_events["resp-error"] = sentinel
+
+    async def fake_send_json(payload):
+        sent_payloads.append(payload)
+
+    provider._send_json = fake_send_json
+
+    task = asyncio.create_task(
+        provider._handle_function_call(_function_call_event("resp-error", "call-error"))
+    )
+    await asyncio.sleep(0.05)
+
+    assert sent_payloads == []
+
+    sentinel.set()
+    await asyncio.wait_for(task, timeout=0.5)
+
+    assert sent_payloads == [
+        {
+            "type": "conversation.item.create",
+            "item": {
+                "type": "function_call_output",
+                "call_id": "call-error",
+                "output": (
+                    '{"status": "error", "message": "Tool execution failed: boom", '
+                    '"error": "boom"}'
+                ),
+            },
+        }
+    ]
+    assert session.conversation_history == []
+    assert session.tool_calls[0]["tool_call_id"] == "call-error"
+    assert session.tool_calls[0]["status"] == "failure"

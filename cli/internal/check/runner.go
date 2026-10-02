@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -64,11 +64,12 @@ func (r *Runner) Run() (*Report, error) {
 	// In-container probes (python-only; no curl).
 	rep.Items = append(rep.Items, r.checkInContainerPaths())
 	rep.Items = append(rep.Items, r.checkCallHistorySQLite())
+	rep.Items = append(rep.Items, r.checkAgentsDB())
 
 	cfg, cfgItem := r.readEffectiveConfig()
 	rep.Items = append(rep.Items, cfgItem)
 
-	env, envItem := r.readEnvSummary()
+	env, envItem := r.readEnvSummary(cfg)
 	rep.Items = append(rep.Items, envItem)
 
 	rep.Items = append(rep.Items, r.checkTransportCompatibility(cfg))
@@ -582,6 +583,58 @@ print(json.dumps(res))
 	}
 }
 
+func (r *Runner) checkAgentsDB() Item {
+	script := `
+import json, os, sqlite3
+p = "/app/data/operator/agents.db"
+res = {"present": False, "active": 0, "default": None, "error": None}
+if os.path.exists(p):
+    res["present"] = True
+    try:
+        c = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=2.0)
+        res["active"] = c.execute("SELECT COUNT(*) FROM agents WHERE is_active=1").fetchone()[0]
+        row = c.execute("SELECT slug FROM agents WHERE is_default=1 AND is_active=1").fetchone()
+        res["default"] = row[0] if row else None
+        c.close()
+    except Exception as e:
+        res["error"] = str(e)
+print(json.dumps(res))
+`
+	out, err := r.dockerExecPython(script)
+	if err != nil {
+		return Item{Name: "Agents DB", Status: StatusWarn, Message: "could not query agents store", Details: err.Error()}
+	}
+	var res struct {
+		Present bool    `json:"present"`
+		Active  int     `json:"active"`
+		Default *string `json:"default"`
+		Error   *string `json:"error"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(out), &res); err != nil {
+		return Item{Name: "Agents DB", Status: StatusWarn, Message: "invalid probe output", Details: string(out)}
+	}
+	if !res.Present {
+		return Item{Name: "Agents DB", Status: StatusPass, Message: "not present (YAML/headless mode)", Details: "path=/app/data/operator/agents.db"}
+	}
+	if res.Error != nil {
+		return Item{Name: "Agents DB", Status: StatusWarn, Message: "present but unreadable", Details: *res.Error}
+	}
+	if res.Default != nil && *res.Default != "" {
+		return Item{
+			Name:    "Agents DB",
+			Status:  StatusPass,
+			Message: fmt.Sprintf("%d active agent(s), default=%s", res.Active, *res.Default),
+			Details: "path=/app/data/operator/agents.db",
+		}
+	}
+	return Item{
+		Name:        "Agents DB",
+		Status:      StatusWarn,
+		Message:     fmt.Sprintf("present, %d active agent(s), but no active default agent", res.Active),
+		Remediation: "Set a default agent in the Admin UI Agents tab.",
+	}
+}
+
 type configSummary struct {
 	AppName        string `json:"app_name"`
 	AudioTransport string `json:"audio_transport"`
@@ -598,6 +651,19 @@ type configSummary struct {
 		PortRange  string   `json:"port_range"`
 		AllowedIPs []string `json:"allowed_remote_hosts"`
 	} `json:"external_media"`
+	WebSocketMedia struct {
+		ConnectionMode string   `json:"connection_mode"`
+		BindHost       string   `json:"bind_host"`
+		AdvertiseHost  string   `json:"advertise_host"`
+		Port           int      `json:"port"`
+		Path           string   `json:"path"`
+		FallbackFormat string   `json:"fallback_format"`
+		ControlFormat  string   `json:"control_format"`
+		AllowedIPs     []string `json:"allowed_remote_hosts"`
+		AuthRequired   bool     `json:"auth_required"`
+		PasswordEnv    string   `json:"password_env"`
+		TLSEnabled     bool     `json:"tls_enabled"`
+	} `json:"websocket_media"`
 }
 
 func (r *Runner) readEffectiveConfig() (*configSummary, Item) {
@@ -628,6 +694,9 @@ try:
     asterisk = cfg.get("asterisk") or {}
     audiosocket = cfg.get("audiosocket") or {}
     external_media = cfg.get("external_media") or {}
+    websocket_media = cfg.get("websocket_media") or {}
+    websocket_auth = websocket_media.get("auth") or {}
+    websocket_tls = websocket_media.get("tls") or {}
     out["summary"] = {
         "app_name": (asterisk.get("app_name") or ""),
         "audio_transport": (cfg.get("audio_transport") or ""),
@@ -643,6 +712,19 @@ try:
             "rtp_port": int(external_media.get("rtp_port") or 0),
             "port_range": (external_media.get("port_range") or ""),
             "allowed_remote_hosts": list(external_media.get("allowed_remote_hosts") or []),
+        },
+        "websocket_media": {
+            "connection_mode": (websocket_media.get("connection_mode") or "asterisk_outbound"),
+            "bind_host": (websocket_media.get("bind_host") or "127.0.0.1"),
+            "advertise_host": (websocket_media.get("advertise_host") or "127.0.0.1"),
+            "port": int(websocket_media.get("port") or 8787),
+            "path": (websocket_media.get("path") or "/media"),
+            "fallback_format": (websocket_media.get("fallback_format") or "ulaw"),
+            "control_format": (websocket_media.get("control_format") or "json"),
+            "allowed_remote_hosts": list(websocket_media.get("allowed_remote_hosts") or ["127.0.0.1"]),
+            "auth_required": bool(websocket_auth.get("required", True)),
+            "password_env": (websocket_auth.get("password_env") or "ASTERISK_MEDIA_WS_PASSWORD"),
+            "tls_enabled": bool(websocket_tls.get("enabled", False)),
         },
     }
     out["ok"] = True
@@ -681,19 +763,27 @@ print(json.dumps(out))
 }
 
 type envSummary struct {
-	AsteriskHost             string `json:"ASTERISK_HOST"`
-	AsteriskARIPort          string `json:"ASTERISK_ARI_PORT"`
-	AsteriskARIScheme        string `json:"ASTERISK_ARI_SCHEME"`
-	AsteriskARISSLVerify     string `json:"ASTERISK_ARI_SSL_VERIFY"`
-	AsteriskAppName          string `json:"ASTERISK_APP_NAME"`
-	CallHistoryDBPath        string `json:"CALL_HISTORY_DB_PATH"`
-	CallHistoryEnabled       string `json:"CALL_HISTORY_ENABLED"`
-	ExternalAdvertiseHost    string `json:"EXTERNAL_MEDIA_ADVERTISE_HOST"`
-	AudioSocketAdvertiseHost string `json:"AUDIOSOCKET_ADVERTISE_HOST"`
-	LocalWSURL               string `json:"LOCAL_WS_URL"`
+	AsteriskHost                 string `json:"ASTERISK_HOST"`
+	AsteriskARIPort              string `json:"ASTERISK_ARI_PORT"`
+	AsteriskARIScheme            string `json:"ASTERISK_ARI_SCHEME"`
+	AsteriskARISSLVerify         string `json:"ASTERISK_ARI_SSL_VERIFY"`
+	AsteriskAppName              string `json:"ASTERISK_APP_NAME"`
+	CallHistoryDBPath            string `json:"CALL_HISTORY_DB_PATH"`
+	CallHistoryEnabled           string `json:"CALL_HISTORY_ENABLED"`
+	ExternalAdvertiseHost        string `json:"EXTERNAL_MEDIA_ADVERTISE_HOST"`
+	AudioSocketAdvertiseHost     string `json:"AUDIOSOCKET_ADVERTISE_HOST"`
+	AsteriskMediaWSSecretPresent bool   `json:"ASTERISK_MEDIA_WS_SECRET_PRESENT"`
+	LocalWSURL                   string `json:"LOCAL_WS_URL"`
 }
 
-func (r *Runner) readEnvSummary() (*envSummary, Item) {
+func websocketPasswordEnv(cfg *configSummary) string {
+	if cfg != nil && strings.TrimSpace(cfg.WebSocketMedia.PasswordEnv) != "" {
+		return strings.TrimSpace(cfg.WebSocketMedia.PasswordEnv)
+	}
+	return "ASTERISK_MEDIA_WS_PASSWORD"
+}
+
+func (r *Runner) readEnvSummary(cfg *configSummary) (*envSummary, Item) {
 	script := `
 import json, os
 
@@ -707,12 +797,17 @@ keys = [
   "CALL_HISTORY_ENABLED",
   "EXTERNAL_MEDIA_ADVERTISE_HOST",
   "AUDIOSOCKET_ADVERTISE_HOST",
+  "ASTERISK_MEDIA_WS_SECRET_PRESENT",
   "LOCAL_WS_URL",
 ]
 
 out = {k: (os.getenv(k, "") or "") for k in keys}
+out["ASTERISK_MEDIA_WS_SECRET_PRESENT"] = bool(os.getenv(__MEDIA_PASSWORD_ENV__, "").strip())
 print(json.dumps(out))
 `
+	passwordEnv := websocketPasswordEnv(cfg)
+	encodedEnv, _ := json.Marshal(passwordEnv)
+	script = strings.Replace(script, "__MEDIA_PASSWORD_ENV__", string(encodedEnv), 1)
 	raw, err := r.dockerExecPython(script)
 	if err != nil {
 		return nil, Item{Name: "Env", Status: StatusWarn, Message: "cannot read env from container", Details: err.Error()}
@@ -730,6 +825,7 @@ print(json.dumps(out))
 		"CALL_HISTORY_DB_PATH=" + emptyTo(env.CallHistoryDBPath, "(unset)"),
 		"EXTERNAL_MEDIA_ADVERTISE_HOST=" + emptyTo(env.ExternalAdvertiseHost, "(unset)"),
 		"AUDIOSOCKET_ADVERTISE_HOST=" + emptyTo(env.AudioSocketAdvertiseHost, "(unset)"),
+		passwordEnv + "=" + map[bool]string{true: "present", false: "missing"}[env.AsteriskMediaWSSecretPresent],
 		"LOCAL_WS_URL=" + emptyTo(env.LocalWSURL, "(unset)"),
 	}
 	return &env, Item{Name: "Env", Status: StatusPass, Message: "loaded (values redacted by design)", Details: strings.Join(details, "\n")}
@@ -752,14 +848,38 @@ func (r *Runner) checkTransportCompatibility(cfg *configSummary) Item {
 	if strings.TrimSpace(cfg.AudioSocket.Format) != "" && strings.ToLower(strings.TrimSpace(cfg.AudioSocket.Format)) != "slin" {
 		warnings = append(warnings, fmt.Sprintf("audiosocket.format=%q (validated baseline is slin)", cfg.AudioSocket.Format))
 	}
-	if transport != "" && transport != "audiosocket" && transport != "externalmedia" {
+	if transport != "" && transport != "audiosocket" && transport != "externalmedia" && transport != "websocket" {
 		return Item{
 			Name:        "Transport Compatibility",
 			Status:      StatusFail,
 			Message:     "invalid audio_transport",
 			Details:     fmt.Sprintf("audio_transport=%q", cfg.AudioTransport),
-			Remediation: "Set audio_transport to audiosocket or externalmedia (see docs/Transport-Mode-Compatibility.md).",
+			Remediation: "Set audio_transport to audiosocket, externalmedia, or websocket (see docs/Transport-Mode-Compatibility.md).",
 		}
+	}
+	if transport == "websocket" {
+		ws := cfg.WebSocketMedia
+		if ws.ConnectionMode != "asterisk_outbound" {
+			warnings = append(warnings, fmt.Sprintf("websocket_media.connection_mode=%q (v1 requires asterisk_outbound)", ws.ConnectionMode))
+		}
+		if ws.ControlFormat != "json" && ws.ControlFormat != "auto" && ws.ControlFormat != "plain" {
+			warnings = append(warnings, fmt.Sprintf("websocket_media.control_format=%q (requires json, auto, or plain)", ws.ControlFormat))
+		} else if ws.ControlFormat != "json" {
+			fyi = append(fyi, "Experimental legacy opt-in: plain only on exactly Asterisk 20.17.0; auto otherwise uses JSON on 20.18+/22.8+/23.2+. Verify engine requested/effective controls and readiness before calls.")
+		}
+		if ws.FallbackFormat != "ulaw" && ws.FallbackFormat != "alaw" && ws.FallbackFormat != "slin" && ws.FallbackFormat != "slin16" {
+			warnings = append(warnings, fmt.Sprintf("websocket_media.fallback_format=%q (must be ulaw, alaw, slin, or slin16)", ws.FallbackFormat))
+		}
+		if ws.AuthRequired && strings.TrimSpace(ws.PasswordEnv) == "" {
+			warnings = append(warnings, "websocket_media authentication requires a password_env reference")
+		}
+		if !ws.AuthRequired && ws.BindHost != "127.0.0.1" && ws.BindHost != "localhost" && ws.BindHost != "::1" {
+			warnings = append(warnings, "websocket_media authentication is required for non-loopback listeners")
+		}
+		if ws.Port < 1024 || ws.Port > 65535 || !strings.HasPrefix(ws.Path, "/") {
+			warnings = append(warnings, "websocket_media listener port/path is invalid")
+		}
+		fyi = append(fyi, "WebSocket uses the existing Stasis dialplan; configure matching websocket_client.conf and restart both services under your operating policy.")
 	}
 
 	if len(warnings) == 0 && len(fyi) > 0 {
@@ -812,6 +932,22 @@ func (r *Runner) checkAdvertiseHosts(cfg *configSummary, env *envSummary, ci *co
 	if !isLocalARI && strings.TrimSpace(cfg.ExternalMedia.RTPHost) == "127.0.0.1" {
 		notes = append(notes, "external_media.rtp_host=127.0.0.1 may break remote Asterisk RTP (bind host should usually be 0.0.0.0)")
 		remediation = append(remediation, "Set external_media.rtp_host: 0.0.0.0 and use EXTERNAL_MEDIA_ADVERTISE_HOST for remote reachability.")
+	}
+
+	if strings.ToLower(strings.TrimSpace(cfg.AudioTransport)) == "websocket" {
+		ws := cfg.WebSocketMedia
+		if ws.AuthRequired && !env.AsteriskMediaWSSecretPresent {
+			passwordEnv := websocketPasswordEnv(cfg)
+			notes = append(notes, passwordEnv+" is missing from the running ai_engine environment")
+			remediation = append(remediation, "Set "+passwordEnv+" in .env and recreate ai_engine.")
+		}
+		if (ws.BindHost != "127.0.0.1" && ws.BindHost != "localhost" && ws.BindHost != "::1") ||
+			(ws.AdvertiseHost != "127.0.0.1" && ws.AdvertiseHost != "localhost" && ws.AdvertiseHost != "::1") {
+			if !ws.TLSEnabled {
+				notes = append(notes, "WebSocket listener is non-loopback without TLS")
+				remediation = append(remediation, "Use wss with a trusted certificate for routed or untrusted networks.")
+			}
+		}
 	}
 
 	if len(notes) == 0 {

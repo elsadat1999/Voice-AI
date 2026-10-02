@@ -13,8 +13,8 @@ If you used the Admin UI Setup Wizard, you may not need to follow this guide end
 - `INSTALLATION.md`
 - `Transport-Mode-Compatibility.md`
 
-For how provider/context selection works (including `AI_CONTEXT` / `AI_PROVIDER`), see:
-- `Configuration-Reference.md` → "Call Selection & Precedence (Provider / Pipeline / Context)"
+For how provider/Agent selection works (including `AI_AGENT` / `AI_PROVIDER`), see:
+- `Configuration-Reference.md` → "Call Selection & Precedence (Provider / Pipeline / Agent)"
 
 ## Quick Start
 
@@ -48,7 +48,7 @@ GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account-key.json
 ```ini
 [from-ai-agent]
 exten => s,1,NoOp(AI Voice Agent - Google Live)
-exten => s,n,Set(AI_CONTEXT=demo_google_live)
+exten => s,n,Set(AI_AGENT=demo_google_live)
 exten => s,n,Set(AI_PROVIDER=google_live)
 exten => s,n,Stasis(asterisk-ai-voice-agent)
 exten => s,n,Hangup()
@@ -59,17 +59,17 @@ exten => s,n,Hangup()
 ```ini
 [from-ai-agent]
 exten => s,1,NoOp(AI Voice Agent - Google Cloud Pipeline)
-exten => s,n,Set(AI_CONTEXT=demo_google)
+exten => s,n,Set(AI_AGENT=demo_google)
 exten => s,n,Set(AI_PROVIDER=google_cloud_full)  ; example pipeline name (you define this in `pipelines:`)
 exten => s,n,Stasis(asterisk-ai-voice-agent)
 exten => s,n,Hangup()
 ```
 
-**Recommended**: Set `AI_CONTEXT` and `AI_PROVIDER` when you want an explicit per-extension override:
-- `AI_CONTEXT` selects the context (greeting, prompt, profile, tools)
+**Recommended**: Set `AI_AGENT` and `AI_PROVIDER` when you want an explicit per-extension override:
+- `AI_AGENT` selects the Agent (greeting, prompt, profile, tools)
 - `AI_PROVIDER` selects the provider (e.g., `google_live`) or a pipeline name you defined under `pipelines:` (e.g., `google_cloud_full`)
 
-If you omit these, the engine will select a context/provider using the precedence rules in `docs/Configuration-Reference.md`.
+If you omit these, the engine selects the default Agent/provider using the precedence rules in `docs/Configuration-Reference.md`.
 
 ### 4. Restart Asterisk
 
@@ -138,7 +138,7 @@ pipelines:
 
 **Solution**: Add both variables to dialplan:
 ```ini
-exten => s,n,Set(AI_CONTEXT=demo_google)
+exten => s,n,Set(AI_AGENT=demo_google)
 exten => s,n,Set(AI_PROVIDER=google_cloud_full)
 ```
 
@@ -253,12 +253,14 @@ Use the same `GOOGLE_API_KEY` from pipeline setup:
 GOOGLE_API_KEY=your_api_key_here
 ```
 
+The setup wizard validates the key with Google's `models.list` endpoint. If that endpoint succeeds but does not advertise any `bidiGenerateContent` models, the wizard now treats Live model discovery as inconclusive instead of blocking setup. It will warn and continue with `gemini-2.5-flash-native-audio-latest`; if runtime calls fail, verify Live API access, billing/quota, and the currently available models in AI Studio.
+
 ### 3. Update Dialplan
 
 ```asterisk
 [from-ai-agent]
 exten => s,1,NoOp(Google Live API Demo)
-same => n,Set(AI_CONTEXT=demo_google_live)
+same => n,Set(AI_AGENT=demo_google_live)
 same => n,Set(AI_PROVIDER=google_live)  ; Use real-time agent
 same => n,Stasis(asterisk-ai-voice-agent)
 same => n,Hangup()
@@ -343,19 +345,42 @@ providers:
 
 Google publishes Gemini Live models on two surfaces with different lifecycles. Pick based on which auth mode you're using (see [Provider-Vertex-Setup.md](Provider-Vertex-Setup.md) for Vertex AI auth):
 
-| Model ID | Surface | Status (2026-04) | Notes |
+| Model ID | Surface | Status | Notes |
 |----------|---------|------------------|-------|
 | `gemini-2.5-flash-native-audio-latest` | Developer API | Preview alias | **Shipped default.** Tracks Google's newest 2.5 native-audio snapshot automatically. |
 | `gemini-2.5-flash-native-audio-preview-12-2025` | Developer API | Preview, dated | Pin this for reproducibility — guarantees a fixed snapshot. |
 | `gemini-3.1-flash-live-preview` | Developer API | Preview, newest generation | Gemini 3.1 generation Live model. Evaluate before flipping the default; tool-calling parity not yet validated for AAVA. |
+| `gemini-3.8-live` | Developer API **or** Vertex AI | **GA** | Opt-in 3.8 Live. AAVA forces AUDIO output and uses ID-matched tool replies; read-only extension checks are non-blocking, while call-state actions remain blocking. Limited Vertex live-call validation is complete; broader qualification remains. |
 | `gemini-live-2.5-flash-native-audio` | **Vertex AI** | **GA** | Use via `use_vertex_ai: true`. SLA, VPC-SC, fewer function-calling bugs (see [Provider-Vertex-Setup.md](Provider-Vertex-Setup.md)). |
 
 **Recommendation:**
-- **Developer API users** → keep the shipped `gemini-2.5-flash-native-audio-latest` unless you need pinned reproducibility (then use the dated string).
-- **Production / enterprise** → switch to Vertex AI mode and use `gemini-live-2.5-flash-native-audio` for GA-grade reliability and the function-calling fix.
-- **Evaluating Gemini 3.1** → swap to `gemini-3.1-flash-live-preview` in a non-prod context first; report back via Discord/issues if function-calling and barge-in behave well end-to-end.
+- **Production voice agents** → keep the established **Vertex AI mode** (`use_vertex_ai: true`) with `gemini-live-2.5-flash-native-audio` until 3.8 has broader production qualification. See the **Barge-In (Interruption)** section below and [Provider-Vertex-Setup.md](Provider-Vertex-Setup.md).
+- **Evaluating Gemini 3.8 Live** → select `gemini-3.8-live` with either API mode. It is [GA on Vertex AI](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/live-api) and [available on the Developer API](https://ai.google.dev/gemini-api/docs/models/gemini-3.8-live). The Admin UI locks Response Modalities to Audio Only for this model; enable output transcription separately if text is needed. Google defaults its function calls to non-blocking; AAVA keeps call-control tools blocking and allows only read-only extension status checks to run asynchronously. Test greeting, transcription, interruption, tools, transfer, and farewell before production use; the existing 2.5 default is unchanged.
+
+- **Developer API evaluation / non-prod** → the shipped `gemini-2.5-flash-native-audio-latest` works for basic conversation flow but server-side barge-in is unreliable. Acceptable for demos and feature evaluation; not recommended for production telephony where mid-utterance interruption matters.
+- **Pinned snapshot for reproducibility** → use `gemini-2.5-flash-native-audio-preview-12-2025` (or dated `-09-2025`) instead of the floating `-latest` alias.
+- **Evaluating Gemini 3.1** → swap to `gemini-3.1-flash-live-preview` in a non-prod context first; tool-calling and barge-in parity not yet validated for AAVA — report back via Discord/issues.
+
+On voiprnd, Vertex `us-central1` 3.8 call `1790560988.243` completed with interruption, extension and calendar tools, an unanswered attended transfer that returned to the agent, and a drained farewell/hangup. Vertex 2.5 call `1790561587.250` also completed after a model switch, including tools, unanswered-transfer recovery, and hangup. These are one environment's live validations, not a blanket guarantee for every region, Developer API mode, or production workload.
+
+Gemini 3.8 Live tool declarations use an explicit execution policy. New tools default to `BLOCKING`; `check_extension_status` is `NON_BLOCKING` with `WHEN_IDLE` result scheduling. Calls are tracked by Google's function-call ID, duplicate IDs are ignored, and cancellations stop queued or read-only work. If a transfer or other state-changing action is already running, AAVA lets it finish rather than canceling halfway through; after a disconnect it records the outcome without sending a result into a closed session. Other Google Live models retain their existing tool protocol.
 
 > Older Live models (`gemini-2.0-flash-live-001-preview-*`) are no longer listed on Google's models page and should not be used for new deployments.
+
+#### Gemini 3.1 Flash Live — verified working on Developer API
+
+End-to-end testing on 2026-05-09 with `llm_model: gemini-3.1-flash-live-preview` against the Developer API endpoint confirmed full conversational compatibility with AAVA's existing code path:
+
+- WebSocket connect, `setupComplete` ACK, greeting playback, and **basic `hangup_call` tool execution** (with farewell `clientContent` round-trip) worked unchanged. **Broader tool-calling parity (Microsoft Calendar, transfer tools, multi-tool turns) was not exercised** in Phase 0 testing and remains the "not yet validated for AAVA" caveat noted in the model table above.
+- Multi-part `serverContent` envelopes (a 3.1 behavioral change where a single event can carry both `modelTurn` and `outputTranscription` simultaneously) are handled correctly by the current parser — observed 94 multi-part envelopes in a 59-second test call, zero parse errors, zero unhandled message types.
+- Tool-call → farewell `clientContent` round-trip succeeds mid-conversation despite Google's docs implying `sendClientContent` is initial-history-only on 3.1; Google appears to accept it in practice without `initial_history_in_client_content: true` in the session config.
+
+**Caveats** (same as the 2.5 native-audio family on Developer API):
+
+- Server-side `interrupted` VAD is preview-tier; mid-utterance barge-in is unreliable even on 3.1. For production-grade barge-in, switch to Vertex AI mode and use `gemini-live-2.5-flash-native-audio` (GA).
+- AAVA's `clientContent` callsites (the `_send_greeting` helper and the post-tool farewell handler in `src/providers/google_live.py`) work today but should be migrated to `realtimeInput` with a text field if Google tightens enforcement of the 3.1 history-only restriction in a future release.
+
+Investigation logs and timeline are captured in the [#350 / #356 verification discussion on PR #384](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/pull/384).
 
 ### Hangup Fallback Tuning
 
@@ -371,10 +396,22 @@ The fallback watchdog protects against stuck calls:
 
 ### 1. Barge-In (Interruption)
 
-**Automatic** - No configuration needed:
-- User speaks → Gemini detects via built-in VAD
-- Agent stops talking immediately
-- User's speech is processed
+Barge-in on Google Live is driven by **server-side VAD** that fires `serverContent.interrupted=true` when the model detects the caller speaking during agent audio output. AAVA's engine receives this signal as a `ProviderBargeIn` event and flushes pending TTS.
+
+**Reliability depends on which Google model surface you're using:**
+
+| Surface | Model | Server-side `interrupted` reliability |
+|---------|-------|---------------------------------------|
+| **Vertex AI** | `gemini-live-2.5-flash-native-audio` (**GA**) | Reliable — production-grade |
+| Developer API | `gemini-2.5-flash-native-audio-latest` (preview alias) | **Unreliable** — server-side `interrupted` may not fire on this preview model variant |
+| Developer API | `gemini-2.5-flash-native-audio-preview-12-2025` (dated preview) | Unverified — preview-tier; behavior may change without notice |
+| Developer API | `gemini-3.1-flash-live-preview` | New preview generation; tool-calling parity not yet validated for AAVA |
+
+**Recommendation for production voice agents: use Vertex AI mode** (`use_vertex_ai: true` + the GA model). This is not a workaround — it reflects Google's current product state where only Vertex publishes a GA Live native-audio model. See [Provider-Vertex-Setup.md](Provider-Vertex-Setup.md).
+
+**Status: documented limitation, not a code fix.** Issue [#351](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues/351) is resolved in v6.5.0 by recommending Vertex AI mode for production, not by code changes. AAVA's TTS-input gating (which mutes caller audio during agent speech to prevent self-echo on Google Live) still applies unconditionally to all Google Live providers and modes — `vad_mode: provider` does not yet skip this gating despite the UI's documented intent. A v6.6 follow-up tracks the architectural fix (refactor silence-gating to honor `vad_mode`); the attempt that landed and was reverted on this branch (`1763a441` → `cead273a`) demonstrated that the audio-forwarding path on AudioSocket has downstream dependencies on either silence injection or `vad_manager` being non-None that aren't safely refactored without a broader audio-path overhaul.
+
+**Why the Dev API preview path is unreliable empirically:** Side-by-side testing showed that with the same VAD config, same audio path, and same client gating logic, Vertex's GA model fires `serverContent.interrupted` reliably during caller overlap, while Dev API's `*-native-audio-latest` alias does not. The differentiator is the model variant, not AAVA's code path.
 
 ### 2. Function Calling
 
@@ -411,7 +448,7 @@ Conversation context is maintained automatically:
 |---------------|---------|
 | **Audio format** | Requires 16kHz PCM input (resampling needed for 8kHz) |
 | **WebSocket** | Persistent connection (manage reconnection) |
-| **API availability** | Live API is still preview-labeled (use currently supported preview model IDs) |
+| **API availability** | Live API is still preview-labeled. Google's model-discovery metadata can lag or omit Live-capable models for some keys, so setup warns rather than treating missing `bidiGenerateContent` listings as an invalid key. |
 | **Latency** | Network-dependent (test in your environment) |
 
 ## Cost Comparison
@@ -468,23 +505,27 @@ Pricing changes frequently; verify current rates and quotas in your Google Cloud
 
 ### Issue: Barge-In Not Working
 
-**Note**: Barge-in is **automatic** with Google Live. If not working:
-1. Confirm using `AI_PROVIDER=google_live` (not pipeline)
-2. Check VAD is active: `docker logs ai_engine 2>&1 | grep -i vad`
-3. Verify WebSocket messages: `docker logs ai_engine 2>&1 | grep -i inputtranscription`
+Barge-in on Google Live depends on `serverContent.interrupted=true` firing from Google's server-side VAD. As documented in the **Barge-In (Interruption)** section above, this is reliable on Vertex AI's GA model but **unreliable on the Developer API preview models**.
+
+**If barge-in is not working:**
+
+1. **Confirm provider**: `AI_PROVIDER=google_live` (not a pipeline)
+2. **Confirm Vertex mode for production**: Set `use_vertex_ai: true` and use `gemini-live-2.5-flash-native-audio` (the GA model). See [Provider-Vertex-Setup.md](Provider-Vertex-Setup.md).
+3. **Inspect engine logs** for `Google Live server-side interruption detected`. If those entries are absent during a call where you deliberately overlapped caller speech with agent TTS, Google's server-side VAD is not firing — on Dev API previews this is expected; switch to Vertex GA.
+4. **Verify caller audio energy** — telephony callers often have low input RMS (~25). Local-VAD fallback uses `vad_energy_threshold` (default `1500`) which is calibrated for clean studio audio. For pure-telephony deployments, server-side VAD on Vertex's GA model is the path that actually works; local VAD is unlikely to fire.
 
 ## Migration from Pipeline to Live
 
 ### Before (Pipeline Mode)
 ```asterisk
-Set(AI_CONTEXT=demo_google)
+Set(AI_AGENT=demo_google)
 ; AI_PROVIDER defaults to your configured `default_provider`
 Stasis(asterisk-ai-voice-agent)
 ```
 
 ### After (Live API Mode)
 ```asterisk
-Set(AI_CONTEXT=demo_google_live)
+Set(AI_AGENT=demo_google_live)
 Set(AI_PROVIDER=google_live)  ; Enable real-time agent
 Stasis(asterisk-ai-voice-agent)
 ```

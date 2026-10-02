@@ -1,0 +1,480 @@
+// @vitest-environment jsdom
+
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import '@testing-library/jest-dom/vitest';
+import axios from 'axios';
+import yaml from 'js-yaml';
+import { MemoryRouter } from 'react-router-dom';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+import ProvidersPage from './ProvidersPage';
+
+const mocks = vi.hoisted(() => ({
+    config: {} as Record<string, unknown>,
+    refetch: vi.fn().mockResolvedValue(undefined),
+    confirm: vi.fn().mockResolvedValue(true),
+    loadConfigYaml: vi.fn(),
+    toastError: vi.fn(),
+}));
+
+vi.mock('axios');
+vi.mock('sonner', () => ({
+    toast: {
+        error: mocks.toastError,
+        success: vi.fn(),
+        warning: vi.fn(),
+        info: vi.fn(),
+    },
+}));
+vi.mock('../hooks/useConfirmDialog', () => ({
+    useConfirmDialog: () => ({ confirm: mocks.confirm }),
+}));
+vi.mock('../hooks/useRestartRequired', () => ({
+    useRestartRequired: () => ({
+        restartRequired: false,
+        refetch: mocks.refetch,
+    }),
+}));
+vi.mock('../utils/configCache', () => ({
+    getCachedConfig: () => ({ config: mocks.config, yamlError: null }),
+    loadConfigYaml: mocks.loadConfigYaml,
+}));
+
+describe('ProvidersPage OpenAI Realtime save contract', () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+        mocks.confirm.mockResolvedValue(true);
+        mocks.loadConfigYaml.mockImplementation(async () => ({
+            config: mocks.config,
+            yamlError: null,
+        }));
+        vi.mocked(axios.get).mockResolvedValue({ data: {} });
+        vi.mocked(axios.post).mockResolvedValue({ data: {}, status: 200 });
+    });
+
+    it.each([
+        {
+            label: 'explicit GA',
+            apiVersion: 'ga',
+            expectedEncoding: 'linear16',
+            expectedRate: 24000,
+        },
+        {
+            label: 'the omitted API version that defaults to GA',
+            apiVersion: undefined,
+            expectedEncoding: 'linear16',
+            expectedRate: 24000,
+        },
+        {
+            label: 'Beta',
+            apiVersion: 'beta',
+            expectedEncoding: 'mulaw',
+            expectedRate: 8000,
+        },
+    ])('serializes the correct audio pair for $label', async ({
+        apiVersion,
+        expectedEncoding,
+        expectedRate,
+    }) => {
+        mocks.config = {
+            providers: {
+                openai_realtime: {
+                    type: 'openai_realtime',
+                    capabilities: ['stt', 'llm', 'tts'],
+                    enabled: true,
+                    ...(apiVersion ? { api_version: apiVersion } : {}),
+                    output_encoding: 'mulaw',
+                    output_sample_rate_hz: 8000,
+                    model: 'gpt-realtime',
+                    voice: 'alloy',
+                },
+            },
+            default_provider: 'openai_realtime',
+        };
+
+        render(
+            <MemoryRouter>
+                <ProvidersPage />
+            </MemoryRouter>,
+        );
+
+        fireEvent.click(await screen.findByRole('button', { name: 'Settings for openai_realtime', exact: true }));
+        const dialog = await screen.findByRole('dialog', {
+            name: 'Edit Provider: openai_realtime',
+        });
+        fireEvent.click(within(dialog).getByRole('button', { name: 'Save Changes' }));
+
+        await waitFor(() => {
+            expect(axios.post).toHaveBeenCalledWith(
+                '/api/config/yaml',
+                expect.objectContaining({ content: expect.any(String) }),
+            );
+        });
+        const saveCall = vi.mocked(axios.post).mock.calls.find(([url]) => url === '/api/config/yaml');
+        expect(saveCall).toBeDefined();
+        const body = saveCall?.[1] as { content: string };
+        const saved = yaml.load(body.content) as {
+            providers: Record<string, Record<string, unknown>>;
+        };
+        expect(saved.providers.openai_realtime.output_encoding).toBe(expectedEncoding);
+        expect(saved.providers.openai_realtime.output_sample_rate_hz).toBe(expectedRate);
+        if (apiVersion === undefined) {
+            expect(saved.providers.openai_realtime).not.toHaveProperty('api_version');
+        } else {
+            expect(saved.providers.openai_realtime.api_version).toBe(apiVersion);
+        }
+    });
+
+    it('does not replace provider B form data when provider A reset completes late', async () => {
+        mocks.config = {
+            providers: {
+                provider_a: {
+                    type: 'openai_realtime',
+                    capabilities: ['stt', 'llm', 'tts'],
+                    model: 'gpt-realtime',
+                },
+                provider_b: {
+                    type: 'deepgram',
+                    capabilities: ['stt', 'llm', 'tts'],
+                    model: 'nova-3',
+                },
+            },
+        };
+        let resolveResetFetch: (value: unknown) => void = () => undefined;
+        const resetFetch = new Promise((resolve) => {
+            resolveResetFetch = resolve;
+        });
+
+        render(
+            <MemoryRouter>
+                <ProvidersPage />
+            </MemoryRouter>,
+        );
+
+        fireEvent.click(await screen.findByRole('button', { name: 'Settings for provider_a', exact: true }));
+        const providerADialog = await screen.findByRole('dialog', {
+            name: 'Edit Provider: provider_a',
+        });
+        mocks.loadConfigYaml.mockReturnValueOnce(resetFetch);
+        fireEvent.click(within(providerADialog).getByRole('button', {
+            name: 'Restore audio defaults',
+        }));
+        await waitFor(() => expect(mocks.loadConfigYaml).toHaveBeenCalledTimes(2));
+
+        fireEvent.click(within(providerADialog).getByRole('button', { name: 'Cancel' }));
+        fireEvent.click(screen.getByRole('button', { name: 'Settings for provider_b', exact: true }));
+        const providerBDialog = await screen.findByRole('dialog', {
+            name: 'Edit Provider: provider_b',
+        });
+        expect(within(providerBDialog).getByDisplayValue('provider_b')).toBeInTheDocument();
+
+        await act(async () => {
+            resolveResetFetch({
+                config: {
+                    providers: {
+                        provider_a: {
+                            type: 'openai_realtime',
+                            capabilities: ['stt', 'llm', 'tts'],
+                            model: 'reset-a',
+                        },
+                        provider_b: {
+                            type: 'deepgram',
+                            capabilities: ['stt', 'llm', 'tts'],
+                            model: 'nova-3',
+                        },
+                    },
+                },
+                yamlError: null,
+            });
+        });
+
+        await waitFor(() => {
+            expect(within(providerBDialog).getByDisplayValue('provider_b')).toBeInTheDocument();
+        });
+        expect(within(providerBDialog).queryByDisplayValue('provider_a')).not.toBeInTheDocument();
+    });
+
+    it('does not restore a deleted Google credentials path on provider save', async () => {
+        mocks.config = {
+            providers: {
+                google_live: {
+                    type: 'google_live',
+                    capabilities: ['stt', 'llm', 'tts'],
+                    enabled: true,
+                    use_vertex_ai: true,
+                    llm_model: 'gemini-live-2.5-flash-native-audio',
+                    credentials_path:
+                        '/app/project/secrets/providers/google_live/vertex-service-account.json',
+                },
+            },
+            default_provider: 'google_live',
+        };
+        vi.mocked(axios.get).mockImplementation(async url => {
+            if (url === '/api/config/vertex-ai/regions') {
+                return { data: { regions: [] } };
+            }
+            if (url === '/api/config/providers/google_live/credentials') {
+                return {
+                    data: {
+                        credentials: {
+                            'vertex-json': {
+                                uploaded: true,
+                                configured: true,
+                                filename: 'vertex-service-account.json',
+                            },
+                        },
+                    },
+                };
+            }
+            return { data: {} };
+        });
+        vi.mocked(axios.delete).mockResolvedValue({ data: {} });
+
+        render(
+            <MemoryRouter>
+                <ProvidersPage />
+            </MemoryRouter>,
+        );
+
+        fireEvent.click(await screen.findByRole('button', { name: 'Settings for google_live', exact: true }));
+        const dialog = await screen.findByRole('dialog', {
+            name: 'Edit Provider: google_live',
+        });
+        fireEvent.click(await within(dialog).findByTitle('Delete credentials'));
+        await waitFor(() =>
+            expect(axios.delete).toHaveBeenCalledWith(
+                '/api/config/providers/google_live/credentials/vertex-json',
+            ),
+        );
+        fireEvent.click(within(dialog).getByRole('button', { name: 'Save Changes' }));
+
+        await waitFor(() => {
+            expect(axios.post).toHaveBeenCalledWith(
+                '/api/config/yaml',
+                expect.objectContaining({ content: expect.any(String) }),
+            );
+        });
+        const saveCall = vi.mocked(axios.post).mock.calls.find(([url]) => url === '/api/config/yaml');
+        const saved = yaml.load((saveCall?.[1] as { content: string }).content) as {
+            providers: Record<string, Record<string, unknown>>;
+        };
+        expect(saved.providers.google_live).not.toHaveProperty('credentials_path');
+    });
+
+    it('removes stale Flux-only fields when Deepgram is saved with Nova-3', async () => {
+        mocks.config = {
+            providers: {
+                deepgram: {
+                    type: 'deepgram',
+                    capabilities: ['stt', 'llm', 'tts'],
+                    enabled: true,
+                    model: 'nova-3',
+                    agent_language: 'es',
+                    tts_model: 'aura-2-celeste-es',
+                    version: 'v2',
+                    eot_threshold: 0.7,
+                    eager_eot_threshold: 0.5,
+                    keyterms: ['Asterisk'],
+                },
+            },
+            default_provider: 'deepgram',
+        };
+
+        render(
+            <MemoryRouter>
+                <ProvidersPage />
+            </MemoryRouter>,
+        );
+
+        fireEvent.click(await screen.findByRole('button', { name: 'Settings for deepgram', exact: true }));
+        const dialog = await screen.findByRole('dialog', {
+            name: 'Edit Provider: deepgram',
+        });
+        fireEvent.click(within(dialog).getByRole('button', { name: 'Save Changes' }));
+
+        await waitFor(() => {
+            expect(axios.post).toHaveBeenCalledWith(
+                '/api/config/yaml',
+                expect.objectContaining({ content: expect.any(String) }),
+            );
+        });
+        const saveCall = vi.mocked(axios.post).mock.calls.find(([url]) => url === '/api/config/yaml');
+        const body = saveCall?.[1] as { content: string };
+        const saved = yaml.load(body.content) as {
+            providers: Record<string, Record<string, unknown>>;
+        };
+        expect(saved.providers.deepgram.model).toBe('nova-3');
+        expect(saved.providers.deepgram).not.toHaveProperty('version');
+        expect(saved.providers.deepgram).not.toHaveProperty('eot_threshold');
+        expect(saved.providers.deepgram).not.toHaveProperty('eager_eot_threshold');
+        expect(saved.providers.deepgram).not.toHaveProperty('keyterms');
+    });
+
+    it('preserves version and tuning fields for a custom Deepgram model', async () => {
+        mocks.config = {
+            providers: {
+                deepgram: {
+                    type: 'deepgram',
+                    capabilities: ['stt', 'llm', 'tts'],
+                    enabled: true,
+                    model: 'customer-private-model',
+                    agent_language: 'en',
+                    tts_model: 'aura-2-luna-en',
+                    version: 'private-v2',
+                    eot_threshold: 0.8,
+                    eager_eot_threshold: 0.4,
+                    keyterms: ['PrivateTerm'],
+                },
+            },
+            default_provider: 'deepgram',
+        };
+
+        render(
+            <MemoryRouter>
+                <ProvidersPage />
+            </MemoryRouter>,
+        );
+
+        fireEvent.click(await screen.findByRole('button', { name: 'Settings for deepgram', exact: true }));
+        const dialog = await screen.findByRole('dialog', {
+            name: 'Edit Provider: deepgram',
+        });
+        fireEvent.click(within(dialog).getByRole('button', { name: 'Save Changes' }));
+
+        await waitFor(() => {
+            expect(axios.post).toHaveBeenCalledWith(
+                '/api/config/yaml',
+                expect.objectContaining({ content: expect.any(String) }),
+            );
+        });
+        const saveCall = vi.mocked(axios.post).mock.calls.find(([url]) => url === '/api/config/yaml');
+        const body = saveCall?.[1] as { content: string };
+        const saved = yaml.load(body.content) as {
+            providers: Record<string, Record<string, unknown>>;
+        };
+        expect(saved.providers.deepgram).toEqual(
+            expect.objectContaining({
+                model: 'customer-private-model',
+                version: 'private-v2',
+                eot_threshold: 0.8,
+                eager_eot_threshold: 0.4,
+                keyterms: ['PrivateTerm'],
+            }),
+        );
+    });
+
+    it('serializes the OpenAI Realtime template with the GA output contract', async () => {
+        mocks.config = { providers: {} };
+
+        render(
+            <MemoryRouter>
+                <ProvidersPage />
+            </MemoryRouter>,
+        );
+
+        fireEvent.click(await screen.findByRole('button', { name: 'Add Provider Templates' }));
+        const dialog = await screen.findByRole('dialog', { name: 'Add Provider Templates' });
+        fireEvent.click(within(dialog).getByRole('checkbox', { name: /OpenAI Realtime/i }));
+        fireEvent.click(within(dialog).getByRole('button', { name: 'Add Selected' }));
+
+        await waitFor(() => {
+            expect(axios.post).toHaveBeenCalledWith(
+                '/api/config/yaml',
+                expect.objectContaining({ content: expect.any(String) }),
+            );
+        });
+        const saveCall = vi.mocked(axios.post).mock.calls.find(([url]) => url === '/api/config/yaml');
+        const body = saveCall?.[1] as { content: string };
+        const saved = yaml.load(body.content) as {
+            providers: Record<string, Record<string, unknown>>;
+        };
+        expect(saved.providers.openai_realtime).toMatchObject({
+            api_version: 'ga',
+            output_encoding: 'linear16',
+            output_sample_rate_hz: 24000,
+        });
+    });
+
+    it('offers and serializes the DeepSeek modular LLM template', async () => {
+        mocks.config = { providers: {} };
+
+        render(
+            <MemoryRouter>
+                <ProvidersPage />
+            </MemoryRouter>,
+        );
+
+        fireEvent.click(await screen.findByRole('button', { name: 'Add Provider Templates' }));
+        const dialog = await screen.findByRole('dialog', { name: 'Add Provider Templates' });
+        fireEvent.click(within(dialog).getByRole('checkbox', { name: /DeepSeek LLM/i }));
+        fireEvent.click(within(dialog).getByRole('button', { name: 'Add Selected' }));
+
+        await waitFor(() => {
+            expect(axios.post).toHaveBeenCalledWith(
+                '/api/config/yaml',
+                expect.objectContaining({ content: expect.any(String) }),
+            );
+        });
+        const saveCall = vi.mocked(axios.post).mock.calls.find(([url]) => url === '/api/config/yaml');
+        const body = saveCall?.[1] as { content: string };
+        const saved = yaml.load(body.content) as {
+            providers: Record<string, Record<string, unknown>>;
+        };
+        expect(saved.providers.deepseek_llm).toMatchObject({
+            enabled: false,
+            type: 'openai',
+            capabilities: ['llm'],
+            chat_base_url: 'https://api.deepseek.com',
+            api_key_env: 'DEEPSEEK_API_KEY',
+            chat_model: 'deepseek-v4-flash',
+        });
+    });
+
+    it('offers and serializes the Google Gemini modular LLM template', async () => {
+        mocks.config = {
+            providers: {
+                existing_llm: {
+                    enabled: true,
+                    type: 'openai',
+                    capabilities: ['llm'],
+                    chat_model: 'existing-model',
+                },
+            },
+        };
+
+        render(
+            <MemoryRouter>
+                <ProvidersPage />
+            </MemoryRouter>,
+        );
+
+        fireEvent.click(await screen.findByRole('button', { name: 'Add Provider Templates' }));
+        const dialog = await screen.findByRole('dialog', { name: 'Add Provider Templates' });
+        fireEvent.click(within(dialog).getByRole('checkbox', { name: /Google Gemini LLM/i }));
+        fireEvent.click(within(dialog).getByRole('button', { name: 'Add Selected' }));
+
+        await waitFor(() => {
+            expect(axios.post).toHaveBeenCalledWith(
+                '/api/config/yaml',
+                expect.objectContaining({ content: expect.any(String) }),
+            );
+        });
+        const saveCall = vi.mocked(axios.post).mock.calls.find(([url]) => url === '/api/config/yaml');
+        const body = saveCall?.[1] as { content: string };
+        const saved = yaml.load(body.content) as {
+            providers: Record<string, Record<string, unknown>>;
+        };
+        expect(saved.providers.existing_llm).toMatchObject({
+            enabled: true,
+            chat_model: 'existing-model',
+        });
+        expect(saved.providers.google_llm).toEqual({
+            enabled: false,
+            type: 'google',
+            capabilities: ['llm'],
+            api_key_env: 'GOOGLE_API_KEY',
+            llm_base_url: 'https://generativelanguage.googleapis.com/v1',
+            llm_model: 'gemini-2.5-flash',
+        });
+    });
+});

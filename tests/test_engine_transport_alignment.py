@@ -4,6 +4,8 @@ import pytest
 
 from src.engine import Engine, _CODEC_ALIGNMENT
 from src.core.models import CallSession, LegacyTransportProfile
+from src.config import GoogleProviderConfig
+from src.providers.google_live import GoogleLiveProvider
 
 
 def _make_session(call_id: str, fmt: str, rate: int) -> CallSession:
@@ -16,6 +18,7 @@ def _make_session(call_id: str, fmt: str, rate: int) -> CallSession:
 def _make_engine() -> Engine:
     engine = Engine.__new__(Engine)
     engine.providers = {}
+    engine.provider_kinds = {}
     engine._call_providers = {}
     engine.call_audio_preferences = {}
     engine._transport_card_logged = set()
@@ -87,3 +90,70 @@ def test_resolve_stream_targets_pass_through_when_aligned():
     assert remediation is None
     assert session.codec_alignment_ok is True
     _CODEC_ALIGNMENT.remove("openai_realtime")
+
+
+@pytest.mark.parametrize("provider_name", ["grok", "grok3", "openai_realtime", "deepgram", "elevenlabs_agent"])
+def test_externalmedia_forwards_gated_audio_to_native_barge_in_providers(provider_name):
+    engine = _make_engine()
+    capabilities = types.SimpleNamespace(
+        requires_continuous_audio=True,
+        has_native_vad=True,
+        has_native_barge_in=True,
+    )
+
+    assert engine._externalmedia_continuous_input_mode(
+        provider_name,
+        capabilities,
+        audio_capture_enabled=False,
+    ) == "forward"
+
+
+def test_externalmedia_keeps_google_silence_gating_during_output():
+    engine = _make_engine()
+    capabilities = types.SimpleNamespace(
+        requires_continuous_audio=True,
+        has_native_vad=True,
+        has_native_barge_in=True,
+    )
+
+    assert engine._externalmedia_continuous_input_mode(
+        "google_live",
+        capabilities,
+        audio_capture_enabled=False,
+    ) == "silence"
+
+
+@pytest.mark.parametrize("model,enabled,expected", [
+    ("gemini-3.8-live", True, "forward"),
+    ("gemini-3.8-live", False, "silence"),
+    ("gemini-live-2.5-flash-native-audio", True, "silence"),
+])
+def test_externalmedia_google_barge_in_mode_is_model_scoped(model, enabled, expected):
+    engine = _make_engine()
+    provider = GoogleLiveProvider(
+        config=GoogleProviderConfig(llm_model=model, full_duplex_barge_in_3_8=enabled),
+        on_event=lambda event: None,
+    )
+    capabilities = types.SimpleNamespace(
+        requires_continuous_audio=True,
+        has_native_vad=True,
+        has_native_barge_in=True,
+    )
+    assert engine._externalmedia_continuous_input_mode(
+        "google_live", capabilities, audio_capture_enabled=False, provider=provider,
+    ) == expected
+
+
+def test_externalmedia_drops_gated_audio_without_native_barge_in():
+    engine = _make_engine()
+    capabilities = types.SimpleNamespace(
+        requires_continuous_audio=True,
+        has_native_vad=True,
+        has_native_barge_in=False,
+    )
+
+    assert engine._externalmedia_continuous_input_mode(
+        "legacy_full_agent",
+        capabilities,
+        audio_capture_enabled=False,
+    ) == "drop"

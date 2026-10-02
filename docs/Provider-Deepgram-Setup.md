@@ -10,8 +10,8 @@ If you used the Admin UI Setup Wizard, you may not need to follow this guide end
 - `INSTALLATION.md`
 - `Transport-Mode-Compatibility.md`
 
-For how provider/context selection works (including `AI_CONTEXT` / `AI_PROVIDER`), see:
-- `Configuration-Reference.md` → "Call Selection & Precedence (Provider / Pipeline / Context)"
+For how provider/Agent selection works (including `AI_AGENT` / `AI_PROVIDER`), see:
+- `Configuration-Reference.md` → "Call Selection & Precedence (Provider / Pipeline / Agent)"
 
 ## Quick Start
 
@@ -30,6 +30,10 @@ Add your Deepgram API key to `.env`:
 # Deepgram Voice Agent (required for deepgram provider)
 DEEPGRAM_API_KEY=your_api_key_here
 ```
+
+The default Voice Agent Think stage is managed by Deepgram. It does not require
+or send a separate `OPENAI_API_KEY`; that key is needed only by configurations
+that independently use an OpenAI provider or modular OpenAI LLM component.
 
 **Test API Key**:
 ```bash
@@ -52,6 +56,7 @@ providers:
     
     # Models — see "Choosing models" below
     model: nova-3                        # Deepgram's current recommended default
+    agent_language: en                   # en, es, de, fr, it, nl, or ja
     tts_model: aura-2-thalia-en
     
     # Audio (telephony defaults)
@@ -67,6 +72,7 @@ providers:
 
 **Key Settings**:
 - `model`: Deepgram listen (STT) model — see **Choosing models** below
+- `agent_language`: Voice Agent conversation language; must match the Aura voice suffix
 - `tts_model`: Aura speak (TTS) voice (example: `aura-2-thalia-en`)
 - `input_encoding`/`input_sample_rate_hz`: what the engine receives from Asterisk (telephony defaults are μ-law @ 8 kHz)
 
@@ -74,12 +80,41 @@ providers:
 
 | Model | Type | Status | When to use |
 |-------|------|--------|-------------|
-| `nova-3` | Listen (STT) | **GA — Deepgram's recommended default** | New deployments. Higher accuracy than nova-2, multilingual conversation, customizable vocabulary. |
-| `nova-2` | Listen (STT) | GA, still supported | Languages not yet supported by nova-3, or workloads that depend on filler-word identification. |
-| `flux` | Listen (STT) + turn detection | GA, conversational-focused | Voice-agent workloads that benefit from Deepgram's built-in turn detection (alternative to server VAD). Evaluate before flipping the default. |
+| `nova-3` | Listen (STT) | **GA — AAVA default** | General Voice Agent compatibility path. AAVA projects the selected language to `listen.provider.language`. |
+| `flux-general-en` | Listen (STT) + turn detection | GA, conversational | **Recommended for voice agents.** English-only conversational STT with built-in EndOfTurn / EagerEndOfTurn detection. Selectable from the Admin UI's Deepgram STT Model dropdown. End-to-end verified on the Voice Agent path (2026-05-09). |
+| `flux-general-multi` | Listen (STT) + turn detection | GA, conversational | Multilingual Voice Agent path. AAVA supplies one `language_hints` entry matching the selected conversation language. |
+| `nova-2-phonecall` | Listen (STT) | Legacy compatibility | English-only telephony compatibility option; retain only after a live `SettingsApplied` validation on the target account. |
 | `aura-2-thalia-en` | Speak (TTS) | GA | Default voice. Browse the full Aura-2 voice catalog at [developers.deepgram.com/docs/tts-models](https://developers.deepgram.com/docs/tts-models). |
 
-> **Repo state (2026-04-26):** the shipped `config/ai-agent.yaml` still ships `model: nova-2` for backward compatibility with existing deployments. The Twilio path in `src/providers/deepgram.py` already uses `nova-3`. New deployments should set `model: nova-3` explicitly in their config; the migration is config-only with no code change required.
+#### Voice Agent languages
+
+AAVA intentionally supports the languages it can provide end to end with its
+verified Aura catalog: `en`, `es`, `de`, `fr`, `it`, `nl`, and `ja`. Existing
+BCP-47 variants such as `en-US` and `es-419` are preserved in configuration and
+normalized to their base language for listen-model projection and voice checks.
+
+The selected Aura model must encode the same language in its suffix. For
+example, `agent_language: es` pairs with `aura-2-celeste-es`. A mismatch or an
+unknown Aura model fails the Deepgram call before Settings are sent, with an
+actionable log message; AAVA does not silently substitute another voice.
+
+Deepgram's speak language is encoded by the Aura model. AAVA therefore does not
+send an unsupported `agent.speak.provider.language` field. The deprecated
+top-level `agent.language` remains temporarily on Nova/V1 Settings for backward
+compatibility, but is omitted for Flux/V2 because Deepgram rejects that field
+when the V2 listen API is selected.
+
+Existing custom/legacy listen-model values are preserved and passed through,
+but are not presented as new recommended choices in the Admin UI. Whisper Cloud
+is not offered for Voice Agent because it does not support live streaming.
+
+> **Upgrade behavior in v6.5.0 — read this before upgrading.** Pre-v6.5.0 the Deepgram Voice Agent provider hardcoded `listen.provider.model: "nova-3"` in the Settings JSON sent to Deepgram, regardless of the YAML `model:` field. v6.5.0 makes the YAML field actually apply. To preserve the previously-effective production behavior on upgrade, the shipped default is now **`nova-3`** (was previously documented as `nova-2` but had no runtime effect). Operators who had explicitly set `model: nova-2` in their YAML will see Deepgram move to Nova-2 *for real* on this upgrade — if you intentionally relied on the hidden Nova-3 hardcoding, leave the YAML at `nova-3` after upgrade.
+>
+> **Flux Voice Agent payload.** When the configured `model` starts with `flux-` (e.g., `flux-general-en`, `flux-general-multi`), the Voice Agent provider automatically adds `listen.provider.version: "v2"` and any configured Flux-specific tuning fields (`eot_threshold`, `eager_eot_threshold`, `keyterms`) to the Settings JSON, per [Deepgram's Configure Voice Agent documentation](https://developers.deepgram.com/docs/configure-voice-agent). Defaults: `eot_threshold: 0.7`, `eager_eot_threshold: None` (disabled). Configurable under `providers.deepgram.*` in YAML or via the Admin UI Providers page — a "Flux Turn-Detection Tuning" panel appears in the Deepgram form when a `flux-*` model is selected, with inputs for `eot_threshold`, `eager_eot_threshold`, and `keyterms`.
+>
+> **Valid ranges (Pydantic-enforced at config load):** `eot_threshold` 0.5–0.9, `eager_eot_threshold` 0.3–0.9, with `eager_eot_threshold` strictly less than `eot_threshold` when both are set. Out-of-range or inverted values fail fast at startup rather than becoming opaque provider-side failures.
+>
+> **Standalone Flux pipeline path (advanced)** — the standalone Flux pipeline adapter at `src/pipelines/deepgram_flux.py` (registered as `deepgram_flux_stt`) supports the same tuning knobs for hybrid pipelines (Flux STT + non-Deepgram LLM/TTS). Use this only when you need Flux STT decoupled from Deepgram's Voice Agent. The engine supplies raw `linear16`, mono, 16 kHz audio and the Admin UI defaults new Flux pipelines to Deepgram's recommended 80 ms chunk size.
 
 ### 4. Configure Asterisk Dialplan
 
@@ -88,17 +123,17 @@ Add to `/etc/asterisk/extensions_custom.conf`:
 ```ini
 [from-ai-agent-deepgram]
 exten => s,1,NoOp(AI Voice Agent - Deepgram)
-exten => s,n,Set(AI_CONTEXT=demo_deepgram)
+exten => s,n,Set(AI_AGENT=demo_deepgram)
 exten => s,n,Set(AI_PROVIDER=deepgram)
 exten => s,n,Stasis(asterisk-ai-voice-agent)
 exten => s,n,Hangup()
 ```
 
-**Recommended**: Set `AI_CONTEXT` and `AI_PROVIDER` when you want an explicit per-extension override:
-- `AI_CONTEXT` selects the context (greeting, prompt, profile, tools)
+**Recommended**: Set `AI_AGENT` and `AI_PROVIDER` when you want an explicit per-extension override:
+- `AI_AGENT` selects the Agent (greeting, prompt, profile, tools)
 - `AI_PROVIDER=deepgram` forces this provider for the call
 
-If you omit these, the engine will select a context/provider using the precedence rules in `docs/Configuration-Reference.md`.
+If you omit these, the engine selects the default Agent/provider using the precedence rules in `docs/Configuration-Reference.md`.
 
 ### 5. Reload Asterisk
 
@@ -122,10 +157,15 @@ Route a test call to the custom destination and verify:
 - ✅ AI responds to your questions naturally
 - ✅ Duplex communication (can interrupt AI)
 - ✅ Tools execute if configured (transfer, email, etc.)
+- ✅ Greeting and responses remain continuous when `ConversationText` events arrive
+- ✅ With no caller speech, the 30-second check-in and 15-second final warning play completely before hangup
+- ✅ A normal `hangup_call` farewell finishes before the caller channel disconnects
 
-## Context Configuration
+## Agent Configuration
 
-Define your AI's behavior in `config/ai-agent.yaml`:
+Define this behavior in **Admin UI → Agents**. The legacy-shaped example below is
+provided only for preparing one-time migration input; `contexts:` YAML is not a live
+v7.4 Agent configuration surface:
 
 ```yaml
 contexts:
@@ -220,6 +260,12 @@ barge_in:
   energy_threshold: 800
   min_ms: 200
 ```
+
+### Issue: Greeting Splits or Farewell Never Hangs Up
+
+**Cause**: Releases before v7.3.1 treated any JSON control frame received during a Deepgram audio burst as the end of that response. A `ConversationText` frame could therefore split one greeting, and terminal tool intent could race the real `AgentAudioDone` boundary.
+
+**Fix**: Upgrade to v7.3.1 or newer. The adapter now closes audio only on Deepgram's explicit `AgentAudioDone`, orders terminal tool execution, and has bounded missing-audio/completion fallbacks. If the symptom persists, collect the call with `agent rca <call-id>` and confirm that `Deepgram lifecycle event` logs contain the provider's `AgentAudioDone`.
 
 ## Production Considerations
 

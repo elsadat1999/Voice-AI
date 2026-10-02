@@ -28,6 +28,21 @@ class ToolCategory(Enum):
     HYBRID = "hybrid"         # May use both telephony and business logic
 
 
+class ToolExecutionBehavior(str, Enum):
+    """Live-provider execution policy; new tools fail closed to blocking."""
+
+    BLOCKING = "BLOCKING"
+    NON_BLOCKING = "NON_BLOCKING"
+
+
+class ToolResponseScheduling(str, Enum):
+    """When a Live model should surface a non-blocking tool result."""
+
+    WHEN_IDLE = "WHEN_IDLE"
+    INTERRUPT = "INTERRUPT"
+    SILENT = "SILENT"
+
+
 @dataclass
 class ToolParameter:
     """Definition of a tool parameter."""
@@ -73,6 +88,8 @@ class ToolDefinition:
     input_schema: Optional[Dict[str, Any]] = None
     requires_channel: bool = False  # Needs active call channel
     max_execution_time: int = 30    # Timeout in seconds
+    execution_behavior: ToolExecutionBehavior = ToolExecutionBehavior.BLOCKING
+    response_scheduling: ToolResponseScheduling = ToolResponseScheduling.WHEN_IDLE
     
     # Phase system fields (Milestone 24)
     phase: ToolPhase = ToolPhase.IN_CALL  # Default to in-call for backward compatibility
@@ -391,25 +408,40 @@ class PreCallTool(ABC):
     ) -> Dict[str, str]:
         """
         Execute the pre-call tool to fetch enrichment data.
-        
+
         Args:
             context: PreCallContext with caller info and system access
-        
+
         Returns:
             Dictionary mapping output_variable names to string values.
             Missing/null values should be returned as empty string "".
-            
+
         Example:
             return {
                 "customer_name": "John Smith",
                 "customer_email": "john@example.com",
                 "last_call_notes": "",  # Not found
             }
-        
+
         Raises:
             Exception: On failure (will be caught; empty values used)
         """
         pass
+
+    def get_last_result(self, call_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """
+        Return execution metadata from the last ``execute()`` call, or None.
+
+        Optional hook used by call-history tracking. Concrete tools may override to
+        surface diagnostics like HTTP status, response body preview, or upstream
+        error message. Default implementation returns None — the engine still
+        records ``name``/``status``/``duration_ms`` from its own measurements.
+
+        ``call_id`` is provided so concrete tools can isolate per-execution state
+        (tools are registered as singletons; concurrent executions across calls
+        must not share mutable diagnostics fields).
+        """
+        return None
 
 
 class PostCallTool(ABC):
@@ -441,16 +473,32 @@ class PostCallTool(ABC):
     ) -> None:
         """
         Execute the post-call tool (fire-and-forget).
-        
+
         Args:
             context: PostCallContext with comprehensive session data
-        
+
         Returns:
             None (fire-and-forget; return value ignored)
-        
+
         Note:
             - Exceptions are logged but do not affect call cleanup
             - No retry mechanism (receiving systems handle retries)
             - Should complete quickly; long operations should be async
         """
         pass
+
+    def get_last_result(self, call_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """
+        Return execution metadata from the last ``execute()`` call, or None.
+
+        Optional hook used by call-history tracking. Concrete tools may override
+        to surface diagnostics like HTTP status, response body preview, or
+        upstream error message. Default implementation returns None — the engine
+        still records ``name``/``status``/``duration_ms`` from its own
+        measurements.
+
+        ``call_id`` is provided so concrete tools can isolate per-execution
+        state (tools are registered as singletons; concurrent post-call
+        executions across calls must not share mutable diagnostics fields).
+        """
+        return None

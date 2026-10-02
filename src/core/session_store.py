@@ -7,7 +7,8 @@ with a single, thread-safe store that enforces invariants.
 
 import asyncio
 import time
-from typing import Optional, Dict, Set, List
+from datetime import datetime, timezone
+from typing import Any, Optional, Dict, Set, List
 import structlog
 
 from src.core.models import CallSession, PlaybackRef, ProviderSession
@@ -38,9 +39,14 @@ class SessionStore:
         
         logger.info("SessionStore initialized")
     
-    async def upsert_call(self, session: CallSession) -> None:
+    async def upsert_call(self, session: CallSession, *, require_current: bool = False) -> bool:
         """Add or update a call session atomically."""
         async with self._lock:
+            if require_current and (
+                self._sessions_by_call_id.get(session.call_id) is not session
+                or session.cleanup_in_progress or session.cleanup_completed
+            ):
+                return False
             # Store by call_id (canonical)
             self._sessions_by_call_id[session.call_id] = session
             
@@ -58,21 +64,146 @@ class SessionStore:
             # Store by audiosocket_channel_id if present
             if session.audiosocket_channel_id:
                 self._sessions_by_channel_id[session.audiosocket_channel_id] = session
+
+            # Neutral media index covers WebSocket immediately and lets existing
+            # transports migrate without teaching every caller another lookup.
+            if session.media_channel_id:
+                self._sessions_by_channel_id[session.media_channel_id] = session
             
             logger.debug("Call session upserted",
                         call_id=session.call_id,
                         caller_channel_id=session.caller_channel_id,
                         local_channel_id=session.local_channel_id)
+            return True
     
     async def get_by_call_id(self, call_id: str) -> Optional[CallSession]:
         """Get session by canonical call_id."""
         async with self._lock:
             return self._sessions_by_call_id.get(call_id)
+
+    async def append_tool_call_if_active(self, call_id: str, record: dict) -> bool:
+        """Append history only while the call is registered, under one lock."""
+        return await self.append_tool_call_and_bind_deferred_origin_if_active(
+            call_id,
+            record,
+        )
+
+    async def append_tool_call_and_bind_deferred_origin_if_active(
+        self,
+        call_id: str,
+        record: dict,
+        *,
+        deferred_action_id: str = "",
+        deferred_origin: Optional[dict] = None,
+    ) -> bool:
+        """Append history and bind its deferred action origin atomically."""
+        async with self._lock:
+            session = self._sessions_by_call_id.get(call_id)
+            if session is None:
+                return False
+            if session.tool_calls is None:
+                session.tool_calls = []
+            session.tool_calls.append(record)
+            pending = getattr(session, "pending_deferred_transfer", None)
+            if (
+                deferred_action_id
+                and isinstance(deferred_origin, dict)
+                and isinstance(pending, dict)
+                and pending.get("id") == deferred_action_id
+                and not isinstance(pending.get("_tool_history_origin"), dict)
+            ):
+                # Duplicate provider invocations can return the same armed
+                # action. Preserve the first invocation as its history owner.
+                pending["_tool_history_origin"] = dict(deferred_origin)
+            return True
+
+    async def update_call_metadata(
+        self,
+        call_id: str,
+        field_name: str,
+        value: Any,
+    ) -> Dict[str, Any]:
+        """Atomically correct one explicitly allowed metadata field.
+
+        The active-session lookup, lifecycle gate, policy check, size check, and
+        mutation all happen under the same lock. A late tool result therefore
+        cannot resurrect a removed call or race cleanup.
+        """
+        from src.core.call_metadata import (
+            CallMetadataValidationError,
+            MAX_CALL_METADATA_UPDATES,
+            normalize_call_metadata_value,
+            validate_call_metadata_document,
+            validate_call_metadata_key,
+        )
+
+        async with self._lock:
+            session = self._sessions_by_call_id.get(call_id)
+            if session is None:
+                return {"status": "error", "message": "The call is no longer active."}
+            if bool(getattr(session, "cleanup_in_progress", False)) or bool(
+                getattr(session, "cleanup_completed", False)
+            ):
+                return {"status": "error", "message": "The call is ending; metadata can no longer be changed."}
+
+            try:
+                field = validate_call_metadata_key(field_name)
+            except CallMetadataValidationError as exc:
+                return {"status": "error", "message": str(exc)}
+            policy = dict((getattr(session, "call_metadata_policy", {}) or {}).get(field) or {})
+            if not policy or not bool(policy.get("correctable", False)):
+                return {"status": "error", "message": f"'{field}' is not an allowed correctable field."}
+
+            try:
+                normalized = normalize_call_metadata_value(
+                    value,
+                    max_length=int(policy.get("max_length") or 1024),
+                )
+                current = dict(getattr(session, "call_metadata", {}) or {})
+                previous = current.get(field)
+                current[field] = normalized
+                current = validate_call_metadata_document(current)
+            except CallMetadataValidationError as exc:
+                return {"status": "error", "message": str(exc)}
+
+            if previous == normalized:
+                return {
+                    "status": "success",
+                    "message": f"'{field}' already has that value.",
+                    "field": field,
+                    "changed": False,
+                }
+
+            session.call_metadata = current
+            updates = list(getattr(session, "call_metadata_updates", []) or [])
+            updates.append(
+                {
+                    "field": field,
+                    "source": "agent_correction",
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            # The values are bounded above; keep the audit bounded as well.
+            session.call_metadata_updates = updates[-MAX_CALL_METADATA_UPDATES:]
+            return {
+                "status": "success",
+                "message": f"Updated '{field}' for this call.",
+                "field": field,
+                "changed": True,
+            }
     
     async def get_by_channel_id(self, channel_id: str) -> Optional[CallSession]:
         """Get session by any channel_id (caller, local, external_media)."""
         async with self._lock:
             return self._sessions_by_channel_id.get(channel_id)
+
+    async def has_active_sessions_for_provider(self, provider_key: str) -> bool:
+        """Return whether any active call is currently using provider_key."""
+        async with self._lock:
+            for session in self._sessions_by_call_id.values():
+                if getattr(session, "provider_name", None) == provider_key:
+                    return True
+            return False
     
     async def remove_call(self, call_id: str) -> Optional[CallSession]:
         """Remove a call session and all its channel mappings."""
@@ -89,6 +220,8 @@ class SessionStore:
                 self._sessions_by_channel_id.pop(session.external_media_id, None)
             if session.audiosocket_channel_id:
                 self._sessions_by_channel_id.pop(session.audiosocket_channel_id, None)
+            if session.media_channel_id:
+                self._sessions_by_channel_id.pop(session.media_channel_id, None)
             
             logger.debug("Call session removed",
                         call_id=call_id,
@@ -235,14 +368,23 @@ class SessionStore:
         async with self._lock:
             return list(self._sessions_by_call_id.values())
 
-    async def count_active_outbound_calls(self, campaign_id: Optional[str] = None) -> int:
-        """Count active outbound calls (optionally scoped to a campaign)."""
+    async def count_active_outbound_calls(
+        self,
+        campaign_id: Optional[str] = None,
+        *,
+        excluding_attempt_ids: Optional[Set[str]] = None,
+    ) -> int:
+        """Count active outbound calls, optionally excluding attempts counted elsewhere."""
+        excluded = {str(value) for value in (excluding_attempt_ids or set()) if str(value)}
         async with self._lock:
             count = 0
             for session in self._sessions_by_call_id.values():
                 if not getattr(session, "is_outbound", False):
                     continue
                 if campaign_id and getattr(session, "outbound_campaign_id", None) != campaign_id:
+                    continue
+                attempt_id = str(getattr(session, "outbound_attempt_id", None) or "").strip()
+                if attempt_id and attempt_id in excluded:
                     continue
                 count += 1
             return count

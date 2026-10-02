@@ -2,7 +2,9 @@ import { useState, useEffect } from 'react';
 import { HardDrive, Download, Trash2, RefreshCw, CheckCircle2, XCircle, Loader2, Mic, Volume2, Brain, AlertTriangle, Cpu, Terminal, Settings, Play, Wrench } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { ConfigCard } from '../../components/ui/ConfigCard';
+import HelpTooltip from '../../components/ui/HelpTooltip';
 import { useConfirmDialog } from '../../hooks/useConfirmDialog';
+import { useLiveStatus, type LiveStatusComponent } from '../../hooks/useLiveStatus';
 import { RebuildBackendDialog } from '../../components/models/RebuildBackendDialog';
 import { CustomModelsPanel } from '../../components/models/CustomModelsPanel';
 import axios from 'axios';
@@ -59,7 +61,7 @@ interface DownloadProgress {
 }
 
 interface ActiveModels {
-    stt: { backend: string; path: string; loaded: boolean; display?: string; language?: string | null; sherpa_model_type?: string | null; tone_decoder_type?: string | null };
+    stt: { backend: string; path: string; loaded: boolean; display?: string; language?: string | null; device?: string | null; compute_type?: string | null; sherpa_model_type?: string | null; tone_decoder_type?: string | null };
     tts: { backend: string; path: string; loaded: boolean; display?: string };
     llm: {
         path: string;
@@ -137,8 +139,11 @@ interface ApplyProgressState {
     details: string[];
 }
 
+type ServerStatus = 'connected' | 'degraded' | 'error' | 'loading';
+
 const ModelsPage = () => {
     const { confirm } = useConfirmDialog();
+    const liveStatus = useLiveStatus();
     const [catalog, setCatalog] = useState<{ stt: ModelInfo[]; tts: ModelInfo[]; llm: ModelInfo[] }>({ stt: [], tts: [], llm: [] });
     const [installedModels, setInstalledModels] = useState<InstalledModel[]>([]);
     const [languageNames, setLanguageNames] = useState<Record<string, string>>({});
@@ -154,16 +159,18 @@ const ModelsPage = () => {
     // Active models state (from Local AI Server)
     const [activeModels, setActiveModels] = useState<ActiveModels | null>(null);
     const [availableModels, setAvailableModels] = useState<AvailableModels | null>(null);
-    const [serverStatus, setServerStatus] = useState<'connected' | 'error' | 'loading'>('loading');
+    const [serverStatus, setServerStatus] = useState<ServerStatus>('loading');
     const [restarting, setRestarting] = useState(false);
     const [pendingChanges, setPendingChanges] = useState<{ stt?: string; tts?: string; llm?: string }>({});
-    const [pendingSttExtra, setPendingSttExtra] = useState<{ language?: string; sherpa_model_type?: string; sherpa_vad_model_path?: string; tone_decoder_type?: string; tone_kenlm_path?: string }>({});
+    const [pendingSttExtra, setPendingSttExtra] = useState<{ language?: string; device?: string; compute_type?: string; sherpa_model_type?: string; sherpa_vad_model_path?: string; tone_decoder_type?: string; tone_kenlm_path?: string }>({});
     const [pendingLlmConfig, setPendingLlmConfig] = useState<{ context?: number; max_tokens?: number }>({});
+    const [pendingRuntimeConfig, setPendingRuntimeConfig] = useState<{ enable_filler_audio?: boolean; llm_streaming_tts_overlap?: boolean }>({});
     const [startingServer, setStartingServer] = useState(false);
     const [capabilities, setCapabilities] = useState<BackendCapabilities | null>(null);
     const [envConfig, setEnvConfig] = useState<Record<string, string>>({});
     const [forceIncompatibleApply, setForceIncompatibleApply] = useState(false);
     const [runtimeGpu, setRuntimeGpu] = useState<RuntimeGpuStatus | null>(null);
+    const [runtimeMode, setRuntimeMode] = useState<string | null>(null);
     const [applyProgress, setApplyProgress] = useState<ApplyProgressState | null>(null);
 
     // Rebuild dialog state
@@ -193,6 +200,56 @@ const ModelsPage = () => {
             fetchModels();
             fetchActiveModels();
         }
+    };
+
+    const hydrateLocalAIStatus = (details: any, status: ServerStatus) => {
+        setServerStatus(status);
+        setRuntimeGpu((details?.gpu || null) as RuntimeGpuStatus | null);
+        setRuntimeMode((details?.config?.runtime_mode || details?.runtime_mode || null) as string | null);
+        setActiveModels({
+            stt: {
+                backend: details?.models?.stt?.backend || 'unknown',
+                path: details?.models?.stt?.path || '',
+                loaded: details?.models?.stt?.loaded || false,
+                display: details?.models?.stt?.display || '',
+                language: details?.models?.stt?.language || null,
+                device: details?.models?.stt?.device || null,
+                compute_type: details?.models?.stt?.compute_type || null,
+                sherpa_model_type: details?.models?.stt?.sherpa_model_type || null,
+                tone_decoder_type: details?.models?.stt?.tone_decoder_type || null,
+            },
+            tts: {
+                backend: details?.models?.tts?.backend || 'unknown',
+                path: details?.models?.tts?.path || '',
+                loaded: details?.models?.tts?.loaded || false,
+                display: details?.models?.tts?.display || ''
+            },
+            llm: {
+                path: details?.models?.llm?.path || '',
+                loaded: details?.models?.llm?.loaded || false,
+                display: details?.models?.llm?.display || '',
+                config: details?.models?.llm?.config || {},
+                prompt_fit: details?.models?.llm?.prompt_fit || {},
+                auto_context: details?.models?.llm?.auto_context || {},
+                tool_capability: details?.models?.llm?.tool_capability || {}
+            }
+        });
+    };
+
+    const applyLocalAILiveStatus = (component?: LiveStatusComponent | null): boolean => {
+        if (!component) return false;
+        if (component.freshness === 'expired') return false;
+        if (component.state === 'ready' || component.state === 'degraded') {
+            hydrateLocalAIStatus(component.details || {}, component.state === 'ready' ? 'connected' : 'degraded');
+            return true;
+        }
+        if (component.state !== 'error' && component.state !== 'unreachable') {
+            return false;
+        }
+        setServerStatus('error');
+        setRuntimeGpu(null);
+        setRuntimeMode(null);
+        return true;
     };
 
     const showToast = (message: string, type: 'success' | 'error' | 'warning') => {
@@ -278,6 +335,18 @@ const ModelsPage = () => {
         fetchActiveModels();
     }, []);
 
+    useEffect(() => {
+        const localAI = liveStatus.snapshot?.components?.local_ai_server || liveStatus.snapshot?.local_ai_server;
+        if (!applyLocalAILiveStatus(localAI) && !liveStatus.loading) {
+            fetchActiveModels();
+        }
+    }, [
+        liveStatus.loading,
+        liveStatus.snapshot?.event_id,
+        liveStatus.snapshot?.components?.local_ai_server?.updated_at,
+        liveStatus.snapshot?.local_ai_server?.updated_at,
+    ]);
+
     // Resume download on mount if active
     useEffect(() => {
         let mounted = true;
@@ -341,51 +410,33 @@ const ModelsPage = () => {
 
     // Fetch active models from Local AI Server health
     const fetchActiveModels = async () => {
-        const [healthRes, modelsRes, capabilitiesRes, envRes] = await Promise.allSettled([
+        const [liveStatusRes, healthRes, modelsRes, capabilitiesRes, envRes] = await Promise.allSettled([
+            axios.get('/api/system/live-status'),
             axios.get('/api/system/health'),
             axios.get('/api/local-ai/models'),
             axios.get('/api/local-ai/capabilities'),
             axios.get('/api/config/env')
         ]);
 
-        if (healthRes.status === 'fulfilled') {
+        let hydratedFromStatus = false;
+        if (liveStatusRes.status === 'fulfilled') {
+            const localAI = liveStatusRes.value.data?.components?.local_ai_server || liveStatusRes.value.data?.local_ai_server;
+            hydratedFromStatus = applyLocalAILiveStatus(localAI);
+        }
+
+        if (!hydratedFromStatus && healthRes.status === 'fulfilled') {
             const localAI = healthRes.value.data?.local_ai_server;
             if (localAI?.status === 'connected') {
-                setServerStatus('connected');
-                setRuntimeGpu((localAI.details?.gpu || null) as RuntimeGpuStatus | null);
-                setActiveModels({
-                    stt: {
-                        backend: localAI.details?.models?.stt?.backend || 'unknown',
-                        path: localAI.details?.models?.stt?.path || '',
-                        loaded: localAI.details?.models?.stt?.loaded || false,
-                        display: localAI.details?.models?.stt?.display || '',
-                        language: localAI.details?.models?.stt?.language || null,
-                        sherpa_model_type: localAI.details?.models?.stt?.sherpa_model_type || null,
-                        tone_decoder_type: localAI.details?.models?.stt?.tone_decoder_type || null,
-                    },
-                    tts: {
-                        backend: localAI.details?.models?.tts?.backend || 'unknown',
-                        path: localAI.details?.models?.tts?.path || '',
-                        loaded: localAI.details?.models?.tts?.loaded || false,
-                        display: localAI.details?.models?.tts?.display || ''
-                    },
-                    llm: {
-                        path: localAI.details?.models?.llm?.path || '',
-                        loaded: localAI.details?.models?.llm?.loaded || false,
-                        display: localAI.details?.models?.llm?.display || '',
-                        config: localAI.details?.models?.llm?.config || {},
-                        prompt_fit: localAI.details?.models?.llm?.prompt_fit || {},
-                        auto_context: localAI.details?.models?.llm?.auto_context || {},
-                        tool_capability: localAI.details?.models?.llm?.tool_capability || {}
-                    }
-                });
+                hydrateLocalAIStatus(localAI.details || {}, 'connected');
             } else {
                 setServerStatus('error');
                 setRuntimeGpu(null);
+                setRuntimeMode(null);
             }
-        } else {
+        } else if (!hydratedFromStatus) {
             setServerStatus('error');
             setRuntimeGpu(null);
+            setRuntimeMode(null);
         }
 
         if (modelsRes.status === 'fulfilled' && modelsRes.value.data) {
@@ -585,12 +636,21 @@ const ModelsPage = () => {
     };
 
     const gpuDetected = isTruthy(envConfig.GPU_AVAILABLE);
-    const fasterWhisperDevice = (envConfig.FASTER_WHISPER_DEVICE || 'cpu').trim().toLowerCase();
+    // Effective device for compatibility gating: prefer pending selection
+    // over persisted env, so the new dropdown's CUDA picks are caught
+    // client-side instead of failing after the long apply flow.
+    const fasterWhisperDevice = (pendingSttExtra.device || envConfig.FASTER_WHISPER_DEVICE || 'cpu').trim().toLowerCase();
     const melottsDevice = (envConfig.MELOTTS_DEVICE || 'cpu').trim().toLowerCase();
     const gpuStatusKnown = typeof envConfig.GPU_AVAILABLE !== 'undefined';
     const runtimeGpuKnown = runtimeGpu !== null && typeof runtimeGpu.runtime_detected === 'boolean';
     const runtimeGpuDetected = runtimeGpu?.runtime_detected === true;
     const runtimeGpuUsable = runtimeGpu?.runtime_usable === true;
+    const currentFillerAudio = isTruthy(envConfig.LOCAL_ENABLE_FILLER_AUDIO);
+    const currentStreamingOverlap = isTruthy(envConfig.LOCAL_LLM_STREAMING_TTS_OVERLAP ?? 'true');
+    const hasPendingModelChanges = Object.keys(pendingChanges).length > 0;
+    const hasPendingLlmTuningChanges = Object.keys(pendingLlmConfig).length > 0;
+    const hasPendingRuntimeChanges = Object.keys(pendingRuntimeConfig).length > 0;
+    const hasPendingApplyChanges = hasPendingModelChanges || hasPendingLlmTuningChanges || hasPendingRuntimeChanges;
 
     const isBackendAvailable = (backend: string | undefined) => {
         const b = (backend || '').trim().toLowerCase();
@@ -695,9 +755,7 @@ const ModelsPage = () => {
     const requiresAnyRebuild = requiresRebuild.fasterWhisper || requiresRebuild.whisperCpp || requiresRebuild.tone || requiresRebuild.meloTts || requiresRebuild.krokoEmbedded || requiresRebuild.silero;
 
     const applyPendingChanges = async () => {
-        const hasModelChanges = Object.keys(pendingChanges).length > 0;
-        const hasLlmTuningChanges = Object.keys(pendingLlmConfig).length > 0;
-        if (!hasModelChanges && !hasLlmTuningChanges) return;
+        if (!hasPendingApplyChanges) return;
         if (compatibilityIssues.length > 0 && !forceIncompatibleApply) {
             showToast('Resolve compatibility warnings or enable force apply.', 'warning');
             return;
@@ -791,7 +849,7 @@ const ModelsPage = () => {
             }
 
             // Apply LLM changes (model and/or tuning) in one request to avoid multiple reloads.
-            if (remainingChanges.llm || hasLlmTuningChanges) {
+            if (remainingChanges.llm || hasPendingLlmTuningChanges || hasPendingRuntimeChanges) {
                 updateApplyProgress('switching', 82, 'Applying LLM changes...', 'Sending LLM switch request');
 
                 // Auto-set chat_format from catalog when switching LLM model
@@ -815,6 +873,8 @@ const ModelsPage = () => {
                     model_path: remainingChanges.llm || undefined,
                     llm_context: pendingLlmConfig.context || undefined,
                     llm_max_tokens: pendingLlmConfig.max_tokens || undefined,
+                    enable_filler_audio: pendingRuntimeConfig.enable_filler_audio,
+                    llm_streaming_tts_overlap: pendingRuntimeConfig.llm_streaming_tts_overlap,
                     force_incompatible_apply: forceIncompatibleApply
                 });
                 delete remainingChanges.llm;
@@ -826,8 +886,10 @@ const ModelsPage = () => {
                 const [backend, ...pathParts] = value.split(':');
                 const extra: Record<string, any> = {};
                 if (type === 'stt') {
-                    if (backend === 'faster_whisper' && pendingSttExtra.language) {
-                        extra.faster_whisper_language = pendingSttExtra.language;
+                    if (backend === 'faster_whisper') {
+                        if (pendingSttExtra.language) extra.faster_whisper_language = pendingSttExtra.language;
+                        if (pendingSttExtra.device) extra.faster_whisper_device = pendingSttExtra.device;
+                        if (pendingSttExtra.compute_type) extra.faster_whisper_compute_type = pendingSttExtra.compute_type;
                     } else if (backend === 'whisper_cpp' && pendingSttExtra.language) {
                         extra.whisper_cpp_language = pendingSttExtra.language;
                     } else if (backend === 'sherpa') {
@@ -854,6 +916,7 @@ const ModelsPage = () => {
             setPendingChanges({});
             setPendingSttExtra({});
             setPendingLlmConfig({});
+            setPendingRuntimeConfig({});
             setForceIncompatibleApply(false);
             updateApplyProgress('verifying', 95, 'Waiting for Local AI to come back online...', 'Refreshing active model status');
             setTimeout(() => {
@@ -906,10 +969,13 @@ const ModelsPage = () => {
                             <Cpu className="w-5 h-5 text-blue-500" />
                             <h3 className="font-semibold">Local AI Server</h3>
                             <span className={`px-2 py-0.5 rounded-full text-xs font-medium flex items-center gap-1 ${serverStatus === 'connected' ? 'bg-green-500/10 text-green-500' :
+                                serverStatus === 'degraded' ? 'bg-yellow-500/10 text-yellow-500' :
                                 serverStatus === 'error' ? 'bg-red-500/10 text-red-500' : 'bg-yellow-500/10 text-yellow-500'
                                 }`}>
                                 {serverStatus === 'connected' ? (
                                     <><CheckCircle2 className="w-3 h-3" /> Connected</>
+                                ) : serverStatus === 'degraded' ? (
+                                    <><AlertTriangle className="w-3 h-3" /> Degraded</>
                                 ) : serverStatus === 'error' ? (
                                     <><XCircle className="w-3 h-3" /> Error</>
                                 ) : (
@@ -951,18 +1017,21 @@ const ModelsPage = () => {
                                 onClick={async () => {
                                     const confirmed = await confirm({
                                         title: 'Restart Local AI Server?',
-                                        description: 'Are you sure you want to restart the Local AI Server? This will temporarily interrupt model inference.',
+                                        description: 'This recreates the Local AI Server container so any .env changes (model paths, GPU settings) are re-read. Model inference will be interrupted briefly.',
                                         confirmText: 'Restart',
                                         variant: 'destructive'
                                     });
                                     if (!confirmed) return;
                                     setRestarting(true);
-                                    axios.post('/api/system/containers/local_ai_server/restart')
+                                    // recreate=true so env_file (.env) changes are applied (MED-R2);
+                                    // a plain restart does NOT re-read .env.
+                                    axios.post('/api/system/containers/local_ai_server/restart?recreate=true')
                                         .then(() => setTimeout(() => { fetchActiveModels(); setRestarting(false); }, 5000))
                                         .catch(() => setRestarting(false));
                                 }}
                                 disabled={restarting}
                                 className="p-2 hover:bg-accent rounded-md text-muted-foreground hover:text-foreground transition-colors"
+                                aria-label="Restart"
                                 title="Restart"
                             >
                                 <RefreshCw className={`w-4 h-4 ${restarting ? 'animate-spin' : ''}`} />
@@ -977,8 +1046,13 @@ const ModelsPage = () => {
                         </div>
                     </div>
 
-                    {serverStatus === 'connected' && activeModels && (
+                    {(serverStatus === 'connected' || serverStatus === 'degraded') && activeModels && (
                         <div className="p-4 space-y-4">
+                            {serverStatus === 'degraded' && (
+                                <div className="p-3 rounded-md border border-yellow-500/40 bg-yellow-500/10 text-xs text-yellow-700 dark:text-yellow-300">
+                                    Local AI Server is reachable but degraded. Model controls remain available; check unloaded models and runtime warnings before using local STT, LLM, or TTS in calls.
+                                </div>
+                            )}
                             <div className="text-xs text-muted-foreground">
                                 {runtimeGpuKnown ? (
                                     <span>
@@ -1007,6 +1081,19 @@ const ModelsPage = () => {
                                     <div className="flex items-center gap-2 mb-2">
                                         <Mic className="w-4 h-4 text-blue-500" />
                                         <span className="text-sm font-medium">STT</span>
+                                        <HelpTooltip
+                                            content={
+                                                <>
+                                                    <strong>STT</strong> — speech-to-text engine currently loaded by the Local AI Server.
+                                                    <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                        <li><code>faster_whisper</code> — accurate, multilingual; needs more RAM.</li>
+                                                        <li><code>whisper_cpp</code> — smaller CPU footprint.</li>
+                                                        <li><code>sherpa</code> — streaming, low latency.</li>
+                                                        <li><code>tone</code> — Russian-specialized.</li>
+                                                    </ul>
+                                                </>
+                                            }
+                                        />
                                         <span className={`ml-auto px-2 py-0.5 rounded text-xs ${activeModels.stt.loaded ? 'bg-green-500/10 text-green-500' : 'bg-yellow-500/10 text-yellow-500'
                                             }`}>
                                             {activeModels.stt.loaded ? 'Loaded' : 'Not Loaded'}
@@ -1038,8 +1125,12 @@ const ModelsPage = () => {
                                             </optgroup>
                                         )}
                                         <optgroup label="Faster Whisper">
+                                            <option value="faster_whisper:tiny.en">
+                                                Whisper Tiny English (CPU demo) {!capabilities?.stt?.faster_whisper?.available ? '(requires rebuild)' : ''}
+                                            </option>
+                                            <option value="faster_whisper:tiny">Whisper Tiny</option>
                                             <option value="faster_whisper:base">
-                                                Whisper Base {!capabilities?.stt?.faster_whisper?.available ? '(requires rebuild)' : ''}
+                                                Whisper Base
                                             </option>
                                             <option value="faster_whisper:small">Whisper Small</option>
                                             <option value="faster_whisper:medium">Whisper Medium</option>
@@ -1059,8 +1150,21 @@ const ModelsPage = () => {
                                         const selectedBackend = selectedStt.split(':')[0];
                                         if (selectedBackend === 'faster_whisper' || selectedBackend === 'whisper_cpp') {
                                             return (
-                                                <div className="mt-2">
-                                                    <label className="text-[10px] text-muted-foreground">Language (ISO 639-1)</label>
+                                                <div className="mt-2 space-y-2">
+                                                    <label className="text-[10px] text-muted-foreground flex items-center gap-1">
+                                                        Language (ISO 639-1)
+                                                        <HelpTooltip
+                                                            content={
+                                                                <>
+                                                                    <strong>Language</strong> — ISO 639-1 code passed to Whisper to skip auto-detection.
+                                                                    <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                                        <li>Faster startup, more reliable transcription.</li>
+                                                                        <li>Examples: <code>en</code>, <code>es</code>, <code>fr</code>, <code>ru</code>.</li>
+                                                                    </ul>
+                                                                </>
+                                                            }
+                                                        />
+                                                    </label>
                                                     <input
                                                         type="text"
                                                         className={`w-full text-xs p-1.5 rounded border bg-background ${pendingSttExtra.language ? 'border-yellow-500' : 'border-border'}`}
@@ -1073,6 +1177,85 @@ const ModelsPage = () => {
                                                         placeholder="en"
                                                         disabled={restarting}
                                                     />
+                                                    {selectedBackend === 'faster_whisper' && (
+                                                        (() => {
+                                                            const fwDevice = pendingSttExtra.device ?? activeModels.stt.device ?? envConfig.FASTER_WHISPER_DEVICE ?? 'cpu';
+                                                            const fwCompute = pendingSttExtra.compute_type ?? activeModels.stt.compute_type ?? envConfig.FASTER_WHISPER_COMPUTE_TYPE ?? 'int8';
+                                                            const cpuDevice = fwDevice === 'cpu';
+                                                            return (
+                                                                <div className="grid grid-cols-2 gap-2">
+                                                                    <div>
+                                                                        <label className="text-[10px] text-muted-foreground flex items-center gap-1">
+                                                                            Device
+                                                                            <HelpTooltip
+                                                                                content={
+                                                                                    <>
+                                                                                        <strong>Device</strong> — where Faster-Whisper runs inference.
+                                                                                        <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                                                            <li><code>cpu</code> — works everywhere; slowest.</li>
+                                                                                            <li><code>cuda</code> — NVIDIA GPU; needs CUDA libs in image.</li>
+                                                                                            <li><code>auto</code> — pick GPU if available.</li>
+                                                                                        </ul>
+                                                                                    </>
+                                                                                }
+                                                                            />
+                                                                        </label>
+                                                                        <select
+                                                                            className={`w-full text-xs p-1.5 rounded border bg-background ${pendingSttExtra.device ? 'border-yellow-500' : 'border-border'}`}
+                                                                            value={fwDevice}
+                                                                            onChange={(e) => {
+                                                                                const device = e.target.value;
+                                                                                setPendingSttExtra(prev => {
+                                                                                    const currentCompute = prev.compute_type ?? activeModels.stt.compute_type ?? envConfig.FASTER_WHISPER_COMPUTE_TYPE ?? 'int8';
+                                                                                    return {
+                                                                                        ...prev,
+                                                                                        device,
+                                                                                        compute_type: device === 'cpu' && currentCompute === 'float16' ? 'int8' : prev.compute_type,
+                                                                                    };
+                                                                                });
+                                                                                if (!pendingChanges.stt) setPendingChanges(prev => ({ ...prev, stt: selectedStt }));
+                                                                            }}
+                                                                            disabled={restarting}
+                                                                        >
+                                                                            <option value="cpu">CPU</option>
+                                                                            <option value="auto">Auto</option>
+                                                                            <option value="cuda">CUDA</option>
+                                                                        </select>
+                                                                    </div>
+                                                                    <div>
+                                                                        <label className="text-[10px] text-muted-foreground flex items-center gap-1">
+                                                                            Compute
+                                                                            <HelpTooltip
+                                                                                content={
+                                                                                    <>
+                                                                                        <strong>Compute Type</strong> — numeric precision Faster-Whisper uses for inference.
+                                                                                        <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                                                            <li><code>int8</code> — fastest on CPU, smallest memory.</li>
+                                                                                            <li><code>float16</code> — best speed on CUDA; CPU not supported.</li>
+                                                                                            <li><code>float32</code> — highest accuracy, slowest.</li>
+                                                                                        </ul>
+                                                                                    </>
+                                                                                }
+                                                                            />
+                                                                        </label>
+                                                                        <select
+                                                                            className={`w-full text-xs p-1.5 rounded border bg-background ${pendingSttExtra.compute_type ? 'border-yellow-500' : 'border-border'}`}
+                                                                            value={cpuDevice && fwCompute === 'float16' ? 'int8' : fwCompute}
+                                                                            onChange={(e) => {
+                                                                                setPendingSttExtra(prev => ({ ...prev, compute_type: e.target.value }));
+                                                                                if (!pendingChanges.stt) setPendingChanges(prev => ({ ...prev, stt: selectedStt }));
+                                                                            }}
+                                                                            disabled={restarting}
+                                                                        >
+                                                                            <option value="int8">INT8</option>
+                                                                            <option value="float16" disabled={cpuDevice}>Float16 {cpuDevice ? '(CUDA only)' : ''}</option>
+                                                                            <option value="float32">Float32</option>
+                                                                        </select>
+                                                                    </div>
+                                                                </div>
+                                                            );
+                                                        })()
+                                                    )}
                                                 </div>
                                             );
                                         }
@@ -1080,7 +1263,20 @@ const ModelsPage = () => {
                                             return (
                                                 <div className="mt-2 space-y-1.5">
                                                     <div>
-                                                        <label className="text-[10px] text-muted-foreground">Model Type</label>
+                                                        <label className="text-[10px] text-muted-foreground flex items-center gap-1">
+                                                            Model Type
+                                                            <HelpTooltip
+                                                                content={
+                                                                    <>
+                                                                        <strong>Sherpa Model Type</strong> — streaming vs. batched inference mode.
+                                                                        <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                                            <li><code>online</code> — true streaming; lowest latency, partial transcripts.</li>
+                                                                            <li><code>offline</code> — VAD-gated batched chunks; better accuracy.</li>
+                                                                        </ul>
+                                                                    </>
+                                                                }
+                                                            />
+                                                        </label>
                                                         <select
                                                             className={`w-full text-xs p-1.5 rounded border bg-background ${pendingSttExtra.sherpa_model_type ? 'border-yellow-500' : 'border-border'}`}
                                                             value={pendingSttExtra.sherpa_model_type ?? (activeModels.stt as any).sherpa_model_type ?? 'online'}
@@ -1116,7 +1312,20 @@ const ModelsPage = () => {
                                             return (
                                                 <div className="mt-2 space-y-1.5">
                                                     <div>
-                                                        <label className="text-[10px] text-muted-foreground">Decoder</label>
+                                                        <label className="text-[10px] text-muted-foreground flex items-center gap-1">
+                                                            Decoder
+                                                            <HelpTooltip
+                                                                content={
+                                                                    <>
+                                                                        <strong>T-one Decoder</strong> — decoding strategy.
+                                                                        <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                                            <li><code>beam_search</code> — explores multiple hypotheses with KenLM rescoring; more accurate.</li>
+                                                                            <li><code>greedy</code> — takes the top token each step; faster, lower accuracy.</li>
+                                                                        </ul>
+                                                                    </>
+                                                                }
+                                                            />
+                                                        </label>
                                                         <select
                                                             className={`w-full text-xs p-1.5 rounded border bg-background ${pendingSttExtra.tone_decoder_type ? 'border-yellow-500' : 'border-border'}`}
                                                             value={pendingSttExtra.tone_decoder_type ?? (activeModels.stt as any).tone_decoder_type ?? 'beam_search'}
@@ -1157,11 +1366,34 @@ const ModelsPage = () => {
                                     <div className="flex items-center gap-2 mb-3">
                                         <Brain className="w-4 h-4 text-purple-500" />
                                         <span className="text-sm font-medium">LLM</span>
-                                        <span className={`ml-auto px-2 py-0.5 rounded text-xs ${activeModels.llm.loaded ? 'bg-green-500/10 text-green-500' : 'bg-yellow-500/10 text-yellow-500'
+                                        <HelpTooltip
+                                            content={
+                                                <>
+                                                    <strong>LLM</strong> — large language model loaded by <code>llama-cpp-python</code> in the Local AI Server.
+                                                    <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                        <li>GGUF format only; quantized weights are fine (Q4_K_M is a good default).</li>
+                                                        <li>Larger models = better quality but slower TTFT.</li>
+                                                        <li>Chat format is auto-set when switching here.</li>
+                                                    </ul>
+                                                </>
+                                            }
+                                        />
+                                        {runtimeMode === 'minimal' && (
+                                            <span className="ml-auto px-2 py-0.5 rounded text-xs bg-amber-500/10 text-amber-500">
+                                                Minimal mode
+                                            </span>
+                                        )}
+                                        <span className={`${runtimeMode === 'minimal' ? '' : 'ml-auto'} px-2 py-0.5 rounded text-xs ${activeModels.llm.loaded ? 'bg-green-500/10 text-green-500' : 'bg-yellow-500/10 text-yellow-500'
                                             }`}>
                                             {activeModels.llm.loaded ? 'Loaded' : 'Not Loaded'}
                                         </span>
                                     </div>
+                                    {runtimeMode === 'minimal' && (
+                                        <div className="mb-3 flex items-start gap-1.5 text-xs text-amber-500 bg-amber-500/10 rounded px-2 py-1.5">
+                                            <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" />
+                                            <span>Minimal mode — no LLM loaded; tuning changes (context, max tokens, filler) have no effect. Set <code>LOCAL_AI_MODE=full</code> with an LLM model, or add a GPU.</span>
+                                        </div>
+                                    )}
                                     <select
                                         className="w-full text-xs p-2 rounded border border-border bg-background"
                                         value={pendingChanges.llm || activeModels.llm.path}
@@ -1178,7 +1410,21 @@ const ModelsPage = () => {
                                     {/* Tuning Controls */}
                                     <div className="mt-3 flex gap-2">
                                         <div className="flex-1 min-w-0">
-                                            <label className="block text-[10px] uppercase tracking-wide text-muted-foreground mb-1">Context</label>
+                                            <label className="block text-[10px] uppercase tracking-wide text-muted-foreground mb-1 flex items-center gap-1">
+                                                Context
+                                                <HelpTooltip
+                                                    content={
+                                                        <>
+                                                            <strong>Context</strong> — context-window size (<code>n_ctx</code>) passed to llama.cpp.
+                                                            <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                                <li>Larger = more memory of conversation, slower & more RAM.</li>
+                                                                <li>Must be {`≤`} the model's trained context length.</li>
+                                                                <li>Change requires LLM reload.</li>
+                                                            </ul>
+                                                        </>
+                                                    }
+                                                />
+                                            </label>
                                             <select
                                                 value={pendingLlmConfig.context ?? activeModels.llm.config?.context ?? ''}
                                                 onChange={(e) => {
@@ -1196,7 +1442,20 @@ const ModelsPage = () => {
                                             </select>
                                         </div>
                                         <div className="flex-1 min-w-0">
-                                            <label className="block text-[10px] uppercase tracking-wide text-muted-foreground mb-1">Max Tokens</label>
+                                            <label className="block text-[10px] uppercase tracking-wide text-muted-foreground mb-1 flex items-center gap-1">
+                                                Max Tokens
+                                                <HelpTooltip
+                                                    content={
+                                                        <>
+                                                            <strong>Max Tokens</strong> — upper bound on tokens generated per local LLM response.
+                                                            <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                                <li>Caps response length and worst-case TTS latency.</li>
+                                                                <li>For voice, 80–200 is usually enough.</li>
+                                                            </ul>
+                                                        </>
+                                                    }
+                                                />
+                                            </label>
                                             <input
                                                 type="number"
                                                 min={1}
@@ -1210,6 +1469,55 @@ const ModelsPage = () => {
                                                 title="Upper bound for each local LLM response."
                                             />
                                         </div>
+                                    </div>
+
+                                    <div className="mt-3 grid grid-cols-1 gap-2 text-xs">
+                                        <label className="flex items-center justify-between gap-3 rounded-md border border-border bg-background px-2 py-1.5">
+                                            <span className="text-muted-foreground flex items-center gap-1">
+                                                Filler audio
+                                                <HelpTooltip
+                                                    content={
+                                                        <>
+                                                            <strong>Filler audio</strong> — play a short "thinking" sound while the LLM is still generating its first token.
+                                                            <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                                <li>Hides first-token latency for slower local models.</li>
+                                                                <li>Disable if you prefer pure silence before speech.</li>
+                                                            </ul>
+                                                        </>
+                                                    }
+                                                />
+                                            </span>
+                                            <input
+                                                type="checkbox"
+                                                className="rounded border-border"
+                                                checked={pendingRuntimeConfig.enable_filler_audio ?? currentFillerAudio}
+                                                onChange={(e) => setPendingRuntimeConfig(prev => ({ ...prev, enable_filler_audio: e.target.checked }))}
+                                                disabled={restarting}
+                                            />
+                                        </label>
+                                        <label className="flex items-center justify-between gap-3 rounded-md border border-border bg-background px-2 py-1.5">
+                                            <span className="text-muted-foreground flex items-center gap-1">
+                                                LLM/TTS overlap
+                                                <HelpTooltip
+                                                    content={
+                                                        <>
+                                                            <strong>LLM/TTS overlap</strong> — start synthesizing TTS for each LLM sentence as it streams, instead of waiting for the full response.
+                                                            <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                                <li>Dramatically cuts perceived response latency.</li>
+                                                                <li>Disable only when debugging streaming glitches.</li>
+                                                            </ul>
+                                                        </>
+                                                    }
+                                                />
+                                            </span>
+                                            <input
+                                                type="checkbox"
+                                                className="rounded border-border"
+                                                checked={pendingRuntimeConfig.llm_streaming_tts_overlap ?? currentStreamingOverlap}
+                                                onChange={(e) => setPendingRuntimeConfig(prev => ({ ...prev, llm_streaming_tts_overlap: e.target.checked }))}
+                                                disabled={restarting}
+                                            />
+                                        </label>
                                     </div>
 
                                     {/* Runtime Stats */}
@@ -1248,6 +1556,19 @@ const ModelsPage = () => {
                                     <div className="flex items-center gap-2 mb-2">
                                         <Volume2 className="w-4 h-4 text-green-500" />
                                         <span className="text-sm font-medium">TTS</span>
+                                        <HelpTooltip
+                                            content={
+                                                <>
+                                                    <strong>TTS</strong> — text-to-speech engine currently loaded by the Local AI Server.
+                                                    <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                        <li><code>piper</code> — fast, lightweight, good voice quality.</li>
+                                                        <li><code>kokoro</code> — natural prosody; multiple voice files.</li>
+                                                        <li><code>melotts</code> — multilingual; requires backend rebuild.</li>
+                                                        <li><code>silero</code> — Russian/EU languages; rebuild required.</li>
+                                                    </ul>
+                                                </>
+                                            }
+                                        />
                                         <span className={`ml-auto px-2 py-0.5 rounded text-xs ${activeModels.tts.loaded ? 'bg-green-500/10 text-green-500' : 'bg-yellow-500/10 text-yellow-500'
                                             }`}>
                                             {activeModels.tts.loaded ? 'Loaded' : 'Not Loaded'}
@@ -1289,7 +1610,7 @@ const ModelsPage = () => {
 
                     {serverStatus === 'error' && (
                         <div className="p-4 bg-yellow-500/10 border border-yellow-500/30 rounded-lg">
-                            <p className="text-sm text-yellow-600 dark:text-yellow-400 mb-3">
+                            <p className="text-sm text-yellow-800 dark:text-yellow-400 mb-3">
                                 Local AI Server is not reachable. The container may still be running.
                             </p>
                             <button
@@ -1318,7 +1639,7 @@ const ModelsPage = () => {
                     )}
 
                     {/* Apply Changes Button */}
-                    {Object.keys(pendingChanges).length > 0 && (
+                    {hasPendingApplyChanges && (
                         <div className="mt-4 space-y-3">
                             {restarting && applyProgress && (
                                 <div className="p-3 rounded-md border border-blue-500/30 bg-blue-500/10 text-sm space-y-2">
@@ -1398,6 +1719,9 @@ const ModelsPage = () => {
                                 <button
                                     onClick={() => {
                                         setPendingChanges({});
+                                        setPendingSttExtra({});
+                                        setPendingLlmConfig({});
+                                        setPendingRuntimeConfig({});
                                         setForceIncompatibleApply(false);
                                     }}
                                     disabled={restarting}
@@ -1421,6 +1745,7 @@ const ModelsPage = () => {
                             onClick={fetchModels}
                             disabled={loading}
                             className="p-2 rounded-md hover:bg-accent text-muted-foreground hover:text-foreground transition-colors"
+                            aria-label="Refresh"
                             title="Refresh"
                         >
                             <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
@@ -1553,6 +1878,8 @@ const ModelsPage = () => {
                                                                 </div>
                                                             </div>
                                                             <button
+                                                                aria-label={deletingModel === model.name ? `Deleting model ${model.name}` : `Delete model ${model.name}`}
+                                                                title={deletingModel === model.name ? `Deleting model ${model.name}` : `Delete model ${model.name}`}
                                                                 onClick={() => handleDelete(model)}
                                                                 disabled={deletingModel === model.name}
                                                                 className="p-2 rounded-md bg-red-100 dark:bg-red-900/30 text-red-600 hover:bg-red-200 dark:hover:bg-red-900/50 transition-colors"

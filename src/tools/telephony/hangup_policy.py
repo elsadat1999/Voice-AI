@@ -1,7 +1,18 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from typing import Any, Dict, Iterable, List
+
+
+AGENT_HANGUP_MARKER_STRATEGIES = frozenset({"inherit", "extend", "replace"})
+MAX_AGENT_END_CALL_MARKERS = 100
+MAX_AGENT_END_CALL_MARKER_LENGTH = 160
+
+
+class HangupPolicyConfigError(ValueError):
+    """Raised when an Agent-scoped hangup marker policy is malformed."""
 
 DEFAULT_HANGUP_MARKERS: Dict[str, List[str]] = {
     "end_call": [
@@ -26,6 +37,7 @@ DEFAULT_HANGUP_MARKERS: Dict[str, List[str]] = {
     "assistant_farewell": [
         "goodbye",
         "bye",
+        "thanks for calling",
         "thank you for calling",
         "have a great day",
         "take care",
@@ -155,6 +167,119 @@ def normalize_hangup_policy(policy: Any) -> Dict[str, Any]:
     }
 
 
+def normalize_agent_hangup_policy(value: Any) -> Dict[str, Any]:
+    """Validate and canonicalize an Agent's end-call marker override.
+
+    An empty document means inherit. ``extend`` appends Agent markers to the
+    global list, while ``replace`` makes the Agent list authoritative. Marker
+    counts and lengths are bounded because this document crosses the Local AI
+    WebSocket boundary once per call.
+    """
+    if value in (None, ""):
+        return {}
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise HangupPolicyConfigError(
+                "hangup_policy_json must contain valid JSON"
+            ) from exc
+    if not isinstance(value, dict):
+        raise HangupPolicyConfigError("hangup policy must be a JSON object")
+
+    if any(not isinstance(key, str) for key in value):
+        raise HangupPolicyConfigError("hangup policy field names must be strings")
+    unknown = sorted(set(value) - {"strategy", "end_call"})
+    if unknown:
+        raise HangupPolicyConfigError(
+            f"unsupported hangup policy field(s): {', '.join(unknown)}"
+        )
+
+    strategy = str(value.get("strategy") or "inherit").strip().lower()
+    if strategy not in AGENT_HANGUP_MARKER_STRATEGIES:
+        raise HangupPolicyConfigError(
+            "hangup strategy must be inherit, extend, or replace"
+        )
+    raw_markers = value.get("end_call")
+    if strategy == "inherit":
+        if raw_markers not in (None, []):
+            raise HangupPolicyConfigError(
+                "end_call markers may only be set when strategy is extend or replace"
+            )
+        return {}
+    if not isinstance(raw_markers, list):
+        raise HangupPolicyConfigError("end_call must be an array")
+    if len(raw_markers) > MAX_AGENT_END_CALL_MARKERS:
+        raise HangupPolicyConfigError(
+            f"end_call supports at most {MAX_AGENT_END_CALL_MARKERS} markers"
+        )
+
+    markers: List[str] = []
+    seen = set()
+    for raw_marker in raw_markers:
+        if not isinstance(raw_marker, str):
+            raise HangupPolicyConfigError("end_call entries must be strings")
+        marker = " ".join(raw_marker.strip().lower().split())
+        if not marker:
+            raise HangupPolicyConfigError("end_call entries must not be empty")
+        if len(marker) > MAX_AGENT_END_CALL_MARKER_LENGTH:
+            raise HangupPolicyConfigError(
+                f"end_call entries must be at most {MAX_AGENT_END_CALL_MARKER_LENGTH} characters"
+            )
+        if marker not in seen:
+            markers.append(marker)
+            seen.add(marker)
+    if not markers:
+        raise HangupPolicyConfigError(
+            f"{strategy} requires at least one end_call marker"
+        )
+    return {"strategy": strategy, "end_call": markers}
+
+
+def dump_agent_hangup_policy(value: Any) -> str | None:
+    """Return stable JSON for Agent storage, or ``None`` for inheritance."""
+    normalized = normalize_agent_hangup_policy(value)
+    if not normalized:
+        return None
+    return json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+
+
+def resolve_effective_hangup_policy(
+    tools_cfg: Any,
+    agent_policy: Any = None,
+) -> Dict[str, Any]:
+    """Resolve global + Agent markers and return policy plus audit metadata."""
+    policy = normalize_hangup_policy(
+        tools_cfg.get("hangup_call", {}).get("policy")
+        if isinstance(tools_cfg, dict)
+        and isinstance(tools_cfg.get("hangup_call"), dict)
+        else {}
+    )
+    override = normalize_agent_hangup_policy(agent_policy)
+    strategy = override.get("strategy") or "inherit"
+    source = "global"
+    if strategy == "extend":
+        policy["markers"]["end_call"] = _dedupe(
+            list(policy["markers"]["end_call"]) + list(override["end_call"])
+        )
+        source = "agent_extend"
+    elif strategy == "replace":
+        policy["markers"]["end_call"] = list(override["end_call"])
+        source = "agent_replace"
+
+    markers = list(policy["markers"]["end_call"])
+    digest = hashlib.sha256(
+        json.dumps(markers, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:16]
+    return {
+        "policy": policy,
+        "source": source,
+        "strategy": strategy,
+        "marker_count": len(markers),
+        "marker_digest": digest,
+    }
+
+
 def resolve_hangup_policy(tools_cfg: Any) -> Dict[str, Any]:
     if isinstance(tools_cfg, dict):
         hangup_cfg = tools_cfg.get("hangup_call")
@@ -217,8 +342,8 @@ def text_is_short_polite_closing(text: str) -> bool:
     Detect short gratitude closings even when custom marker lists are too narrow.
 
     This is intentionally conservative to avoid mid-call false positives:
-    - utterance must be short (<= 6 words after normalization)
-    - must look like a closing gratitude phrase (e.g. "okay thank you")
+    - utterance must be short (<= 8 words after normalization)
+    - must end in gratitude, optionally after a recognized closing prefix
     """
     normalized = _normalize_end_call_text(text)
     if not normalized:
@@ -226,11 +351,12 @@ def text_is_short_polite_closing(text: str) -> bool:
     compact = _normalize_text(re.sub(r"[^a-z0-9\s]", " ", normalized))
     if not compact:
         return False
-    if len(compact.split()) > 6:
+    if len(compact.split()) > 8:
         return False
     return bool(
         re.fullmatch(
-            r"(?:ok(?:ay)?\s+)?(?:thank\s+you|thanks)(?:\s+(?:so\s+much|very\s+much))?(?:\s+(?:bye|goodbye))?",
+            r"(?:(?:ok(?:ay)?|no(?:pe)?(?!\s+(?:thank\s+you|thanks)\b)|never\s+mind|nevermind|leave\s+it|that\s+s\s+(?:all|it)|thats\s+(?:all|it)|nothing\s+else)\s+)*"
+            r"(?:thank\s+you|thanks)(?:\s+(?:so\s+much|very\s+much))?(?:\s+(?:bye|goodbye))?",
             compact,
         )
     )

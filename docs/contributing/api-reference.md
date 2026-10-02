@@ -32,16 +32,19 @@ When disabled, `/docs`, `/redoc`, and `/openapi.json` will return 404. Default i
 
 Most Admin UI endpoints require JWT authentication:
 
-> ⚠️ **Security Note:** The credentials below (`admin/admin`) are initial defaults. Change the admin password immediately after first login and never use default credentials in production.
+> **v7.0.0 and newer:** the default `admin/admin` login is removed. On first start, a one-time admin password is printed to the `admin_ui` container logs and must be changed at first login.
 
 ```bash
-# 1. Login to get a token
+# 1. Retrieve the first-run password
+docker compose -p asterisk-ai-voice-agent logs admin_ui | grep -i password
+
+# 2. Login to get a token
 curl -X POST http://localhost:3003/api/auth/login \
-  -d "username=admin&password=admin"
+  -d "username=admin&password=<one-time-password>"
 
 # Response: {"access_token": "eyJ...", "token_type": "bearer"}
 
-# 2. Use the token in subsequent requests
+# 3. Use the token in subsequent requests
 curl -H "Authorization: Bearer eyJ..." \
   http://localhost:3003/api/config/yaml
 ```
@@ -69,7 +72,7 @@ curl -H "Authorization: Bearer eyJ..." \
 | GET | `/api/config/export` | Export configuration as ZIP |
 | POST | `/api/config/import` | Import configuration from ZIP |
 | POST | `/api/config/env/smtp/test` | Test SMTP settings |
-| GET | `/api/config/export-logs` | Export logs for troubleshooting |
+| GET | `/api/config/export-logs` | Deprecated compatibility alias for the bounded sanitized system-diagnostics package |
 | GET | `/api/config/options/{provider_type}` | Get provider options (models, voices) |
 
 ### System (`/api/system`)
@@ -112,6 +115,96 @@ curl -H "Authorization: Bearer eyJ..." \
 | GET | `/api/calls/export/csv` | Export calls as CSV |
 | GET | `/api/calls/export/json` | Export calls as JSON |
 
+> **Agent on a call record (v7).** Each call record reports the resolved agent as
+> `context_name` (the agent/context slug) plus `routing_method`
+> (`ai_agent` \| `ai_context` \| `default` \| `null`). v7.0.x adds two **additive**
+> aliases so integrations need not infer this: `agent_slug` and `agent_name`.
+> `agent_slug` mirrors the resolved agent (`context_name`) **whenever the call was
+> routed to one** — `ai_agent`, `ai_context` or `default` routing — and is `null`
+> only for `unknown`/`null` routing. `routing_method` still tells you *how* the agent
+> was selected. `agent_name` is a best-effort display-name lookup and is `null` when
+> the agents database is unavailable or has no matching agent. `context_name` and
+> `routing_method` are unchanged.
+
+### Agents (`/api/agents`)
+The Agents system (v7) is the operator surface for managing AI agents. Manage agents
+over HTTP here; see also [`docs/AGENTS.md`](../AGENTS.md).
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/agents` | List all agents |
+| GET | `/api/agents/{slug}` | Get a single agent by slug |
+| POST | `/api/agents` | Create an agent (requires a provider **or** a pipeline) |
+| PATCH | `/api/agents/{slug}` | Update an agent (partial; `is_active` can promote default) |
+| DELETE | `/api/agents/{slug}` | Delete an agent (promotes a new default if needed) |
+| POST | `/api/agents/{slug}/default` | Make this agent the default |
+| GET | `/api/agents/{slug}/stats` | Per-agent stats (calls in last 30d, last call) |
+| GET | `/api/agents/{slug}/dialplan` | Generate an `extensions_custom.conf` snippet |
+| GET | `/api/agents/templates` | List starter agent templates |
+| GET | `/api/agents/summary` | Dashboard KPIs (active agents, active calls, routed, transfers) |
+| GET | `/api/agents/stats-batch` | Per-agent stats for all agents in one response |
+| GET | `/api/agents/distribution` | Call counts grouped by agent, descending |
+| GET | `/api/agents/routing-methods` | Routing-method breakdown (`ai_agent`/`ai_context`/`default`/`unknown`) |
+| GET | `/api/agents-migration/status` | YAML→DB migration result and drift state |
+| POST | `/api/agents-migration/reconcile` | Re-import YAML context changes into the DB |
+| POST | `/api/agents-migration/acknowledge` | Keep the DB as-is and clear the drift flag |
+
+> **`AI_AGENT` is a dialplan/runtime channel variable, not an HTTP parameter.** Set
+> `AI_AGENT=<slug>` (or the legacy `AI_CONTEXT=<slug>`) in your Asterisk dialplan to
+> route a call to a specific agent — see `GET /api/agents/{slug}/dialplan` for a
+> ready-to-paste snippet. External integrations should manage agents via the Agents
+> API above and read the agent that handled a call from the call-record fields
+> (`context_name` / `agent_slug` / `agent_name` / `routing_method`).
+
+### Tools (`/api/tools`)
+The Tools system (v7) is the operator surface for managing the agent's tools &
+capabilities. **Managed HTTP tools** are the operator-built HTTP/webhook
+integrations (pre-call lookups, in-call tools, post-call webhooks). **Built-in
+tools** are the engine-registered telephony/business tools (transfer, hangup,
+voicemail, email, calendars). **Settings** covers tools-block options that are
+not individual tools.
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/tools/catalog` | Read-only catalog of all available tools (built-in, HTTP, MCP) |
+| POST | `/api/tools/test-http` | Test an HTTP tool configuration without saving it |
+| GET | `/api/tools/test-values` | Get default values used by the HTTP-tool tester |
+| GET | `/api/tools/email-templates/defaults` | Get email-template defaults |
+| POST | `/api/tools/email-templates/preview` | Preview an email template |
+| GET | `/api/tools/managed` | List operator-managed HTTP tools |
+| POST | `/api/tools/managed` | Create a managed HTTP tool (`kind` derived from `phase`) |
+| GET | `/api/tools/managed/{name}` | Get a single managed HTTP tool |
+| PUT | `/api/tools/managed/{name}` | Replace a managed HTTP tool (may move it between phases) |
+| PATCH | `/api/tools/managed/{name}` | Partially update a managed HTTP tool |
+| DELETE | `/api/tools/managed/{name}` | Delete a managed HTTP tool |
+| GET | `/api/tools/builtin` | List built-in tools with enabled state and config |
+| GET | `/api/tools/builtin/{name}` | Get a single built-in tool's config |
+| PATCH | `/api/tools/builtin/{name}` | Partially update a built-in tool (deep merge; `null` removes a key) |
+| PUT | `/api/tools/builtin/{name}` | Replace a built-in tool's config |
+| GET | `/api/tools/settings` | Read tools-block settings (`farewell_hangup_delay_sec`, extensions, …) |
+| PATCH | `/api/tools/settings` | Update tools-block settings |
+
+> **`phase` → `kind` is enforced.** A managed tool's `kind` is derived from its
+> `phase` (`pre_call` → `generic_http_lookup`, `in_call` → `in_call_http_lookup`,
+> `post_call` → `generic_webhook`); a mismatched `kind` is rejected with `422`.
+> Managed tool names may not collide with built-in tool names.
+
+Managed tool URLs must be absolute HTTP(S) URLs or start with an environment
+placeholder such as `${CRM_BASE_URL}`. Timeouts must be between 1 and 300,000 ms,
+and methods are limited to standard HTTP methods. Explicit `null` is rejected for
+required PATCH fields; it removes supported optional fields.
+
+Built-ins include transfer, attended/cancel transfer, hangup, voicemail,
+`check_extension_status`, email/transcript, and Google/Microsoft calendar tools.
+The settings endpoint rejects built-in, managed, MCP, identity, and other
+registry-reserved tool names. `farewell_hangup_delay_sec` is deprecated and
+ignored by the engine. The API continues to read/write it for compatibility
+without changing hangup timing. It must be finite and between 0 and 300 seconds.
+
+Mutating endpoints persist the local configuration override but do not restart
+the AI Engine. Apply tool changes using the AI Engine restart endpoint after the
+write succeeds.
+
 ### Outbound (`/api/outbound`, `/api/campaigns`, `/api/leads`, `/api/recordings`)
 | Method | Endpoint | Description |
 |--------|----------|-------------|
@@ -149,15 +242,6 @@ curl -H "Authorization: Bearer eyJ..." \
 | GET | `/api/local-ai/backends` | List available backends |
 | GET | `/api/local-ai/backends/{type}/{name}/schema` | Get backend config schema |
 
-### Tools (`/api/tools`)
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/tools/catalog` | Get tool catalog |
-| POST | `/api/tools/test-http` | Test HTTP tool configuration |
-| GET | `/api/tools/test-values` | Get default test values |
-| GET | `/api/tools/email-templates/defaults` | Get email template defaults |
-| POST | `/api/tools/email-templates/preview` | Preview email template |
-
 ### MCP (`/api/mcp`)
 | Method | Endpoint | Description |
 |--------|----------|-------------|
@@ -169,6 +253,25 @@ curl -H "Authorization: Bearer eyJ..." \
 |--------|----------|-------------|
 | GET | `/api/logs/{container_name}` | Get container logs |
 | GET | `/api/logs/{container_name}/events` | Get structured log events |
+
+Only `ai_engine`, `local_ai_server`, and `admin_ui` are valid log container
+names. The event endpoint accepts console, JSON, and mixed log streams and can
+expand a call ID through related channel and bridge IDs.
+
+### Support packages (`/api/support`)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/support/call-preview?call_id=...` | Summarize retained lifecycle evidence, findings, source relevance, settings availability, and tool counts for one call |
+| POST | `/api/support/call-bundle` | Download a call-correlated, sanitized ZIP; optional Local AI Server, Admin UI, transcript, tools, and settings fields default to `true` |
+| POST | `/api/support/system-bundle` | Download a sanitized 1–24 hour system ZIP for issues not tied to one call |
+| GET | `/api/support-bundle` | Legacy redacted agent/system metadata bundle |
+
+Call support packages never include recordings or caller identity. Their
+manifest reports the log format and observed levels. Call-time provider, Audio
+Profile, transport, codec, VAD, barge-in, and streaming configuration is
+available for calls created after the diagnostics-snapshot migration; older
+records return an explicit omission rather than substituting current settings.
 
 ### Wizard (`/api/wizard`)
 | Method | Endpoint | Description |
@@ -264,4 +367,3 @@ curl -H "Authorization: Bearer your-token" http://localhost:15000/reload -X POST
 - Architecture deep dive: [`architecture-deep-dive.md`](architecture-deep-dive.md)
 - Engine source: [`src/engine.py`](../../src/engine.py)
 - Configuration: [`src/config.py`](../../src/config.py)
-

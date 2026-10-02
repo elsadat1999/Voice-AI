@@ -8,30 +8,30 @@ import { ConfigSection } from '../../components/ui/ConfigSection';
 import { ConfigCard } from '../../components/ui/ConfigCard';
 import { FormInput, FormSelect, FormSwitch } from '../../components/ui/FormComponents';
 import { sanitizeConfigForSave } from '../../utils/configSanitizers';
+import { getCachedConfig, loadConfigYaml } from '../../utils/configCache';
+import { useRestartRequired } from '../../hooks/useRestartRequired';
 
 const StreamingPage = () => {
-    const [config, setConfig] = useState<any>({});
-    const [loading, setLoading] = useState(true);
-    const [yamlError, setYamlError] = useState<YamlErrorInfo | null>(null);
+    const [config, setConfig] = useState<any>(() => getCachedConfig()?.config ?? {});
+    const [loading, setLoading] = useState(() => getCachedConfig() == null);
+    const [yamlError, setYamlError] = useState<YamlErrorInfo | null>(() => getCachedConfig()?.yamlError ?? null);
     const [saving, setSaving] = useState(false);
-    const [pendingRestart, setPendingRestart] = useState(false);
+    const { restartRequired, refetch } = useRestartRequired();
     const [restartingEngine, setRestartingEngine] = useState(false);
+    const [applyMethod, setApplyMethod] = useState<string>('restart');
 
     useEffect(() => {
+        // Cache-first: seed from the shared cache (no flash on revisit). The write
+        // interceptor invalidates the cache on every save, so a background
+        // revalidate is unnecessary and could clobber in-progress form edits.
         fetchConfig();
     }, []);
 
-    const fetchConfig = async () => {
+    const fetchConfig = async (force = false) => {
         try {
-            const res = await axios.get('/api/config/yaml');
-            if (res.data.yaml_error) {
-                setYamlError(res.data.yaml_error);
-                setConfig({});
-            } else {
-                const parsed = yaml.load(res.data.content) as any;
-                setConfig(parsed || {});
-                setYamlError(null);
-            }
+            const r = await loadConfigYaml(force);
+            setConfig(r.config);
+            setYamlError(r.yamlError);
         } catch (err) {
             console.error('Failed to load config', err);
             setYamlError(null);
@@ -44,9 +44,15 @@ const StreamingPage = () => {
         setSaving(true);
         try {
             const sanitized = sanitizeConfigForSave(config);
-            await axios.post('/api/config/yaml', { content: yaml.dump(sanitized) });
-            setPendingRestart(true);
-            toast.success('Streaming configuration saved');
+            const response = await axios.post('/api/config/yaml', { content: yaml.dump(sanitized) });
+            const method = response.data?.recommended_apply_method || 'restart';
+            setApplyMethod(method);
+            await refetch();
+            if (method === 'hot_reload') {
+                toast.success('Streaming configuration saved. Changes can be applied via hot-reload.');
+            } else {
+                toast.success('Streaming configuration saved. Restart AI Engine to apply changes.');
+            }
         } catch (err) {
             console.error('Failed to save config', err);
             toast.error('Failed to save configuration');
@@ -55,10 +61,30 @@ const StreamingPage = () => {
         }
     };
 
-    const handleReloadAIEngine = async (force: boolean = false) => {
+    const handleApplyAIEngine = async (force: boolean = false) => {
         setRestartingEngine(true);
         try {
-            // Use restart to ensure all changes are picked up
+            // Prefer hot-reload (no dropped calls) when the backend says it suffices (MED-R1).
+            if (applyMethod === 'hot_reload') {
+                const response = await axios.post('/api/system/containers/ai_engine/reload');
+
+                if (response.data?.restart_required) {
+                    setApplyMethod('restart');
+                    await refetch();
+                    toast.warning('Hot reload applied partially', { description: response.data.message || 'Restart AI Engine to fully apply changes' });
+                    return;
+                }
+
+                if (response.data?.status === 'success') {
+                    await refetch();
+                    toast.success('AI Engine hot reloaded! Changes are now active.');
+                    return;
+                }
+
+                toast.info(`Hot reload response: ${response.data?.message || 'unknown status'}`);
+                return;
+            }
+
             const response = await axios.post(`/api/system/containers/ai_engine/restart?force=${force}`);
 
             if (response.data.status === 'warning') {
@@ -67,7 +93,7 @@ const StreamingPage = () => {
                         `${response.data.message}\n\nDo you want to force restart anyway? This may disconnect active calls.`
                     );
                     if (confirmForce) {
-                        await handleReloadAIEngine(true);
+                        await handleApplyAIEngine(true);
                     }
                     return;
                 }
@@ -81,11 +107,12 @@ const StreamingPage = () => {
             }
 
             if (response.data.status === 'success') {
-                setPendingRestart(false);
+                await refetch();
                 toast.success('AI Engine restarted! Changes are now active.');
             }
         } catch (error: any) {
-            toast.error('Failed to restart AI Engine', { description: error.response?.data?.detail || error.message });
+            const actionLabel = applyMethod === 'hot_reload' ? 'hot reload' : 'restart';
+            toast.error(`Failed to ${actionLabel} AI Engine`, { description: error.response?.data?.detail || error.message });
         } finally {
             setRestartingEngine(false);
         }
@@ -139,7 +166,7 @@ const StreamingPage = () => {
 
     const getLatencyColor = (seconds: number) => {
         if (seconds < 2) return 'text-green-600 dark:text-green-400';
-        if (seconds <= 3) return 'text-yellow-600 dark:text-yellow-400';
+        if (seconds <= 3) return 'text-yellow-800 dark:text-yellow-400';
         return 'text-red-600 dark:text-red-400';
     };
 
@@ -165,30 +192,34 @@ const StreamingPage = () => {
 
     const streamingConfig = config.streaming || {};
 
+    const bannerMessage = applyMethod === 'hot_reload'
+        ? 'Changes saved. Apply Changes to hot reload AI Engine without dropping active calls.'
+        : 'Changes to streaming configurations require an AI Engine restart to take effect.';
+
     return (
         <div className="space-y-6">
-            <div className={`${pendingRestart ? 'bg-orange-500/15 border-orange-500/30' : 'bg-yellow-500/10 border-yellow-500/20'} border text-yellow-600 dark:text-yellow-500 p-4 rounded-md flex items-center justify-between`}>
-                <div className="flex items-center">
-                    <AlertCircle className="w-5 h-5 mr-2" />
-                    Changes to streaming configurations require an AI Engine restart to take effect.
+            {restartRequired && (
+                <div className="bg-orange-500/15 border-orange-500/30 border text-yellow-800 dark:text-yellow-500 p-4 rounded-md flex items-center justify-between">
+                    <div className="flex items-center">
+                        <AlertCircle className="w-5 h-5 mr-2" />
+                        {bannerMessage}
+                    </div>
+                    <button
+                        onClick={() => handleApplyAIEngine(false)}
+                        disabled={restartingEngine}
+                        className="flex items-center text-xs px-3 py-1.5 rounded transition-colors bg-orange-500 text-white hover:bg-orange-600 font-medium disabled:opacity-50"
+                    >
+                        {restartingEngine ? (
+                            <Loader2 className="w-3 h-3 mr-1.5 animate-spin" />
+                        ) : (
+                            <RefreshCw className="w-3 h-3 mr-1.5" />
+                        )}
+                        {restartingEngine
+                            ? (applyMethod === 'hot_reload' ? 'Applying...' : 'Restarting...')
+                            : (applyMethod === 'hot_reload' ? 'Apply Changes' : 'Restart AI Engine')}
+                    </button>
                 </div>
-                <button
-                    onClick={() => handleReloadAIEngine(false)}
-                    disabled={restartingEngine}
-                    className={`flex items-center text-xs px-3 py-1.5 rounded transition-colors ${
-                        pendingRestart 
-                            ? 'bg-orange-500 text-white hover:bg-orange-600 font-medium' 
-                            : 'bg-yellow-500/20 hover:bg-yellow-500/30'
-                    } disabled:opacity-50`}
-                >
-                    {restartingEngine ? (
-                        <Loader2 className="w-3 h-3 mr-1.5 animate-spin" />
-                    ) : (
-                        <RefreshCw className="w-3 h-3 mr-1.5" />
-                    )}
-                    {restartingEngine ? 'Restarting...' : 'Reload AI Engine'}
-                </button>
-            </div>
+            )}
 
             <div className="flex justify-between items-center">
                 <div>

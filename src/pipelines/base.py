@@ -27,6 +27,14 @@ except ImportError:
     websockets = None
 
 
+STREAMING_STT_FORMAT_ALIASES: frozenset[str] = frozenset({
+    "pcm16",
+    "pcm16_16k",
+    "pcm16-16k",
+    "linear16",
+})
+
+
 @dataclass
 class LLMResponse:
     """Standard response from an LLM, containing text and/or tool calls."""
@@ -270,6 +278,11 @@ class Component(ABC):
 class STTComponent(Component):
     """Speech-to-text component."""
 
+    # Streaming adapters opt in explicitly. The engine must not infer support
+    # from incidental method names because buffered-only adapters share this
+    # base class.
+    supports_streaming: bool = False
+
     @abstractmethod
     async def transcribe(
         self,
@@ -288,6 +301,15 @@ class LLMComponent(Component):
     # via generate_stream(). The engine checks this to decide whether to use
     # the streaming overlap pipeline or the serial path.
     supports_streaming: bool = False
+
+    def bind_tool_registry(self, registry: Any) -> None:
+        """Bind the immutable tool registry captured for this pipeline call."""
+        self._call_tool_registry = registry
+
+    def tool_registry_or(self, fallback: Any) -> Any:
+        """Return the per-call registry, or a compatibility fallback if unbound."""
+        registry = getattr(self, "_call_tool_registry", None)
+        return registry if registry is not None else fallback
 
     @abstractmethod
     async def generate(
@@ -319,6 +341,15 @@ class LLMComponent(Component):
 class TTSComponent(Component):
     """Text-to-speech component."""
 
+    # Adapters set this only when they can return native linear PCM suitable for
+    # a 16 kHz AudioSocket call.  The engine uses the declaration to opt a
+    # pipeline into wideband on a per-call basis; legacy 8 kHz options remain
+    # untouched for adapters without an explicit declaration.
+    # ``options`` may carry adapter-specific provider-request overrides (for
+    # example Google/Azure source encoding and rate) in addition to the common
+    # downstream ``encoding`` and ``sample_rate`` fields.
+    wideband_output_format: Optional[Dict[str, Any]] = None
+
     @abstractmethod
     async def synthesize(
         self,
@@ -327,3 +358,24 @@ class TTSComponent(Component):
         options: Dict[str, Any],
     ) -> AsyncIterator[bytes]:
         """Yield audio frames (μ-law or PCM) for the supplied text."""
+
+    # Adapters that hold one provider session open for a whole turn set this to
+    # True and implement ``synthesize_stream``. The engine then feeds them text
+    # as the LLM produces it, instead of waiting for each fragment to be
+    # synthesised before consuming the next tokens.
+    supports_text_stream: bool = False
+
+    async def synthesize_stream(
+        self,
+        call_id: str,
+        text_chunks: AsyncIterator[str],
+        options: Dict[str, Any],
+    ) -> AsyncIterator[bytes]:
+        """Yield audio frames for a stream of text fragments (one turn).
+
+        The default implementation synthesises each fragment in turn, so the
+        engine can use a single code path for every adapter.
+        """
+        async for text in text_chunks:
+            async for chunk in self.synthesize(call_id, text, options):
+                yield chunk

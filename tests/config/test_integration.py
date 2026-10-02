@@ -42,6 +42,30 @@ class TestConfigLoading:
         assert isinstance(config, AppConfig)
         assert config.default_provider == "openai_realtime"
         assert hasattr(config, 'pipelines')
+
+    def test_load_config_retains_raw_contexts_for_migration_hash(
+        self, tmp_path, monkeypatch
+    ):
+        source = Path("config/ai-agent.golden-openai.yaml").read_text()
+        original_prompt = (
+            "You are a concise voice assistant. Respond clearly and keep answers "
+            "under 20 words unless more detail is requested."
+        )
+        config_path = tmp_path / "ai-agent.yaml"
+        config_path.write_text(
+            source.replace(original_prompt, "${LEGACY_AGENT_PROMPT}"),
+            encoding="utf-8",
+        )
+        (tmp_path / "contexts").mkdir()
+        monkeypatch.setenv("LEGACY_AGENT_PROMPT", original_prompt)
+
+        config = load_config(str(config_path))
+
+        assert config.contexts["default"]["prompt"] == original_prompt
+        assert (
+            config._legacy_contexts_for_hash["default"]["prompt"]
+            == "${LEGACY_AGENT_PROMPT}"
+        )
     
     def test_load_golden_deepgram_config(self):
         """Should successfully load golden Deepgram config."""
@@ -114,12 +138,17 @@ class TestConfigLoading:
     def test_diagnostic_settings_from_env(self, monkeypatch):
         """Should apply diagnostic settings from environment variables."""
         monkeypatch.setenv("STREAMING_LOG_LEVEL", "debug")
+        monkeypatch.setenv("DIAG_ENABLE_TAPS", "false")
         
         config = load_config("config/ai-agent.example.yaml")
         
-        # Diagnostic fields like diag_enable_taps are set but not validated by Pydantic
-        # (they don't exist in StreamingConfig model). Only test fields that exist.
+        # Documented diagnostic fields must survive Pydantic validation so the
+        # resolved opt-in reaches both playback taps and full-call capture.
         assert config.streaming.logging_level == "debug"
+        assert config.streaming.diag_enable_taps is False
+        assert config.streaming.diag_pre_secs == 1
+        assert config.streaming.diag_post_secs == 1
+        assert config.streaming.diag_out_dir == "/tmp/ai-engine-taps"
     
     def test_barge_in_env_overrides(self, monkeypatch):
         """Should apply barge-in env var overrides."""
@@ -205,3 +234,31 @@ class TestConfigIntegrity:
         
         assert hasattr(config, 'contexts')
         assert isinstance(config.contexts, dict)
+
+
+@pytest.mark.parametrize("model_name", [
+    "LocalProviderConfig", "DeepgramProviderConfig", "OpenAIProviderConfig",
+    "GoogleProviderConfig", "ElevenLabsProviderConfig", "CambAiProviderConfig",
+    "FishAudioProviderConfig",
+])
+def test_legacy_provider_farewell_delay_is_preserved_and_deprecated(model_name):
+    import src.config as config_module
+
+    model = getattr(config_module, model_name)
+    config = model(farewell_hangup_delay_sec=4)
+    assert config.model_dump()["farewell_hangup_delay_sec"] == 4
+    field_schema = model.model_json_schema()["properties"]["farewell_hangup_delay_sec"]
+    assert field_schema["deprecated"] is True
+    assert "ignored" in field_schema["description"]
+
+
+def test_legacy_global_farewell_delay_survives_validation_and_serialization():
+    config = AppConfig(
+        asterisk={"host": "127.0.0.1", "username": "u", "password": "p"},
+        llm={},
+        default_provider="local",
+        providers={"local": {}},
+        farewell_hangup_delay_sec=4,
+    )
+    assert config.model_dump()["farewell_hangup_delay_sec"] == 4
+    assert AppConfig.model_json_schema()["properties"]["farewell_hangup_delay_sec"]["deprecated"] is True

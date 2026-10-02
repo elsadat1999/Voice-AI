@@ -1,4 +1,4 @@
-import React, { useEffect, useState, Suspense, lazy } from 'react';
+import React, { useEffect, useRef, useState, Suspense, lazy } from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate, useNavigate, useLocation } from 'react-router-dom';
 import { Toaster } from 'sonner';
 import { ConfirmDialogProvider } from './hooks/useConfirmDialog';
@@ -16,7 +16,9 @@ import LoginPage from './pages/LoginPage';
 // Core Configuration Pages
 import ProvidersPage from './pages/ProvidersPage';
 import PipelinesPage from './pages/PipelinesPage';
-import ContextsPage from './pages/ContextsPage';
+import AgentsPage from './pages/AgentsPage';
+import MigrationStatusPage from './pages/MigrationStatusPage';
+import LegacyContextsRedirect from './pages/LegacyContextsRedirect';
 import ProfilesPage from './pages/ProfilesPage';
 import ToolsPage from './pages/ToolsPage';
 import MCPPage from './pages/MCPPage';
@@ -52,54 +54,77 @@ const PageLoader = () => (
 );
 
 // Auth/Setup Guard
-const SetupGuard = ({ children }: { children: React.ReactNode }) => {
+export const SetupGuard = ({ children }: { children: React.ReactNode }) => {
     const [loading, setLoading] = useState(true);
-    const [error, setError] = useState<string | null>(null);
+    const [error, setError] = useState<{ kind: 'http' | 'transport'; message: string } | null>(null);
+    const [retryCount, setRetryCount] = useState(0);
     const navigate = useNavigate();
     const location = useLocation();
+    const navigateRef = useRef(navigate);
+    const locationPathRef = useRef(location.pathname);
+    navigateRef.current = navigate;
+    locationPathRef.current = location.pathname;
 
     useEffect(() => {
         let mounted = true;
+        let activeController: AbortController | null = null;
+        let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
-        const checkStatus = async () => {
+        const checkStatus = async (attempt = 0) => {
+            activeController = new AbortController();
+            const timeoutId = setTimeout(() => activeController?.abort(), 5000);
             try {
-                // Add timeout to prevent hanging
-                const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), 5000);
-
                 const res = await axios.get('/api/wizard/status', {
-                    signal: controller.signal
+                    signal: activeController.signal
                 });
-
-                clearTimeout(timeoutId);
 
                 if (mounted) {
                     // If not configured and not already on wizard, redirect
-                    if (!res.data.configured && location.pathname !== '/wizard') {
-                        navigate('/wizard');
+                    if (!res.data.configured && locationPathRef.current !== '/wizard') {
+                        navigateRef.current('/wizard');
                     }
+                    setError(null);
                     setLoading(false);
                 }
             } catch (err) {
                 console.error('Failed to check setup status', err);
-                if (mounted) {
-                    // If API fails, we assume not configured or backend down
-                    // But we shouldn't block the UI entirely
-                    setError('Failed to connect to backend API');
-                    setLoading(false);
+                if (!mounted) return;
+
+                // A single delayed probe should not replace the entire UI with a
+                // persistent outage screen. Retry once after a short pause.
+                if (attempt === 0) {
+                    retryTimer = setTimeout(() => checkStatus(1), 500);
+                    return;
                 }
+
+                const status = axios.isAxiosError(err) ? err.response?.status : undefined;
+                const timedOut = axios.isAxiosError(err) && err.code === 'ERR_CANCELED';
+                setError({
+                    kind: status ? 'http' : 'transport',
+                    message: status
+                        ? `The backend API returned HTTP ${status} while checking setup status.`
+                        : timedOut
+                            ? 'The backend API did not respond before the setup check timed out.'
+                            : 'Could not reach the backend API.',
+                });
+                setLoading(false);
+            } finally {
+                clearTimeout(timeoutId);
             }
         };
 
+        setLoading(true);
+        setError(null);
         checkStatus();
 
         return () => {
             mounted = false;
+            activeController?.abort();
+            if (retryTimer) clearTimeout(retryTimer);
         };
-    }, [navigate, location.pathname]);
+    }, [retryCount]);
 
     if (loading) {
-        console.log("SetupGuard: loading");
         return (
             <div className="min-h-screen flex items-center justify-center flex-col gap-4">
                 <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary"></div>
@@ -108,11 +133,29 @@ const SetupGuard = ({ children }: { children: React.ReactNode }) => {
         );
     }
 
-    if (error && location.pathname !== '/wizard') {
-        console.warn("Rendering app despite setup check failure:", error);
+    if (error) {
+        const isHttpError = error.kind === 'http';
+        console.warn("SetupGuard: setup status check failed:", error.message);
+        return (
+            <div className="min-h-screen flex items-center justify-center flex-col gap-4 px-6 text-center">
+                <h1 className="text-xl font-semibold">
+                    {isHttpError ? 'Setup status check failed' : 'Backend unavailable'}
+                </h1>
+                <p className="text-muted-foreground text-sm max-w-md">
+                    {isHttpError
+                        ? `${error.message} The backend is reachable, but it could not complete the setup check. Check the Admin UI service logs and permissions, then retry.`
+                        : `${error.message} The admin UI cannot load until the AVA backend is running and reachable. Check that the service is up, then retry.`}
+                </p>
+                <button
+                    onClick={() => setRetryCount((c) => c + 1)}
+                    className="px-4 py-2 text-sm font-medium bg-primary text-primary-foreground rounded-md hover:bg-primary/90"
+                >
+                    Retry
+                </button>
+            </div>
+        );
     }
 
-    console.log("SetupGuard: rendering children");
     return <>{children}</>;
 };
 
@@ -142,7 +185,9 @@ function App() {
                                             {/* Core Configuration */}
                                             <Route path="/providers" element={<ProvidersPage />} />
                                             <Route path="/pipelines" element={<PipelinesPage />} />
-                                            <Route path="/contexts" element={<ContextsPage />} />
+                                            <Route path="/agents" element={<AgentsPage />} />
+                                            <Route path="/agents/migration" element={<MigrationStatusPage />} />
+                                            <Route path="/contexts" element={<LegacyContextsRedirect />} />
                                             <Route path="/profiles" element={<ProfilesPage />} />
                                             <Route path="/tools" element={<ToolsPage />} />
                                             <Route path="/mcp" element={<MCPPage />} />

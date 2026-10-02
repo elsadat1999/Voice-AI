@@ -2,30 +2,192 @@ from fastapi import APIRouter, HTTPException, UploadFile, File
 import yaml
 from yaml.constructor import ConstructorError
 from yaml.nodes import MappingNode, SequenceNode, ScalarNode
+import errno
 import os
 import re
 import asyncio
 import glob
+import sqlite3
+import stat
 import tempfile
 import sys
+import threading
 import logging
+import math
+import json
 import ssl
 import smtplib
+from copy import deepcopy
 from email.message import EmailMessage
 from contextlib import contextmanager
+from pathlib import Path
 from pydantic import BaseModel
 from typing import Dict, Any, Optional, Union
 from urllib.parse import urlparse
 import settings
+
+PROJECT_SOURCE_ROOT = Path(settings.PROJECT_ROOT)
+if str(PROJECT_SOURCE_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_SOURCE_ROOT))
+
+try:
+    # The production Admin image copies the shared module into /app.
+    from config_apply import classify_config_change
+except ModuleNotFoundError:
+    # Source checkout/tests: import the same canonical module from root src/.
+    from src.config_apply import classify_config_change
+
+from src.fish_audio_url import (
+    fish_audio_synthesis_test_url,
+    fish_audio_verification_url,
+)
+from src.tools.execution_history import CALL_HISTORY_TOOL_REDACTION_MODES
 
 # A11: Maximum number of backups to keep
 MAX_BACKUPS = 5
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+# Transactions call _write_local_config(), which re-enters this lock while
+# preserving the writer's direct-call safety for tests and synchronous helpers.
+_CONFIG_UPDATE_LOCK = threading.RLock()
+
+
+def _assert_in_use_audio_profiles_unchanged(
+    old_config: Dict[str, Any],
+    new_config: Dict[str, Any],
+    *,
+    trusted_profile_reset: Optional[tuple[str, Dict[str, Any]]] = None,
+) -> None:
+    """Fail closed before mutating a profile referenced by an Agent.
+
+    Agent assignments live in a separate SQLite source of truth, so schema
+    validation alone cannot detect this cross-store dependency. Read the
+    existing database without creating or migrating it; a missing database is
+    an empty first-run store, while an unreadable existing database makes a
+    profile mutation unsafe.
+    """
+    old_profiles = old_config.get("profiles") or {}
+    new_profiles = new_config.get("profiles") or {}
+    if not isinstance(old_profiles, dict) or not isinstance(new_profiles, dict):
+        return
+
+    changed_profiles = {
+        name
+        for name in (set(old_profiles) | set(new_profiles)) - {"default"}
+        if old_profiles.get(name) != new_profiles.get(name)
+    }
+    if trusted_profile_reset is not None:
+        reset_name, expected_body = trusted_profile_reset
+        # This exception is deliberately value-bound.  Callers cannot bypass
+        # the Agent-reference guard merely by naming a profile: the resulting
+        # body must be the exact backend-owned canonical reset value.
+        if (
+            reset_name != "default"
+            and reset_name in changed_profiles
+            and new_profiles.get(reset_name) == expected_body
+        ):
+            changed_profiles.remove(reset_name)
+    configured_old_default = old_profiles.get("default")
+    old_default_profile = (
+        configured_old_default.strip()
+        if isinstance(configured_old_default, str) and configured_old_default.strip()
+        else "telephony_ulaw_8k"
+    )
+    configured_new_default = new_profiles.get("default")
+    new_default_profile = (
+        configured_new_default.strip()
+        if isinstance(configured_new_default, str) and configured_new_default.strip()
+        else "telephony_ulaw_8k"
+    )
+    default_changed = old_default_profile != new_default_profile
+    if not changed_profiles and not default_changed:
+        return
+
+    inheritance_impacted = default_changed or old_default_profile in changed_profiles
+
+    db_path = Path(
+        os.getenv("AGENTS_DB_PATH", "/app/data/operator/agents.db")
+    ).expanduser()
+    if not db_path.exists():
+        return
+
+    try:
+        db_uri = db_path.resolve().as_uri() + "?mode=ro"
+        with sqlite3.connect(db_uri, uri=True) as conn:
+            where_clauses = []
+            query_params = []
+            if changed_profiles:
+                placeholders = ",".join("?" for _ in changed_profiles)
+                where_clauses.append(f"audio_profile IN ({placeholders})")
+                query_params.extend(sorted(changed_profiles))
+            if inheritance_impacted:
+                where_clauses.append(
+                    "(audio_profile IS NULL OR TRIM(audio_profile) = '')"
+                )
+            rows = conn.execute(
+                "SELECT slug, display_name, audio_profile FROM agents "
+                f"WHERE {' OR '.join(where_clauses)}",
+                tuple(query_params),
+            ).fetchall()
+    except (OSError, sqlite3.Error) as exc:
+        logger.warning(
+            "Cannot verify Agent audio-profile usage before config save",
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Cannot safely change audio profiles because Agent usage "
+                "could not be verified. Restore access to the Agent store and retry."
+            ),
+        ) from exc
+
+    if rows:
+        references: Dict[str, list[str]] = {}
+        for slug, display_name, profile_name in rows:
+            explicit_profile = (
+                profile_name.strip() if isinstance(profile_name, str) else ""
+            )
+            if not explicit_profile and default_changed:
+                reference_name = (
+                    "profiles.default "
+                    f"({old_default_profile} -> {new_default_profile})"
+                )
+                references.setdefault(reference_name, []).append(
+                    str(display_name or slug)
+                )
+                continue
+            effective_profile = explicit_profile or old_default_profile
+            if effective_profile not in changed_profiles:
+                continue
+            references.setdefault(str(effective_profile), []).append(
+                str(display_name or slug)
+            )
+        if not references:
+            return
+        detail = "; ".join(
+            f"{profile}: {', '.join(sorted(names))}"
+            for profile, names in sorted(references.items())
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Cannot change audio profile configuration used by an Agent. "
+                f"Assign or migrate the Agent first ({detail})."
+            ),
+        )
 
 def _is_prefix(key: str, prefixes: tuple[str, ...]) -> bool:
     return any(key.startswith(p) for p in prefixes)
+
+
+_LIVE_STATUS_PUBLISHER_KEYS = {
+    "LIVE_STATUS_ADMIN_URL",
+    "LIVE_STATUS_PUSH_TOKEN",
+    "LIVE_STATUS_PUSH_INTERVAL_SECONDS",
+    "LIVE_STATUS_PUSH_TIMEOUT_SECONDS",
+}
 
 
 def _running_container_names() -> set:
@@ -82,58 +244,105 @@ def _ai_engine_env_key(key: str) -> bool:
             "RESEND_API_KEY",
             "ELEVENLABS_API_KEY",
             "ELEVENLABS_AGENT_ID",
+            "XAI_API_KEY",  # xAI Grok Voice Agent (legacy single-instance fallback)
             "TZ",
             "STREAMING_LOG_LEVEL",
         )
-        or _is_prefix(key, ("AUDIO_TRANSPORT", "DOWNSTREAM_MODE", "AUDIOSOCKET_", "EXTERNAL_MEDIA_", "BARGE_IN_"))
+        or _is_prefix(key, ("AUDIO_TRANSPORT", "DOWNSTREAM_MODE", "AUDIOSOCKET_", "EXTERNAL_MEDIA_", "BARGE_IN_", "VICIDIAL_"))
         or _is_prefix(key, ("SMTP_",))
         # Local provider runtime uses these env vars via ${LOCAL_WS_*} placeholders in ai-agent.yaml
         or _is_prefix(key, ("LOCAL_WS_",))
+        or key in _LIVE_STATUS_PUBLISHER_KEYS
     )
 
 
 def _local_ai_env_key(key: str) -> bool:
     return (
         _is_prefix(key, ("LOCAL_", "KROKO_", "FASTER_WHISPER_", "WHISPER_CPP_", "MELOTTS_", "KOKORO_"))
-        or key in ("SHERPA_MODEL_PATH",)
+        or key in ("SHERPA_MODEL_PATH", "HEALTH_API_TOKEN")
+        or key in _LIVE_STATUS_PUBLISHER_KEYS
     )
 
 
 def _admin_ui_env_key(key: str) -> bool:
+    # AAVA_HTTP_TOOL_TEST_* are read by the admin_ui's HTTP tool test endpoint
+    # (admin_ui/backend/api/tools.py). They take effect live via the .env file
+    # (no restart needed — see tools.py `_dotenv_value`), but recognizing them
+    # here surfaces them in the Admin UI Environment-page apply/restart UX as
+    # admin_ui-impacting keys, which is honest signaling: changes affect this
+    # service's runtime behavior. Refs #370.
     return (
-        key in ("JWT_SECRET", "DOCKER_SOCK", "DOCKER_GID", "TZ")
-        or _is_prefix(key, ("UVICORN_", "ADMIN_UI_"))
+        key in ("JWT_SECRET", "DOCKER_SOCK", "DOCKER_GID", "TZ", "HEALTH_API_TOKEN", "LIVE_STATUS_PUSH_TOKEN")
+        or _is_prefix(key, ("UVICORN_", "ADMIN_UI_", "AAVA_HTTP_TOOL_TEST_", "VICIDIAL_"))
+        or key in ("LIVE_STATUS_POLL_INTERVAL_SECONDS", "LIVE_STATUS_INITIAL_PROBE_TIMEOUT_SECONDS")
     )
 
 
-def _assert_no_duplicate_yaml_keys(node: yaml.Node) -> None:
+class _RecursiveYamlAliasError(ConstructorError):
+    """Raised when YAML aliases create a cycle in the configuration graph."""
+
+
+class _NonFiniteYamlKeyError(ConstructorError):
+    """Raised when a YAML mapping uses a non-JSON-compatible numeric key."""
+
+
+def _assert_no_duplicate_yaml_keys(
+    node: yaml.Node,
+    visiting: Optional[set[int]] = None,
+) -> None:
     """
     Detect duplicate mapping keys before calling yaml.safe_load().
 
     We avoid yaml.load() here to keep CodeQL happy while still enforcing our
     "no duplicate keys" constraint for Admin UI config edits.
     """
-    if isinstance(node, MappingNode):
-        seen: dict[str, ScalarNode] = {}
-        for key_node, value_node in node.value:
-            # Config files use string keys; if not, fall back to a stable repr.
-            if isinstance(key_node, ScalarNode):
-                key = str(key_node.value)
-            else:
-                key = str(key_node)
-            if key in seen:
-                raise ConstructorError(
-                    "while constructing a mapping",
-                    node.start_mark,
-                    f"found duplicate key ({key!r})",
-                    key_node.start_mark,
-                )
-            if isinstance(key_node, ScalarNode):
-                seen[key] = key_node
-            _assert_no_duplicate_yaml_keys(value_node)
-    elif isinstance(node, SequenceNode):
-        for item in node.value:
-            _assert_no_duplicate_yaml_keys(item)
+    if not isinstance(node, (MappingNode, SequenceNode)):
+        return
+
+    active = visiting if visiting is not None else set()
+    node_id = id(node)
+    if node_id in active:
+        raise _RecursiveYamlAliasError(
+            "while constructing the configuration",
+            node.start_mark,
+            "found recursive YAML alias",
+            node.start_mark,
+        )
+
+    active.add(node_id)
+    try:
+        if isinstance(node, MappingNode):
+            seen: dict[str, ScalarNode] = {}
+            for key_node, value_node in node.value:
+                # Config files use string keys; if not, fall back to a stable repr.
+                if isinstance(key_node, ScalarNode):
+                    if key_node.tag == "tag:yaml.org,2002:float":
+                        parsed_key = yaml.safe_load(key_node.value)
+                        if isinstance(parsed_key, float) and not math.isfinite(parsed_key):
+                            raise _NonFiniteYamlKeyError(
+                                "while constructing a mapping",
+                                node.start_mark,
+                                f"found non-finite numeric key ({key_node.value!r})",
+                                key_node.start_mark,
+                            )
+                    key = str(key_node.value)
+                else:
+                    key = str(key_node)
+                if key in seen:
+                    raise ConstructorError(
+                        "while constructing a mapping",
+                        node.start_mark,
+                        f"found duplicate key ({key!r})",
+                        key_node.start_mark,
+                    )
+                if isinstance(key_node, ScalarNode):
+                    seen[key] = key_node
+                _assert_no_duplicate_yaml_keys(value_node, active)
+        else:
+            for item in node.value:
+                _assert_no_duplicate_yaml_keys(item, active)
+    finally:
+        active.remove(node_id)
 
 
 def _safe_load_no_duplicates(content: str):
@@ -141,6 +350,75 @@ def _safe_load_no_duplicates(content: str):
     if node is not None:
         _assert_no_duplicate_yaml_keys(node)
     return yaml.safe_load(content)
+
+
+class _RecursiveConfigAliasError(ValueError):
+    """Raised when an in-memory configuration contains a recursive container."""
+
+    def __init__(self, path: str):
+        self.path = path or "<root>"
+        super().__init__(self.path)
+
+
+def _non_finite_number_paths(
+    value: Any,
+    path: str = "",
+    visiting: Optional[set[int]] = None,
+) -> list[str]:
+    """Return config paths containing floats that cannot be represented in JSON."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return [path or "<root>"]
+
+    if not isinstance(value, (dict, list)):
+        return []
+
+    active = visiting if visiting is not None else set()
+    value_id = id(value)
+    if value_id in active:
+        raise _RecursiveConfigAliasError(path)
+
+    active.add(value_id)
+    paths: list[str] = []
+    try:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                key_text = str(key)
+                if re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_$]*", key_text):
+                    child_path = f"{path}.{key_text}" if path else key_text
+                else:
+                    child_path = f"{path}[{json.dumps(key_text)}]"
+                paths.extend(_non_finite_number_paths(child, child_path, active))
+        else:
+            for index, child in enumerate(value):
+                paths.extend(_non_finite_number_paths(child, f"{path}[{index}]", active))
+        return paths
+    finally:
+        active.remove(value_id)
+
+
+def _assert_finite_config_numbers(value: Any, *, status_code: int = 400) -> None:
+    try:
+        paths = _non_finite_number_paths(value)
+    except _RecursiveConfigAliasError as exc:
+        raise HTTPException(
+            status_code=status_code,
+            detail=(
+                "Configuration contains a recursive YAML alias at "
+                f"{exc.path}. Replace the alias with an ordinary mapping or list."
+            ),
+        ) from exc
+    if not paths:
+        return
+    displayed = ", ".join(paths[:10])
+    if len(paths) > 10:
+        displayed += f", and {len(paths) - 10} more"
+    raise HTTPException(
+        status_code=status_code,
+        detail=(
+            "Configuration contains non-finite numeric values that are not JSON-compatible: "
+            f"{displayed}. Replace .nan/.inf values in Advanced > Raw YAML with finite numbers."
+        ),
+    )
 
 
 def _deep_merge_dicts(base: dict, override: dict) -> dict:
@@ -228,6 +506,8 @@ def _read_merged_config_dict() -> dict:
     try:
         with open(settings.LOCAL_CONFIG_PATH, "r") as f:
             local = _safe_load_no_duplicates(f.read()) or {}
+    except (_RecursiveYamlAliasError, _NonFiniteYamlKeyError):
+        raise
     except Exception:
         return base
 
@@ -245,23 +525,37 @@ def _read_merged_config_content() -> str:
 
 def _write_local_config(content: str) -> None:
     """
-    Atomically write *content* to the local override config file.
+    Write *content* to the local override config file.
 
     Creates a backup of the existing local file (if any), validates permissions,
-    and performs an atomic temp-file + rename write.
+    and normally performs an atomic temp-file + rename write. Docker cannot
+    replace a path that is itself a bind-mount target (``EBUSY``), so that
+    topology falls back to a validated, fsynced in-place rewrite with automatic
+    rollback to the backup if the rewrite fails.
     """
+    with _CONFIG_UPDATE_LOCK:
+        _write_local_config_locked(content)
+
+
+def _write_local_config_locked(content: str) -> None:
+    """Persist local config while the process-wide writer lock is held."""
     import datetime
     dir_path = os.path.dirname(settings.LOCAL_CONFIG_PATH)
     if dir_path:
         os.makedirs(dir_path, exist_ok=True)
 
     # Backup existing local file
+    previous_bytes: Optional[bytes] = None
+    backup_path: Optional[str] = None
     if os.path.exists(settings.LOCAL_CONFIG_PATH):
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         backup_path = f"{settings.LOCAL_CONFIG_PATH}.bak.{timestamp}"
-        with open(settings.LOCAL_CONFIG_PATH, "r") as src:
-            with open(backup_path, "w") as dst:
-                dst.write(src.read())
+        with open(settings.LOCAL_CONFIG_PATH, "rb") as src:
+            previous_bytes = src.read()
+            with open(backup_path, "wb") as dst:
+                dst.write(previous_bytes)
+                dst.flush()
+                os.fsync(dst.fileno())
         _rotate_backups(settings.LOCAL_CONFIG_PATH)
 
     # Preserve permissions from existing local or base file
@@ -271,14 +565,96 @@ def _write_local_config(content: str) -> None:
             original_mode = os.stat(candidate).st_mode
             break
 
-    with tempfile.NamedTemporaryFile("w", dir=dir_path, delete=False, suffix=".tmp") as f:
-        f.write(content)
+    desired_bytes = content.encode("utf-8")
+    with tempfile.NamedTemporaryFile("wb", dir=dir_path, delete=False, suffix=".tmp") as f:
+        f.write(desired_bytes)
+        f.flush()
+        os.fsync(f.fileno())
         temp_path = f.name
 
     if original_mode is not None:
         os.chmod(temp_path, original_mode)
 
-    os.replace(temp_path, settings.LOCAL_CONFIG_PATH)
+    try:
+        os.replace(temp_path, settings.LOCAL_CONFIG_PATH)
+        temp_path = ""
+    except OSError as exc:
+        if exc.errno != errno.EBUSY:
+            raise
+
+        # A file mounted directly into a container is a mount point and cannot
+        # be replaced, even when the mount is writable. The desired content has
+        # already passed schema validation and is staged in the adjacent temp
+        # file. Rewrite the mounted inode, fsync it, and restore the pre-write
+        # snapshot if any part of the fallback fails.
+        try:
+            target_stat = os.stat(settings.LOCAL_CONFIG_PATH)
+        except OSError as stat_exc:
+            raise OSError(
+                errno.EBUSY,
+                "Refusing bind-mount fallback because the local config target "
+                "cannot be inspected",
+                settings.LOCAL_CONFIG_PATH,
+            ) from stat_exc
+        if previous_bytes is None or not stat.S_ISREG(target_stat.st_mode):
+            raise OSError(
+                errno.EBUSY,
+                "Refusing bind-mount fallback without an existing regular "
+                "local config file",
+                settings.LOCAL_CONFIG_PATH,
+            ) from exc
+
+        logger.warning(
+            "Atomic config replace unavailable for bind-mounted file; "
+            "using fsynced in-place rewrite",
+            extra={"path": settings.LOCAL_CONFIG_PATH},
+        )
+        try:
+            with open(settings.LOCAL_CONFIG_PATH, "r+b") as dst:
+                dst.seek(0)
+                dst.write(desired_bytes)
+                dst.truncate()
+                dst.flush()
+                os.fsync(dst.fileno())
+            with open(settings.LOCAL_CONFIG_PATH, "rb") as current:
+                if current.read() != desired_bytes:
+                    raise OSError(
+                        errno.EIO,
+                        "Bind-mounted local config verification failed",
+                    )
+        except Exception as write_exc:
+            try:
+                with open(settings.LOCAL_CONFIG_PATH, "r+b") as dst:
+                    dst.seek(0)
+                    dst.write(previous_bytes)
+                    dst.truncate()
+                    dst.flush()
+                    os.fsync(dst.fileno())
+                with open(settings.LOCAL_CONFIG_PATH, "rb") as restored:
+                    if restored.read() != previous_bytes:
+                        raise OSError(
+                            errno.EIO,
+                            "Bind-mounted local config rollback verification failed",
+                        )
+            except Exception as rollback_exc:
+                recovery_path = backup_path or "unavailable"
+                raise OSError(
+                    errno.EIO,
+                    "Bind-mounted local config write failed and automatic "
+                    f"recovery failed; restore backup {recovery_path}",
+                    settings.LOCAL_CONFIG_PATH,
+                ) from rollback_exc
+            raise write_exc
+    finally:
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                logger.warning(
+                    "Failed to remove staged local config temp file",
+                    extra={"path": temp_path},
+                    exc_info=True,
+                )
 
 
 # Regex to strip ANSI escape codes from logs
@@ -303,6 +679,9 @@ _SAFE_BASE_URLS: dict[str, str] = {
     "api.openai.com": "https://api.openai.com/v1",
     "api.groq.com": "https://api.groq.com/openai/v1",
     "openrouter.ai": "https://openrouter.ai/api/v1",
+    "api.deepseek.com": "https://api.deepseek.com/v1",
+    "api.minimax.io": "https://api.minimax.io/v1",
+    "api.minimaxi.com": "https://api.minimaxi.com/v1",
     "api.anthropic.com": "https://api.anthropic.com/v1",
     "api.deepgram.com": "https://api.deepgram.com/v1",
     "api.elevenlabs.io": "https://api.elevenlabs.io/v1",
@@ -446,6 +825,54 @@ def _collect_unknown_keys(data: Any, schema_root: Dict[str, Any], schema_node: D
     return warnings
 
 
+# MED-E1: email tool keys whose values must be valid addresses. Each has a
+# *_by_context companion map (per-context overrides) whose values are validated too.
+_EMAIL_TOOL_KEYS = ("admin_email", "from_email")
+
+
+def _assert_tool_emails_valid(content: str) -> None:
+    """Reject the tools-config save if any configured email address is malformed.
+
+    Empty/None means "unset/inherit" and is allowed. ${ENV:-...} placeholders are
+    resolved at load time, not literal addresses, so they are skipped. Raises
+    HTTPException(422) naming the bad field/value on the first invalid address.
+    """
+    try:
+        parsed = _safe_load_no_duplicates(content) or {}
+    except yaml.YAMLError:
+        return  # malformed YAML is caught by _validate_ai_agent_config (400)
+    tools = parsed.get("tools") if isinstance(parsed, dict) else None
+    if not isinstance(tools, dict):
+        return
+
+    project_root = getattr(settings, "PROJECT_ROOT", None)
+    if project_root and project_root not in sys.path:
+        sys.path.insert(0, project_root)
+    from src.utils.email_validator import EmailValidator
+
+    def _check(value: Any, field: str) -> None:
+        if value is None:
+            return
+        s = str(value).strip()
+        if not s or "${" in s:  # unset/inherit, or env placeholder
+            return
+        if not EmailValidator.validate_email(s):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid email address in tools.{field}: {value!r}",
+            )
+
+    for tool_name, tool_cfg in tools.items():
+        if not isinstance(tool_cfg, dict):
+            continue
+        for key in _EMAIL_TOOL_KEYS:
+            _check(tool_cfg.get(key), f"{tool_name}.{key}")
+            mapping = tool_cfg.get(f"{key}_by_context")
+            if isinstance(mapping, dict):
+                for ctx, v in mapping.items():
+                    _check(v, f"{tool_name}.{key}_by_context.{ctx}")
+
+
 def _validate_ai_agent_config(content: str) -> Dict[str, Any]:
     """
     Validate ai-agent.yaml content against the canonical AppConfig schema.
@@ -464,6 +891,11 @@ def _validate_ai_agent_config(content: str) -> Dict[str, Any]:
     if not isinstance(parsed, dict):
         raise HTTPException(status_code=400, detail="Invalid YAML: expected a mapping at the document root")
 
+    # YAML permits .nan/.inf, but JSON and downstream numeric operations do not.
+    # Reject these values before validation or persistence so a form edit cannot
+    # poison the structured config endpoint or runtime behavior.
+    _assert_finite_config_numbers(parsed)
+
     # Ensure project root is importable so we can reuse canonical Pydantic models.
     project_root = getattr(settings, "PROJECT_ROOT", None)
     if project_root and project_root not in sys.path:
@@ -472,6 +904,7 @@ def _validate_ai_agent_config(content: str) -> Dict[str, Any]:
     try:
         from pydantic import ValidationError
         from src.config import AppConfig, load_config
+        from src.config.provider_instances import validate_provider_instances
     except Exception as exc:
         raise HTTPException(
             status_code=500,
@@ -479,6 +912,11 @@ def _validate_ai_agent_config(content: str) -> Dict[str, Any]:
         )
 
     warnings: list[str] = []
+
+    try:
+        validate_provider_instances(parsed)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
     # Warn if user put credentials in YAML (they will be ignored by design).
     try:
@@ -514,8 +952,10 @@ def _validate_ai_agent_config(content: str) -> Dict[str, Any]:
         pass
 
     # Validate using the same loader pipeline as ai-engine (env injection + defaults + normalization).
-    dir_path = os.path.dirname(settings.CONFIG_PATH)
-    with tempfile.NamedTemporaryFile("w", dir=dir_path, delete=False, suffix=".validate.yaml") as f:
+    # Validation is read-only and does not need to stage beside the live config.
+    # Use the process temp directory so a read-only/project-owned checkout cannot
+    # fail before the actual persistence path reports or repairs write access.
+    with tempfile.NamedTemporaryFile("w", delete=False, suffix=".validate.yaml") as f:
         f.write(content)
         tmp_path = f.name
 
@@ -541,65 +981,424 @@ def _validate_ai_agent_config(content: str) -> Dict[str, Any]:
     return {"warnings": warnings}
 
 
+def persist_config_content(
+    content: str,
+    *,
+    trusted_profile_reset: Optional[tuple[str, Dict[str, Any]]] = None,
+) -> dict:
+    """
+    Validate and persist a full merged ai-agent config (YAML string).
+
+    Shared by the Raw YAML editor (``POST /yaml``) and the structured tools
+    CRUD API (``api/tools.py``). Runs the same schema validation, inline-secret
+    migration, and minimal-local-override computation, then writes the operator
+    local override file. Returns the apply-plan payload describing whether a
+    hot reload or restart is needed.
+
+    Raises ``HTTPException`` on validation failure (propagated to the caller).
+    """
+    with _CONFIG_UPDATE_LOCK:
+        return _persist_config_content_locked(
+            content,
+            trusted_profile_reset=trusted_profile_reset,
+        )
+
+
+def _persist_config_content_locked(
+    content: str,
+    *,
+    trusted_profile_reset: Optional[tuple[str, Dict[str, Any]]] = None,
+) -> dict:
+    """Persist a complete config while the shared update lock is held."""
+    # MED-E1: reject malformed tool email addresses (422) on EVERY persistence
+    # path. Both the Raw YAML editor (POST /yaml) and the structured tools CRUD
+    # API (api/tools.py -> _persist_cfg) funnel through here, so centralizing the
+    # check guarantees no endpoint can persist an invalid address. Runs before the
+    # schema validation, matching the order the YAML editor used previously.
+    _assert_tool_emails_valid(content)
+
+    # Validate YAML + schema before saving.
+    validation = _validate_ai_agent_config(content)
+    warnings = validation.get("warnings") or []
+
+    # Parse desired merged config content from UI.
+    new_parsed = _safe_load_no_duplicates(content) or {}
+    if not isinstance(new_parsed, dict):
+        raise HTTPException(status_code=400, detail="Config YAML must be a mapping at the top level")
+
+    # Persist the canonical replacement for the exact v7.5.2 OpenAI audio
+    # typo. Runtime load performs the same migration so an existing local
+    # override cannot prevent startup; rewriting on the next save removes the
+    # stale pair from operator-owned YAML as well.
+    from src.config.normalization import normalize_legacy_openai_audio
+
+    if normalize_legacy_openai_audio(new_parsed):
+        content = yaml.dump(new_parsed, default_flow_style=False, sort_keys=False)
+        validation = _validate_ai_agent_config(content)
+        migrated_warnings = validation.get("warnings")
+        warnings = warnings if migrated_warnings is None else migrated_warnings
+
+    if _migrate_inline_provider_secrets(new_parsed):
+        content = yaml.dump(new_parsed, default_flow_style=False, sort_keys=False)
+        validation = _validate_ai_agent_config(content)
+        migrated_warnings = validation.get("warnings")
+        warnings = warnings if migrated_warnings is None else migrated_warnings
+
+    # Snapshot current merged config for hot-reload comparison
+    old_merged = _read_merged_config_dict()
+
+    # Audio profiles are referenced from the independent Agent store. Guard
+    # every persistence path (structured pages and Raw YAML), not only the
+    # frontend button flow, before writing the local override.
+    _assert_in_use_audio_profiles_unchanged(
+        old_merged,
+        new_parsed,
+        trusted_profile_reset=trusted_profile_reset,
+    )
+
+    # Convert desired merged config into a minimal local override (supports deletions).
+    base = _read_base_config_dict()
+    local_override = _compute_local_override(base, new_parsed)
+    local_content = yaml.dump(local_override or {}, default_flow_style=False, sort_keys=False)
+
+    # Write to LOCAL override file (keeps base ai-agent.yaml clean for git)
+    _write_local_config(local_content)
+
+    decision = classify_config_change(old_merged, new_parsed)
+    recommended_method = decision.recommended_apply_method
+    apply_plan = decision.apply_plan()
+
+    return {
+        "status": "success",
+        "apply_required": decision.apply_required,
+        "restart_required": decision.restart_required,
+        "recommended_apply_method": recommended_method,
+        "apply_plan": apply_plan,
+        "message": (
+            "Configuration saved. No runtime changes detected."
+            if recommended_method == "none"
+            else f"Configuration saved. {'Hot reload' if recommended_method == 'hot_reload' else 'Restart'} AI Engine to apply changes."
+        ),
+        "warnings": warnings,
+    }
+
+
+async def _fetch_engine_config_state() -> Optional[Dict[str, Any]]:
+    """Read engine-owned apply state without making config saves depend on it."""
+    import httpx
+
+    engine_url = os.getenv("AI_ENGINE_HEALTH_URL", "http://localhost:15000")
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            response = await client.get(engine_url.rstrip("/") + "/config/state")
+        if response.status_code != 200:
+            return None
+        payload = response.json()
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        logger.debug("Engine config state unavailable after config save", exc_info=True)
+        return None
+
+
+async def reconcile_apply_result_with_engine_state(result: dict) -> dict:
+    """Overlay a pre-existing deferred restart onto save-time diff metadata."""
+    state = await _fetch_engine_config_state()
+    if not state or state.get("restart_required") is not True:
+        return result
+
+    reconciled = dict(result)
+    reconciled["restart_required"] = True
+    reconciled["recommended_apply_method"] = "restart"
+    reconciled["apply_plan"] = [{
+        "service": "ai_engine",
+        "method": "restart",
+        "endpoint": "/api/system/containers/ai_engine/restart",
+    }]
+    reconciled["message"] = (
+        "Configuration saved. Restart AI Engine to finish applying pending changes."
+    )
+    return reconciled
+
+
+def _audio_baseline_helpers() -> dict[str, Any]:
+    """Load canonical audio baseline helpers in source and image layouts."""
+    project_root = getattr(settings, "PROJECT_ROOT", None)
+    if project_root and project_root not in sys.path:
+        sys.path.insert(0, project_root)
+    from src.config.audio_baselines import (
+        BUILTIN_PROFILE_BASELINES,
+        PIPELINE_AUDIO_FIELDS,
+        PROVIDER_AUDIO_BASELINES,
+        profile_audio_baseline,
+        provider_audio_baseline,
+        provider_audio_fields,
+    )
+
+    return {
+        "pipeline_fields": PIPELINE_AUDIO_FIELDS,
+        "provider_baselines": PROVIDER_AUDIO_BASELINES,
+        "profile_baselines": BUILTIN_PROFILE_BASELINES,
+        "profile_baseline": profile_audio_baseline,
+        "provider_baseline": provider_audio_baseline,
+        "provider_fields": provider_audio_fields,
+    }
+
+
+def _get_resettable_provider_block(
+    provider_key: str,
+) -> tuple[Dict[str, Any], Dict[str, Any], str]:
+    """Resolve a configured provider instance to its canonical audio kind."""
+    instance_helpers = _provider_instances_module()
+    try:
+        instance_helpers["validate_provider_key"](provider_key)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    merged = _read_merged_config_dict()
+    providers = merged.get("providers")
+    if not isinstance(providers, dict):
+        raise HTTPException(status_code=404, detail="No providers are configured")
+    provider_cfg = providers.get(provider_key)
+    if not isinstance(provider_cfg, dict):
+        raise HTTPException(status_code=404, detail=f"Provider '{provider_key}' not found")
+
+    baseline_helpers = _audio_baseline_helpers()
+    known_kinds = baseline_helpers["provider_baselines"]
+    full_agent_kind = instance_helpers["provider_kind"](provider_key, provider_cfg)
+    candidates = [full_agent_kind, provider_key]
+
+    capabilities = provider_cfg.get("capabilities") or []
+    if isinstance(capabilities, str):
+        capabilities = [capabilities]
+    roles = [role for role in ("stt", "tts") if role in capabilities]
+    raw_type = str(provider_cfg.get("type") or "").strip()
+    if len(roles) == 1 and raw_type:
+        candidates.append(f"{raw_type}_{roles[0]}")
+
+    audio_kind = next(
+        (str(candidate) for candidate in candidates if candidate in known_kinds),
+        None,
+    )
+    if audio_kind is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Provider '{provider_key}' does not have a recognized audio "
+                "baseline"
+            ),
+        )
+    return merged, provider_cfg, audio_kind
+
+
+async def _persist_audio_reset(
+    merged: Dict[str, Any],
+    *,
+    trusted_profile_reset: Optional[tuple[str, Dict[str, Any]]] = None,
+) -> dict:
+    """Persist a reset without blocking the Admin UI event loop."""
+    content = yaml.dump(merged, default_flow_style=False, sort_keys=False)
+    result = await asyncio.to_thread(
+        persist_config_content,
+        content,
+        trusted_profile_reset=trusted_profile_reset,
+    )
+    return await reconcile_apply_result_with_engine_state(result)
+
+
+@router.post("/providers/{provider_key}/audio/reset")
+async def reset_provider_audio(provider_key: str):
+    """Restore a provider instance's managed audio fields to its baseline."""
+    merged, provider_cfg, audio_kind = _get_resettable_provider_block(provider_key)
+    helpers = _audio_baseline_helpers()
+    baseline = helpers["provider_baseline"](audio_kind)
+    if baseline is None:  # Defensive; resolver only returns registered kinds.
+        raise HTTPException(status_code=400, detail="Provider audio baseline not found")
+
+    updated_provider = deepcopy(provider_cfg)
+    reset_fields = helpers["provider_fields"](audio_kind)
+    for field in reset_fields:
+        updated_provider.pop(field, None)
+    updated_provider.update(baseline)
+    merged["providers"][provider_key] = updated_provider
+
+    result = await _persist_audio_reset(merged)
+    return {
+        **result,
+        "provider_key": provider_key,
+        "provider_kind": audio_kind,
+        "audio_baseline": baseline,
+    }
+
+
+@router.get("/profiles/audio/baselines")
+async def get_profile_audio_baselines():
+    """List profile names backed by canonical shipped audio baselines."""
+    helpers = _audio_baseline_helpers()
+    return {"built_in_profiles": sorted(helpers["profile_baselines"])}
+
+
+@router.post("/profiles/{profile_name}/audio/reset")
+async def reset_profile_audio(profile_name: str):
+    """Restore an existing profile to its built-in or telephony baseline."""
+    if profile_name == "default":
+        raise HTTPException(status_code=400, detail="profiles.default is a selector, not a profile")
+    merged = _read_merged_config_dict()
+    profiles = merged.get("profiles")
+    if not isinstance(profiles, dict) or not isinstance(profiles.get(profile_name), dict):
+        raise HTTPException(status_code=404, detail=f"Audio profile '{profile_name}' not found")
+
+    helpers = _audio_baseline_helpers()
+    built_in = profile_name in helpers.get("profile_baselines", {})
+    # The helper deliberately maps custom profiles to the standard 8 kHz
+    # telephony body while preserving the custom profile key.
+    baseline = helpers["profile_baseline"](profile_name)
+    profiles[profile_name] = baseline
+
+    result = await _persist_audio_reset(
+        merged,
+        trusted_profile_reset=(profile_name, baseline),
+    )
+    return {
+        **result,
+        "profile_name": profile_name,
+        "baseline_kind": "built_in" if built_in else "standard_telephony",
+        "audio_baseline": baseline,
+    }
+
+
+@router.post("/pipelines/{pipeline_name}/audio/reset")
+async def reset_pipeline_audio(pipeline_name: str):
+    """Remove pipeline audio overrides so profile policy is inherited."""
+    merged = _read_merged_config_dict()
+    pipelines = merged.get("pipelines")
+    if not isinstance(pipelines, dict) or pipeline_name not in pipelines:
+        raise HTTPException(status_code=404, detail=f"Pipeline '{pipeline_name}' not found")
+    pipeline = pipelines.get(pipeline_name)
+    removed: Dict[str, Dict[str, Any]] = {}
+    if isinstance(pipeline, dict):
+        helpers = _audio_baseline_helpers()
+        options = pipeline.get("options")
+        if isinstance(options, dict):
+            for role, fields in helpers["pipeline_fields"].items():
+                role_options = options.get(role)
+                if not isinstance(role_options, dict):
+                    continue
+                role_removed = {
+                    field: role_options.pop(field)
+                    for field in tuple(role_options)
+                    if field in fields
+                }
+                if role_removed:
+                    removed[role] = role_removed
+
+    if not removed:
+        # Legacy shorthand and dict pipelines without audio overrides already
+        # inherit profile audio policy, so do not rotate a backup or rewrite
+        # the local override file.
+        return {
+            "status": "success",
+            "apply_required": False,
+            "restart_required": False,
+            "recommended_apply_method": "none",
+            "apply_plan": [],
+            "message": "Pipeline already inherits profile audio policy.",
+            "warnings": [],
+            "pipeline_name": pipeline_name,
+            "removed_audio_overrides": {},
+        }
+
+    result = await _persist_audio_reset(merged)
+    return {
+        **result,
+        "pipeline_name": pipeline_name,
+        "removed_audio_overrides": removed,
+    }
+
+
+@router.get("")
+@router.get("/")
+async def get_config():
+    try:
+        safe = _redact_websocket_media_secrets(_read_merged_config_dict())
+    except _RecursiveYamlAliasError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Configuration contains a recursive YAML alias. Repair the local "
+                "configuration file by replacing the alias with an ordinary mapping or list."
+            ),
+        ) from exc
+    except _NonFiniteYamlKeyError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Configuration contains a non-finite numeric mapping key. Repair the local "
+                "configuration file by replacing .nan/.inf keys with ordinary text keys."
+            ),
+        ) from exc
+    # Existing operator overrides may predate write-time validation. Return a
+    # controlled, actionable response while leaving /yaml available for repair.
+    _assert_finite_config_numbers(safe, status_code=422)
+    return safe
+
+
+def _redact_websocket_media_secrets(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Defensively keep an accidentally hand-written WS secret out of API reads."""
+    safe = deepcopy(config)
+    websocket_media = safe.get("websocket_media") if isinstance(safe, dict) else None
+    auth = websocket_media.get("auth") if isinstance(websocket_media, dict) else None
+    if isinstance(auth, dict):
+        # `password_env` is an identifier, not a credential, and remains visible
+        # so operators know exactly which ai_engine env var is required.
+        for key in ("password", "secret", "token"):
+            auth.pop(key, None)
+    return safe
+
+
+@router.get("/websocket-media-status")
+async def get_websocket_media_status():
+    """Return safe WebSocket listener configuration and env-file secret state.
+
+    The Admin UI does not infer secret availability from its own container
+    environment.  ai_engine receives the project `.env` through Compose's
+    `env_file`, so this endpoint checks that intended source only and never
+    returns its value.
+    """
+    try:
+        from dotenv import dotenv_values
+        from src.config import WebSocketMediaConfig
+
+        merged = _read_merged_config_dict()
+        raw = merged.get("websocket_media") if isinstance(merged, dict) else None
+        websocket_media = WebSocketMediaConfig.model_validate(raw or {})
+        password_env = websocket_media.auth.password_env
+        dotenv_map = dotenv_values(settings.ENV_PATH) if os.path.exists(settings.ENV_PATH) else {}
+        secret_present = bool(str(dotenv_map.get(password_env) or "").strip())
+        return {
+            "config": websocket_media.model_dump(),
+            "secret_reference": password_env,
+            "secret_present": secret_present,
+            "secret_source": "ai_engine env_file (.env)",
+        }
+    except Exception as exc:
+        # Validation errors can include rejected raw input values (including an
+        # accidentally hand-written auth.password), so never attach traceback
+        # data to this operator-facing status failure.
+        logger.warning("Unable to read WebSocket media status")
+        raise HTTPException(
+            status_code=400,
+            detail="WebSocket media configuration is invalid; correct it in Audio Transport settings.",
+        ) from exc
+
+
 @router.post("/yaml")
 async def update_yaml_config(update: ConfigUpdate):
     try:
-        # Validate YAML + schema before saving.
-        validation = _validate_ai_agent_config(update.content)
-        warnings = validation.get("warnings") or []
-
-        # Snapshot current merged config for hot-reload comparison
-        old_merged = _read_merged_config_dict()
-
-        # Parse desired merged config content from UI.
-        new_parsed = _safe_load_no_duplicates(update.content) or {}
-        if not isinstance(new_parsed, dict):
-            raise HTTPException(status_code=400, detail="Config YAML must be a mapping at the top level")
-
-        # Convert desired merged config into a minimal local override (supports deletions).
-        base = _read_base_config_dict()
-        local_override = _compute_local_override(base, new_parsed)
-        local_content = yaml.dump(local_override or {}, default_flow_style=False, sort_keys=False)
-
-        # Write to LOCAL override file (keeps base ai-agent.yaml clean for git)
-        _write_local_config(local_content)
-        
-        # Determine recommended apply method based on what changed
-        # hot_reload: contexts, MCP servers, greetings/instructions only
-        # restart: most YAML changes (providers, pipelines, transport, VAD, etc.)
-        # recreate: .env changes (handled separately in /env endpoint)
-        recommended_method = "restart"  # Default for YAML changes
-        
-        # Check if change is limited to hot-reloadable sections
-        try:
-            if old_merged:
-                # Keys that can be hot-reloaded
-                hot_reload_keys = {'contexts', 'profiles', 'mcp'}
-                
-                # Check if only hot-reloadable keys changed
-                all_keys = set(old_merged.keys()) | set(new_parsed.keys())
-                changed_keys = set()
-                for key in all_keys:
-                    if old_merged.get(key) != new_parsed.get(key):
-                        changed_keys.add(key)
-                
-                if changed_keys and changed_keys.issubset(hot_reload_keys):
-                    recommended_method = "hot_reload"
-        except Exception:
-            pass  # Fall back to restart if comparison fails
-        
-        apply_plan = ([{"service": "ai_engine", "method": "hot_reload", "endpoint": "/api/system/containers/ai_engine/reload"}]
-                     if recommended_method == "hot_reload"
-                     else [{"service": "ai_engine", "method": "restart", "endpoint": "/api/system/containers/ai_engine/restart"}])
-
-        return {
-            "status": "success",
-            "restart_required": recommended_method != "hot_reload",
-            "recommended_apply_method": recommended_method,
-            "apply_plan": apply_plan,
-            "message": f"Configuration saved. {'Hot reload' if recommended_method == 'hot_reload' else 'Restart'} AI Engine to apply changes.",
-            "warnings": warnings,
-        }
+        # Persist via the shared helper (also used by the structured tools CRUD
+        # API). MED-E1 email validation now lives inside persist_config_content
+        # so every persistence path enforces it (not just this endpoint).
+        result = await asyncio.to_thread(persist_config_content, update.content)
+        return await reconcile_apply_result_with_engine_state(result)
     except HTTPException:
         raise
     except Exception as e:
@@ -615,8 +1414,13 @@ async def get_yaml_config():
         # Return the merged config (base + local overrides) so the editor
         # always shows the effective configuration the engine will use.
         config_content = _read_merged_config_content()
-        _safe_load_no_duplicates(config_content)  # Validate YAML and reject duplicate keys
-        return {"content": config_content}
+        parsed = _safe_load_no_duplicates(config_content)  # Validate YAML and reject duplicate keys
+        safe_content = yaml.dump(
+            _redact_websocket_media_secrets(parsed or {}),
+            default_flow_style=False,
+            sort_keys=False,
+        )
+        return {"content": safe_content}
     except yaml.YAMLError as e:
         logger.info("YAML parse error while reading config YAML", exc_info=True)
         # Extract detailed error information for user-friendly display
@@ -703,6 +1507,17 @@ async def update_env(env_data: Dict[str, Optional[str]]):
     - Already-quoted values from UI are stored as-is (no double-quoting)
     """
     try:
+        redaction_mode = env_data.get("CALL_HISTORY_TOOL_REDACTION_MODE")
+        if redaction_mode not in (None, "__DELETE__"):
+            normalized_mode = str(redaction_mode).strip().lower()
+            if normalized_mode and normalized_mode not in CALL_HISTORY_TOOL_REDACTION_MODES:
+                allowed = ", ".join(sorted(CALL_HISTORY_TOOL_REDACTION_MODES))
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"CALL_HISTORY_TOOL_REDACTION_MODE must be one of: {allowed}",
+                )
+            env_data["CALL_HISTORY_TOOL_REDACTION_MODE"] = normalized_mode
+
         # If file logging is enabled but no path is provided, default to the shared media volume.
         # This matches the UI recommendation and prevents "log to file" from silently falling back
         # to a non-writable working directory inside the container.
@@ -865,6 +1680,16 @@ async def update_env(env_data: Dict[str, Optional[str]]):
         changed_keys = sorted(set(keys_to_update) | set(keys_to_delete))
 
         impacts_ai_engine = any(_ai_engine_env_key(k) for k in changed_keys)
+        # A WebSocket credential may use an operator-selected env name rather
+        # than the default ASTERISK_* prefix. Its value still enters ai_engine
+        # through env_file and requires recreation, including on deletion.
+        try:
+            effective = _read_merged_config_dict()
+            ws_auth = ((effective.get("websocket_media") or {}).get("auth") or {})
+            ws_password_env = str(ws_auth.get("password_env") or "ASTERISK_MEDIA_WS_PASSWORD")
+            impacts_ai_engine = impacts_ai_engine or ws_password_env in changed_keys
+        except Exception:
+            logger.warning("Unable to resolve custom media credential reference for environment apply plan")
         impacts_local_ai = any(_local_ai_env_key(k) for k in changed_keys)
         impacts_admin_ui = any(_admin_ui_env_key(k) for k in changed_keys)
 
@@ -1057,7 +1882,27 @@ async def test_provider_connection(request: ProviderTestRequest):
         # Apply substitution to the config
         provider_config = substitute_env_vars(request.config)
         provider_name = request.name.lower()
+        # Saved provider instances may keep credentials in owner-only files.
+        # Resolve the key in memory for this verification request without ever
+        # returning it to the browser or writing it back into YAML.
+        if provider_config.get("api_key_file") or provider_config.get("api_key_env"):
+            try:
+                helpers = _provider_instances_module()
+                kind = str(provider_config.get("type") or provider_name.rsplit("_llm", 1)[0]).lower()
+                resolved_key = helpers["resolve_secret_value"](
+                    provider_config,
+                    file_field="api_key_file",
+                    env_field="api_key_env",
+                    inline_field="api_key",
+                    legacy_env_names=_provider_legacy_api_key_env_names(provider_name, kind),
+                )
+                if resolved_key:
+                    provider_config["api_key"] = resolved_key
+            except Exception:
+                logger.warning("Provider connection test could not resolve managed API key")
         
+        provider_type = str(provider_config.get('type') or '').lower()
+
         # ============================================================
         # LOCAL PROVIDER - test connection to local_ai_server
         # ============================================================
@@ -1129,6 +1974,71 @@ async def test_provider_connection(request: ProviderTestRequest):
                 return {"success": False, "message": f"Cannot connect to Local AI Server at {ws_url} (see server logs)"}
         
         # ============================================================
+        # FISH AUDIO TTS - perform a minimal real synthesis. A key-only model
+        # listing can succeed even when the configured model returns 402 for
+        # missing credit or entitlement. A loopback-only exception supports
+        # the bundled mock; bearer credentials never reach arbitrary hosts.
+        # ============================================================
+        if provider_type == 'fishaudio':
+            api_key = (
+                str(provider_config.get('api_key') or '').strip()
+                or get_env_key('FISH_AUDIO_API_KEY')
+                or os.getenv('FISH_AUDIO_API_KEY')
+                or ''
+            )
+            if not api_key:
+                return {"success": False, "message": "Fish Audio API key is not configured"}
+            reference_id = str(provider_config.get('reference_id') or '').strip()
+            if not reference_id:
+                return {"success": False, "message": "Fish Audio reference ID is not configured"}
+            model = str(provider_config.get('model') or 's2.1-pro').strip()
+            try:
+                tts_url = fish_audio_synthesis_test_url(
+                    str(provider_config.get('base_url') or 'https://api.fish.audio/v1')
+                )
+                async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
+                    response = await client.post(
+                        tts_url,
+                        headers={
+                            "Authorization": f"Bearer {api_key}",
+                            "Content-Type": "application/json",
+                            "model": model,
+                        },
+                        json={
+                            "text": "Connection test.",
+                            "reference_id": reference_id,
+                            "format": "pcm",
+                            "sample_rate": 8000,
+                            "latency": "low",
+                            "chunk_length": 200,
+                            "normalize": True,
+                            "temperature": 0.7,
+                            "top_p": 0.7,
+                        },
+                    )
+                if response.status_code == 200 and response.content:
+                    return {"success": True, "message": "Fish Audio synthesis verified"}
+                if response.status_code == 200:
+                    return {"success": False, "message": "Fish Audio returned no audio"}
+                if response.status_code == 401:
+                    return {"success": False, "message": "Invalid Fish Audio API key (401)"}
+                if response.status_code == 402:
+                    return {
+                        "success": False,
+                        "message": "Fish Audio rejected synthesis (402): check model access or account credit",
+                    }
+                return {
+                    "success": False,
+                    "message": f"Fish Audio synthesis failed: HTTP {response.status_code}",
+                }
+            except Exception:
+                logger.debug("Fish Audio provider validation failed", exc_info=True)
+                return {
+                    "success": False,
+                    "message": "Cannot connect to the configured Fish Audio endpoint",
+                }
+
+        # ============================================================
         # ELEVENLABS AGENT - check before other providers
         # ============================================================
         if 'elevenlabs' in provider_name or 'agent_id' in provider_config:
@@ -1170,13 +2080,17 @@ async def test_provider_connection(request: ProviderTestRequest):
         # ============================================================
         # TELNYX (OpenAI-compatible) - validate /models + a tiny /chat/completions
         # ============================================================
-        provider_type = str(provider_config.get('type') or '').lower()
         chat_base_url = (provider_config.get('chat_base_url') or provider_config.get('base_url') or '').rstrip('/')
         host = _url_host(chat_base_url)
         is_telnyx = provider_type in ('telnyx', 'telenyx') or ('telnyx' in provider_name) or host == 'api.telnyx.com'
         if is_telnyx:
             base_url = _safe_base_url(chat_base_url, 'https://api.telnyx.com/v2/ai')
-            api_key = get_env_key('TELNYX_API_KEY') or os.getenv('TELNYX_API_KEY') or ''
+            api_key = (
+                str(provider_config.get('api_key') or '').strip()
+                or get_env_key('TELNYX_API_KEY')
+                or os.getenv('TELNYX_API_KEY')
+                or ''
+            )
             if not api_key:
                 return {"success": False, "message": "TELNYX_API_KEY not set in .env"}
 
@@ -1320,9 +2234,9 @@ async def test_provider_connection(request: ProviderTestRequest):
                 
         elif 'google_live' in provider_config or ('llm_model' in provider_config and 'gemini' in provider_config.get('llm_model', '')):
             # Google Live
-            api_key = get_env_key('GOOGLE_API_KEY')
+            api_key = provider_config.get('api_key') or get_env_key('GOOGLE_API_KEY')
             if not api_key:
-                return {"success": False, "message": "GOOGLE_API_KEY not set in .env file"}
+                return {"success": False, "message": "No Google API key configured (checked api_key_file/api_key_env and GOOGLE_API_KEY in .env)"}
             async with httpx.AsyncClient() as client:
                 response = await client.get(
                     f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}",
@@ -1455,30 +2369,83 @@ async def test_provider_connection(request: ProviderTestRequest):
         return {"success": False, "message": f"Test failed: {str(e)}"}
 
 @router.get("/export")
-async def export_configuration():
+async def export_configuration(include_secrets: bool = False):
     """Export configuration as a ZIP file"""
     try:
         import zipfile
         import io
         from datetime import datetime
-        
+
         # Create ZIP in memory
         zip_buffer = io.BytesIO()
-        
+
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
             # Add YAML config (base + local override)
             if os.path.exists(settings.CONFIG_PATH):
                 zip_file.write(settings.CONFIG_PATH, 'ai-agent.yaml')
             if os.path.exists(settings.LOCAL_CONFIG_PATH):
                 zip_file.write(settings.LOCAL_CONFIG_PATH, 'ai-agent.local.yaml')
-            
-            # Add ENV file
-            if os.path.exists(settings.ENV_PATH):
+
+            # .env contains credentials — excluded by default; opt-in via include_secrets=true
+            env_actually_included = include_secrets and os.path.exists(settings.ENV_PATH)
+            if env_actually_included:
                 zip_file.write(settings.ENV_PATH, '.env')
-            
+
+            # agents.db snapshot (operator agents config) — via sqlite online backup.
+            # Failure is non-fatal: the YAML files are the primary export; the snapshot
+            # is a convenience. Any open/backup error logs a warning and the export
+            # continues without the snapshot.
+            import sqlite3
+            agents_db = os.environ.get("AGENTS_DB_PATH", "/app/data/operator/agents.db")
+            agents_db_included = False
+            if os.path.exists(agents_db):
+                try:
+                    tmp_name = None
+                    src = sqlite3.connect(f"file:{agents_db}?mode=ro", uri=True)
+                    try:
+                        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+                            tmp_name = tf.name
+                        disk = sqlite3.connect(tmp_name)
+                        try:
+                            src.backup(disk)
+                        finally:
+                            disk.close()
+                        zip_file.write(tmp_name, "operator/agents.db")
+                        agents_db_included = True
+                    finally:
+                        src.close()
+                        if tmp_name:
+                            try:
+                                os.unlink(tmp_name)
+                            except OSError:
+                                pass
+                except Exception as e:
+                    logger.warning("agents.db snapshot failed — excluded from export: %s", e)
+
+            # README explaining what is (and is not) included — three distinct cases:
+            # (1) secrets requested and .env present  (2) requested but no .env on disk
+            # (3) not requested (default).
+            if env_actually_included:
+                env_line = "Included: ai-agent.yaml, ai-agent.local.yaml, .env (REQUESTED — CONTAINS API KEYS/SECRETS)\n"
+            elif include_secrets:
+                env_line = ("Included: ai-agent.yaml, ai-agent.local.yaml\n"
+                            "Note: .env was requested (include_secrets=true) but no .env file was found on disk.\n")
+            else:
+                env_line = ("Included: ai-agent.yaml, ai-agent.local.yaml\n"
+                            "Excluded by default: .env (pass include_secrets=true to include — the file contains credentials)\n")
+            readme = (
+                "AVA configuration export\n"
+                f"Created: {datetime.utcnow().isoformat()}Z\n\n"
+                + env_line
+                + ("operator/agents.db contains your agent configurations including prompts.\n" if agents_db_included else "")
+            )
+            zip_file.writestr("EXPORT_README.txt", readme)
+
             # Add timestamp file
             timestamp = datetime.now().isoformat()
-            zip_file.writestr('backup_info.txt', f'Backup created: {timestamp}\n')
+            zip_file.writestr('backup_info.txt',
+                              f'Backup created: {timestamp}\n'
+                              'operator/agents.db contains your agent configurations including prompts.\n')
         
         zip_buffer.seek(0)
         
@@ -1595,143 +2562,14 @@ async def test_smtp_settings(req: SmtpTestRequest):
 
 @router.get("/export-logs")
 async def export_logs():
-    """Export logs and sanitized configuration for troubleshooting"""
-    try:
-        import zipfile
-        import io
-        import glob
-        from datetime import datetime
-        import subprocess
-        
-        # Create ZIP in memory
-        zip_buffer = io.BytesIO()
-        
-        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-            # 1. Sanitized YAML (merged base + local override)
-            try:
-                import yaml
-                parsed = _read_merged_config_dict()
+    """Deprecated compatibility export: bounded, sanitized system diagnostics."""
+    from api.support import SystemBundleRequest, _system_bundle_sync
 
-                import re
-                email_pattern = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
-                # Pattern for hostnames that look like internal infrastructure
-                hostname_pattern = re.compile(r'\b(?:pbx|sip|voip|trunk|asterisk)[a-zA-Z0-9.-]*\.[a-zA-Z]{2,}\b', re.IGNORECASE)
-                
-                def redact(obj):
-                    if isinstance(obj, dict):
-                        out = {}
-                        for k, v in obj.items():
-                            key = str(k).lower()
-                            # Redact sensitive keys
-                            if any(s in key for s in ["api_key", "apikey", "token", "secret", "password", "pass", "key"]):
-                                out[k] = "[REDACTED]"
-                            # Redact email fields
-                            elif "email" in key:
-                                out[k] = "[EMAIL_REDACTED]"
-                            else:
-                                out[k] = redact(v)
-                        return out
-                    if isinstance(obj, list):
-                        return [redact(v) for v in obj]
-                    # Redact email addresses and sensitive hostnames in string values
-                    if isinstance(obj, str):
-                        result = email_pattern.sub('[EMAIL_REDACTED]', obj)
-                        result = hostname_pattern.sub('[HOSTNAME_REDACTED]', result)
-                        return result
-                    return obj
-
-                if parsed:
-                    redacted = redact(parsed)
-                    zip_file.writestr(
-                        'ai-agent-sanitized.yaml',
-                        yaml.safe_dump(redacted, sort_keys=False, default_flow_style=False),
-                    )
-            except Exception:
-                # Fallback: write raw base if sanitization fails
-                if os.path.exists(settings.CONFIG_PATH):
-                    with open(settings.CONFIG_PATH, 'r') as f:
-                        zip_file.writestr('ai-agent-sanitized.yaml', f.read())
-            
-            # 2. Sanitized ENV (Just keys, no values)
-            if os.path.exists(settings.ENV_PATH):
-                env_keys = []
-                with open(settings.ENV_PATH, 'r') as f:
-                    for line in f:
-                        if '=' in line and not line.startswith('#'):
-                            key = line.split('=')[0].strip()
-                            env_keys.append(f"{key}=[REDACTED]")
-                zip_file.writestr('.env.sanitized', '\n'.join(env_keys))
-
-            # 2b. Host OS info (if mounted) and basic Docker versions
-            for os_release in ("/host/etc/os-release", "/etc/os-release"):
-                if os.path.exists(os_release):
-                    try:
-                        with open(os_release, "r") as f:
-                            zip_file.writestr("os-release.txt", f.read())
-                        break
-                    except Exception:
-                        pass
-
-            def add_cmd(name: str, cmd: list):
-                try:
-                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-                    content = (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
-                    zip_file.writestr(name, content.strip() + "\n")
-                except Exception as e:
-                    zip_file.writestr(name, f"Failed to run {cmd}: {e}\n")
-
-            add_cmd("docker-version.txt", ["docker", "version"])
-            add_cmd("docker-compose-version.txt", ["docker", "compose", "version"])
-            add_cmd("docker-ps.txt", ["docker", "ps", "-a"])
-            
-            # 3. Logs from Docker Containers
-            try:
-                import docker
-                client = docker.from_env()
-                containers_to_log = ['ai_engine', 'local_ai_server', 'admin_ui']
-                
-                found_logs = False
-                for container_name in containers_to_log:
-                    try:
-                        container = client.containers.get(container_name)
-                        # Capture full logs (no tail limit)
-                        logs = container.logs().decode('utf-8', errors='replace')
-                        if logs:
-                            # Strip ANSI escape codes for clean log files
-                            clean_logs = strip_ansi_codes(logs)
-                            # Redact sensitive information for privacy (AAVA-162)
-                            import re
-                            # Email addresses
-                            clean_logs = re.sub(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', '[EMAIL_REDACTED]', clean_logs)
-                            # PBX/SIP/VoIP hostnames (likely internal infrastructure)
-                            clean_logs = re.sub(r'\b(?:pbx|sip|voip|trunk|asterisk)[a-zA-Z0-9.-]*\.[a-zA-Z]{2,}\b', '[HOSTNAME_REDACTED]', clean_logs, flags=re.IGNORECASE)
-                            # API key previews (e.g., api_key_preview=AIzaSyB2..._H_M)
-                            clean_logs = re.sub(r'(api_key_preview=)[^\s\]]+', r'\1[REDACTED]', clean_logs)
-                            zip_file.writestr(f'{container_name}.log', clean_logs)
-                            found_logs = True
-                    except Exception as e:
-                        zip_file.writestr(f'{container_name}_error.txt', f"Could not fetch logs: {str(e)}")
-                
-                if not found_logs:
-                    zip_file.writestr('logs_info.txt', 'No logs retrieved from containers.')
-
-            except Exception as e:
-                 zip_file.writestr('docker_error.txt', f"Failed to connect to Docker API: {str(e)}")
-
-            # Add timestamp
-            timestamp = datetime.now().isoformat()
-            zip_file.writestr('export_info.txt', f'Debug export created: {timestamp}\n')
-        
-        zip_buffer.seek(0)
-        
-        from fastapi.responses import StreamingResponse
-        return StreamingResponse(
-            zip_buffer, 
-            media_type="application/zip",
-            headers={"Content-Disposition": f"attachment; filename=debug-logs-{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip"}
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return await asyncio.to_thread(
+        _system_bundle_sync,
+        SystemBundleRequest(),
+        deprecated=True,
+    )
 
 @router.post("/import")
 async def import_configuration(file: UploadFile = File(...)):
@@ -1796,6 +2634,16 @@ def update_yaml_provider_field(provider_name: str, field: str, value: Any) -> bo
     and writes the result to the LOCAL override file so the git-tracked
     base stays clean.
     """
+    with _CONFIG_UPDATE_LOCK:
+        return _update_yaml_provider_field_locked(provider_name, field, value)
+
+
+def _update_yaml_provider_field_locked(
+    provider_name: str,
+    field: str,
+    value: Any,
+) -> bool:
+    """Update one provider field while the shared config lock is held."""
     try:
         base_config = _read_base_config_dict()
         merged_config = _read_merged_config_dict()
@@ -1841,14 +2689,22 @@ def update_yaml_provider_field(provider_name: str, field: str, value: Any) -> bo
 async def get_provider_options(provider_type: str):
     """Get available options (models, voices) for a specific provider."""
     
-    # Common catalogs
+    # Common catalogs.
+    # Aligned with the DeepgramProviderForm.tsx STT-model dropdown and the
+    # docs/Provider-Deepgram-Setup.md model table. v6.5.0+ ships nova-3 as the
+    # default (preserves pre-fix runtime hardcoded behavior) and exposes Flux
+    # for conversational voice-agent workloads. Flux models are flagged so
+    # frontend consumers can render the EOT VAD note where appropriate.
     DEEPGRAM_MODELS = [
+        {"id": "flux-general-en", "name": "Flux General — English (recommended for voice agents)", "cost": "Low", "latency": "Ultra Low", "flux": True},
+        {"id": "flux-general-multi", "name": "Flux General — Multilingual", "cost": "Low", "latency": "Ultra Low", "flux": True},
+        {"id": "nova-3", "name": "Nova 3 (General, default)", "cost": "Low", "latency": "Ultra Low"},
+        {"id": "nova-3-medical", "name": "Nova 3 (Medical)", "cost": "Low", "latency": "Ultra Low"},
         {"id": "nova-2", "name": "Nova 2 (General)", "cost": "Low", "latency": "Ultra Low"},
         {"id": "nova-2-phonecall", "name": "Nova 2 (Phonecall)", "cost": "Low", "latency": "Ultra Low"},
         {"id": "nova-2-medical", "name": "Nova 2 (Medical)", "cost": "Low", "latency": "Ultra Low"},
         {"id": "nova-2-meeting", "name": "Nova 2 (Meeting)", "cost": "Low", "latency": "Ultra Low"},
         {"id": "nova-2-general", "name": "Nova 2 (General Legacy)", "cost": "Low", "latency": "Ultra Low"},
-        {"id": "listen", "name": "General (Listen)", "cost": "Medium", "latency": "Low"},
     ]
     
     OPENAI_LLM_MODELS = [
@@ -1914,16 +2770,956 @@ async def get_provider_options(provider_type: str):
 
 # Store in project secrets dir - Admin UI has write access, ai_engine mounts it
 VERTEX_CREDENTIALS_PATH = "/app/project/secrets/gcp-service-account.json"
+PROVIDER_SECRETS_ROOT = "/app/project/secrets/providers"
+
+
+def _provider_instances_module():
+    project_root = getattr(settings, "PROJECT_ROOT", None)
+    if project_root and project_root not in sys.path:
+        sys.path.insert(0, project_root)
+    from src.config.provider_instances import (
+        API_KEY_COMPATIBLE_KINDS,
+        CREDENTIAL_NAME_TO_FIELD,
+        FULL_AGENT_KINDS,
+        MODULAR_LLM_KINDS,
+        ProviderInstanceError,
+        credential_provider_kind,
+        provider_kind,
+        resolve_secret_value,
+        safe_secret_path,
+        validate_provider_key,
+        write_secret_file_bytes,
+    )
+    return {
+        "api_key_kinds": API_KEY_COMPATIBLE_KINDS,
+        "credential_fields": CREDENTIAL_NAME_TO_FIELD,
+        "full_agent_kinds": FULL_AGENT_KINDS,
+        "modular_llm_kinds": MODULAR_LLM_KINDS,
+        "ProviderInstanceError": ProviderInstanceError,
+        "credential_provider_kind": credential_provider_kind,
+        "provider_kind": provider_kind,
+        "resolve_secret_value": resolve_secret_value,
+        "safe_secret_path": safe_secret_path,
+        "validate_provider_key": validate_provider_key,
+        "write_secret_file_bytes": write_secret_file_bytes,
+    }
+
+
+def _get_provider_block(provider_key: str) -> tuple[Dict[str, Any], Dict[str, Any], str]:
+    helpers = _provider_instances_module()
+    try:
+        helpers["validate_provider_key"](provider_key)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    merged = _read_merged_config_dict()
+    providers = merged.get("providers") if isinstance(merged.get("providers"), dict) else {}
+    provider_cfg = providers.get(provider_key)
+    if not isinstance(provider_cfg, dict):
+        raise HTTPException(status_code=404, detail=f"Provider '{provider_key}' not found")
+    kind = helpers["credential_provider_kind"](provider_key, provider_cfg)
+    if kind is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Provider '{provider_key}' does not support managed credentials",
+        )
+    return merged, provider_cfg, kind
+
+
+def _provider_secret_path(provider_key: str, credential_name: str) -> str:
+    """Build a secrets-root-bounded path for a per-provider credential file.
+
+    Delegates to :func:`src.config.provider_instances.safe_secret_path`
+    which (a) re-validates ``provider_key`` against the strict allowlist
+    and (b) re-checks that the realpath stays inside
+    :data:`PROVIDER_SECRETS_ROOT`. CodeQL flags string interpolation of
+    request data into file paths, even when the input has already been
+    sanitized — routing every call through the central helper makes the
+    validation local to every filesystem operation and removes the
+    finding.
+    """
+    filename_map = {
+        "api-key": "api-key",
+        "agent-id": "agent-id",
+        "vertex-json": "vertex-service-account.json",
+    }
+    if credential_name not in filename_map:
+        raise HTTPException(status_code=400, detail="credential_name must be one of: api-key, agent-id, vertex-json")
+    helpers = _provider_instances_module()
+    try:
+        return helpers["safe_secret_path"](
+            provider_key,
+            filename_map[credential_name],
+            root=PROVIDER_SECRETS_ROOT,
+        )
+    except helpers["ProviderInstanceError"] as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+def _credential_allowed_for_kind(kind: str, credential_name: str) -> bool:
+    helpers = _provider_instances_module()
+    if credential_name == "api-key":
+        return kind in helpers["api_key_kinds"]
+    if credential_name == "agent-id":
+        return kind == "elevenlabs_agent"
+    if credential_name == "vertex-json":
+        return kind == "google_live"
+    return False
+
+
+def _write_provider_secret(provider_key: str, credential_name: str, content: bytes) -> None:
+    """Atomically write a per-instance provider credential to disk.
+
+    Sinks take ``(provider_key, credential_name)`` rather than a path
+    string so the only request-derived value entering the filesystem
+    operation is the strictly-validated provider key (regex
+    ``[A-Za-z0-9_.-]{1,64}``). The path is constructed locally from
+    that validated key plus a constant filename lookup, eliminating
+    the cross-function taint flow that CodeQL's CWE-022 query could
+    not see through (PR #396 — replaces alerts 1704–1726 with a
+    refactor instead of mid-flow sanitizers).
+
+    Storing credentials in chmod-600 files under
+    :data:`PROVIDER_SECRETS_ROOT` is the intentional design (see
+    :doc:`docs/Multi-Instance-Full-Agent-Providers`): runtime providers
+    need to read them to make API calls, and the env-vars-only
+    alternative does not scale to multi-tenant deployments.
+
+    Atomic write via per-writer unique ``.tmp`` sibling + ``os.replace``.
+    The temp file is created with mode 0o600, so it is owner-only readable
+    before content is written and before the rename.
+    """
+    import uuid
+
+    helpers = _provider_instances_module()
+    try:
+        target_str = helpers["safe_secret_path"](
+            provider_key,
+            _credential_filename(credential_name),
+            root=PROVIDER_SECRETS_ROOT,
+        )
+    except helpers["ProviderInstanceError"] as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    target = Path(target_str)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # Per-writer unique temp filename so two concurrent uploads /
+    # migrations to the same credential can't clobber each other's
+    # ``.tmp`` mid-write or race on ``os.replace`` (CodeRabbit on
+    # PR #396).
+    temp_path = target.with_name(
+        f"{target.name}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+    )
+    try:
+        # nosec B306: writing the credential to a chmod-600 file under
+        # the secrets root is the intended storage layer for
+        # per-instance API keys; see docstring above.
+        helpers["write_secret_file_bytes"](str(temp_path), content)
+        os.replace(temp_path, target)
+    finally:
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except OSError:
+            pass
+
+
+_CREDENTIAL_FILENAME_MAP = {
+    "api-key": "api-key",
+    "agent-id": "agent-id",
+    "vertex-json": "vertex-service-account.json",
+}
+
+
+def _credential_filename(credential_name: str) -> str:
+    """Resolve credential_name → on-disk filename via the static map.
+
+    Raises HTTPException 400 if the credential_name is not one of the
+    three allowlist values. The output is a constant string from the
+    map — never request-derived — so any path constructed downstream
+    has only validated provider_key + constant filename inputs.
+    """
+    fname = _CREDENTIAL_FILENAME_MAP.get(credential_name)
+    if fname is None:
+        raise HTTPException(
+            status_code=400,
+            detail="credential_name must be one of: api-key, agent-id, vertex-json",
+        )
+    return fname
+
+
+def _save_merged_config(merged_config: Dict[str, Any]) -> None:
+    base_config = _read_base_config_dict()
+    merged_content = yaml.dump(merged_config, default_flow_style=False, sort_keys=False)
+    _validate_ai_agent_config(merged_content)
+    local_override = _compute_local_override(base_config, merged_config)
+    content = yaml.dump(local_override or {}, default_flow_style=False, sort_keys=False)
+    _write_local_config(content)
+
+
+def _update_provider_credentials_field(provider_key: str, field: str, value: Optional[str]) -> None:
+    merged, provider_cfg, _kind = _get_provider_block(provider_key)
+    providers = merged.get("providers")
+    if not isinstance(providers, dict):
+        providers = {}
+    if value:
+        provider_cfg[field] = value
+    else:
+        provider_cfg.pop(field, None)
+    providers[provider_key] = provider_cfg
+    merged["providers"] = providers
+    _save_merged_config(merged)
+
+
+def _migrate_inline_provider_secrets(config_data: Dict[str, Any]) -> bool:
+    """Move inline Admin UI secrets into provider-scoped secret files."""
+    helpers = _provider_instances_module()
+    providers = config_data.get("providers") if isinstance(config_data.get("providers"), dict) else {}
+    changed = False
+    for provider_key, provider_cfg in providers.items():
+        if not isinstance(provider_cfg, dict):
+            continue
+        kind = helpers["credential_provider_kind"](provider_key, provider_cfg)
+        for inline_field, credential_name, file_field in (
+            ("api_key", "api-key", "api_key_file"),
+            ("agent_id", "agent-id", "agent_id_file"),
+        ):
+            value = provider_cfg.get(inline_field)
+            if not isinstance(value, str) or not value.strip() or value.strip().startswith("${"):
+                continue
+            # OpenAI-compatible endpoints that do not authenticate commonly use
+            # this documented sentinel.  It is configuration, not a credential,
+            # and moving it to /secrets would make unrelated config writes fail
+            # in environments where managed secret storage is unavailable.
+            if inline_field == "api_key" and value.strip().lower() == "not-needed":
+                continue
+            if not _credential_allowed_for_kind(kind, credential_name):
+                continue
+            path = _provider_secret_path(str(provider_key), credential_name)
+            _write_provider_secret(str(provider_key), credential_name, value.strip().encode("utf-8"))
+            provider_cfg[file_field] = path
+            provider_cfg.pop(inline_field, None)
+            changed = True
+    return changed
+
+
+def _credential_metadata(provider_key: str, credential_name: str) -> Dict[str, Any]:
+    """Stat + optional JSON-parse a per-instance credential file.
+
+    Takes ``(provider_key, credential_name)`` so the path is constructed
+    locally from the validated key + constant filename map — same
+    no-taint-flow shape as ``_write_provider_secret`` (CodeQL CWE-022
+    elimination via refactor, not mid-flow sanitizer).
+    """
+    helpers = _provider_instances_module()
+    try:
+        target_str = helpers["safe_secret_path"](
+            provider_key,
+            _credential_filename(credential_name),
+            root=PROVIDER_SECRETS_ROOT,
+        )
+    except helpers["ProviderInstanceError"] as exc:
+        return {"uploaded": False, "error": str(exc)}
+
+    target = Path(target_str)
+    if not target.exists():
+        return {"uploaded": False, "path": str(target)}
+    stat = target.stat()
+    meta: Dict[str, Any] = {
+        "uploaded": True,
+        "path": str(target),
+        "uploaded_at": stat.st_mtime,
+    }
+    if credential_name == "vertex-json":
+        try:
+            from google.oauth2 import service_account
+
+            creds = service_account.Credentials.from_service_account_file(str(target))
+            meta.update(
+                {
+                    "valid": True,
+                    "project_id": creds.project_id,
+                    "client_email": creds.service_account_email,
+                }
+            )
+        except Exception:
+            meta.update(
+                {
+                    "valid": False,
+                    "error": "Invalid Google service-account credential file",
+                }
+            )
+    return meta
+
+
+def _configured_file_metadata(path: str, credential_name: str) -> Dict[str, Any]:
+    """Return secret-safe metadata for an operator-configured credential file."""
+    target = Path(str(path or "").strip())
+    meta: Dict[str, Any] = {
+        "uploaded": False,
+        "configured": False,
+        "path": str(target),
+    }
+    if not str(path or "").strip() or not target.is_file():
+        return meta
+
+    stat = target.stat()
+    meta.update({"filename": target.name, "uploaded_at": stat.st_mtime})
+    if credential_name == "vertex-json":
+        try:
+            from google.oauth2 import service_account
+
+            creds = service_account.Credentials.from_service_account_file(str(target))
+            meta.update(
+                {
+                    "configured": True,
+                    "valid": True,
+                    "project_id": creds.project_id,
+                    "client_email": creds.service_account_email,
+                }
+            )
+        except Exception:
+            meta.update(
+                {
+                    "configured": False,
+                    "valid": False,
+                    "error": "Invalid Google service-account credential file",
+                }
+            )
+    else:
+        meta["configured"] = True
+    return meta
+
+
+def _provider_legacy_api_key_env_names(provider_key: str, kind: str) -> tuple[str, ...]:
+    """Return the legacy env fallbacks used by each provider runtime."""
+    full_agent = {
+        "openai_realtime": ("OPENAI_API_KEY",),
+        "deepgram": ("DEEPGRAM_API_KEY",),
+        "google_live": ("GOOGLE_API_KEY",),
+        "elevenlabs_agent": ("ELEVENLABS_API_KEY",),
+        "grok": ("XAI_API_KEY",),
+        "fishaudio": ("FISH_AUDIO_API_KEY",),
+    }.get(kind)
+    if full_agent is not None:
+        return full_agent
+    return _llm_legacy_env_names(provider_key, kind)
+
+
+def _api_key_credential_metadata(
+    provider_key: str, provider_cfg: Dict[str, Any], kind: str
+) -> Dict[str, Any]:
+    """Describe the effective API-key source without returning the secret."""
+    helpers = _provider_instances_module()
+    meta = _credential_metadata(provider_key, "api-key")
+    config_for_resolution = dict(provider_cfg)
+    inline = str(config_for_resolution.get("api_key") or "").strip()
+    env_ref = re.fullmatch(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-[^}]*)?\}", inline)
+    if env_ref:
+        config_for_resolution["api_key"] = ""
+        config_for_resolution.setdefault("api_key_env", env_ref.group(1))
+
+    def _candidate_resolves(candidate: Dict[str, Any], legacy_env_names: tuple[str, ...] = ()) -> bool:
+        """Return whether one isolated credential source resolves to a usable key."""
+        value = str(
+            helpers["resolve_secret_value"](
+                candidate,
+                file_field="api_key_file",
+                env_field="api_key_env",
+                inline_field="api_key",
+                legacy_env_names=legacy_env_names,
+            )
+            or ""
+        ).strip()
+        return bool(value) and not (value.lower() == "not-needed" and kind != "openai")
+
+    file_path = str(config_for_resolution.get("api_key_file") or "").strip()
+    env_name = str(config_for_resolution.get("api_key_env") or "").strip()
+    literal = str(config_for_resolution.get("api_key") or "").strip()
+    legacy_env_names = _provider_legacy_api_key_env_names(provider_key, kind)
+    managed_path = str(meta.get("path") or "").strip()
+    file_is_managed = bool(
+        file_path
+        and meta.get("uploaded")
+        and managed_path
+        and os.path.abspath(file_path) == os.path.abspath(managed_path)
+    )
+    if file_path and not file_is_managed:
+        meta = _configured_file_metadata(file_path, "api-key")
+
+    configured = False
+    source: Optional[str] = None
+    if file_path and _candidate_resolves({"api_key_file": file_path}):
+        configured = True
+        source = "managed_file" if file_is_managed else "configured_file"
+        meta["path"] = file_path
+    elif env_name and _candidate_resolves({"api_key_env": env_name}):
+        configured = True
+        source = "env_var"
+        meta["env_var"] = env_name
+    elif literal and _candidate_resolves({"api_key": literal}):
+        configured = True
+        source = "inline"
+    else:
+        for legacy_name in legacy_env_names:
+            if _candidate_resolves({}, (legacy_name,)):
+                configured = True
+                source = "legacy_env"
+                meta["env_var"] = legacy_name
+                break
+
+    if source is None:
+        if file_path:
+            source = "configured_file"
+            meta["path"] = file_path
+        elif env_name:
+            source = "env_var"
+            meta["env_var"] = env_name
+        elif literal:
+            source = "inline"
+
+    meta["configured"] = configured
+    meta["source"] = source
+    return meta
+
+
+def _vertex_credential_metadata(provider_key: str, provider_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Describe managed or legacy Vertex credentials without copying them."""
+    managed = _credential_metadata(provider_key, "vertex-json")
+    configured_path = str(provider_cfg.get("credentials_path") or "").strip()
+    if configured_path:
+        managed_path = str(managed.get("path") or "").strip()
+        if (
+            managed.get("uploaded")
+            and managed.get("valid")
+            and managed_path
+            and os.path.abspath(configured_path) == os.path.abspath(managed_path)
+        ):
+            managed.update(
+                {
+                    "configured": True,
+                    "source": "managed_file",
+                    "filename": Path(managed_path).name,
+                }
+            )
+            return managed
+        if (
+            managed.get("uploaded")
+            and managed_path
+            and os.path.abspath(configured_path) == os.path.abspath(managed_path)
+        ):
+            managed.update({"configured": False, "source": "managed_file"})
+            return managed
+        meta = _configured_file_metadata(configured_path, "vertex-json")
+        meta["source"] = "configured_file"
+        return meta
+
+    env_path = str(os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or "").strip()
+    if env_path:
+        meta = _configured_file_metadata(env_path, "vertex-json")
+        meta.update({"source": "legacy_env_file", "env_var": "GOOGLE_APPLICATION_CREDENTIALS"})
+        return meta
+
+    if Path(VERTEX_CREDENTIALS_PATH).is_file():
+        meta = _configured_file_metadata(VERTEX_CREDENTIALS_PATH, "vertex-json")
+        meta["source"] = "legacy_shared_file"
+        return meta
+
+    managed.update(
+        {
+            "configured": False,
+            "source": "orphaned_managed_file" if managed.get("uploaded") else None,
+        }
+    )
+    return managed
+
+
+def _llm_legacy_env_names(provider_key: str, kind: str) -> tuple[str, ...]:
+    prefix = provider_key.rsplit("_llm", 1)[0].upper()
+    names = [f"{prefix}_API_KEY"]
+    canonical = {
+        "google": "GOOGLE_API_KEY",
+        "telnyx": "TELNYX_API_KEY",
+        "telenyx": "TELNYX_API_KEY",
+        "minimax": "MINIMAX_API_KEY",
+    }.get(kind)
+    if canonical and canonical not in names:
+        names.append(canonical)
+    return tuple(names)
+
+
+def _summary_provider_api_key_configured(
+    provider_key: str, provider_cfg: Dict[str, Any], kind: str
+) -> bool:
+    """Resolve readiness without treating an unresolved ``${ENV}`` as a key."""
+    helpers = _provider_instances_module()
+    config_for_resolution = dict(provider_cfg)
+    inline = str(config_for_resolution.get("api_key") or "").strip()
+    env_ref = re.fullmatch(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-[^}]*)?\}", inline)
+    if env_ref:
+        config_for_resolution["api_key"] = ""
+        config_for_resolution.setdefault("api_key_env", env_ref.group(1))
+    resolved = str(
+        helpers["resolve_secret_value"](
+            config_for_resolution,
+            file_field="api_key_file",
+            env_field="api_key_env",
+            inline_field="api_key",
+            legacy_env_names=_provider_legacy_api_key_env_names(provider_key, kind),
+        )
+        or ""
+    )
+    # ``not-needed`` is supported only by OpenAI-compatible endpoints that
+    # intentionally run without authentication. Vendor APIs always require a
+    # real credential and must not be advertised as ready with this sentinel.
+    if resolved.strip().lower() == "not-needed" and kind != "openai":
+        return False
+    return bool(resolved.strip())
+
+
+@router.get("/providers/llm-options")
+async def get_llm_provider_options():
+    """Return a secret-safe catalog for post-call summary selection."""
+    merged = _read_merged_config_dict()
+    providers = merged.get("providers") if isinstance(merged.get("providers"), dict) else {}
+    helpers = _provider_instances_module()
+    options: list[Dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for provider_key, provider_cfg in providers.items():
+        if not isinstance(provider_cfg, dict):
+            continue
+        key = str(provider_key)
+        if key.endswith("_llm"):
+            component_key = key
+            kind = str(provider_cfg.get("type") or key.rsplit("_llm", 1)[0]).lower()
+        elif key in {"openai", "google", "local", "telnyx", "telenyx", "minimax"}:
+            component_key = f"{key}_llm"
+            kind = str(provider_cfg.get("type") or key).lower()
+        else:
+            continue
+        if component_key in seen or kind not in helpers["modular_llm_kinds"]:
+            continue
+        seen.add(component_key)
+        enabled = provider_cfg.get("enabled") is not False
+
+        credential_required = kind in helpers["api_key_kinds"]
+        credential_configured = True
+        if credential_required:
+            credential_configured = _summary_provider_api_key_configured(
+                component_key, provider_cfg, kind
+            )
+        if kind == "google" and not credential_configured:
+            credential_configured = bool(
+                provider_cfg.get("credentials_path")
+                or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+            )
+
+        options.append(
+            {
+                "key": component_key,
+                "label": str(provider_cfg.get("display_name") or provider_cfg.get("name") or component_key),
+                "type": kind,
+                "model": str(
+                    provider_cfg.get("chat_model")
+                    or provider_cfg.get("llm_model")
+                    or provider_cfg.get("model")
+                    or ""
+                ),
+                "enabled": enabled,
+                "credential_required": credential_required,
+                "credential_configured": credential_configured,
+                "ready": enabled and credential_configured,
+                "readiness": (
+                    "disabled"
+                    if not enabled
+                    else "ready"
+                    if credential_configured
+                    else "credential_missing"
+                ),
+            }
+        )
+    legacy_credential_configured = bool(str(os.getenv("OPENAI_API_KEY") or "").strip())
+    return {
+        "providers": sorted(options, key=lambda item: item["label"].lower()),
+        # Existing post-call webhooks without summary_provider use this exact
+        # OpenAI path.  Returning its secret-safe readiness lets upgraded UIs
+        # display the effective selection instead of a misleading blank field.
+        "legacy_provider": {
+            "key": "",
+            "label": "OpenAI (legacy default)",
+            "type": "openai",
+            "model": "gpt-4o-mini",
+            "enabled": True,
+            "credential_required": True,
+            "credential_configured": legacy_credential_configured,
+            "ready": legacy_credential_configured,
+            "readiness": "ready" if legacy_credential_configured else "credential_missing",
+            "legacy": True,
+        },
+    }
+
+
+@router.get("/providers/{provider_key}/credentials")
+async def get_provider_credentials_status(provider_key: str):
+    merged, provider_cfg, kind = _get_provider_block(provider_key)
+    helpers = _provider_instances_module()
+    fields = helpers["credential_fields"]
+    credentials: Dict[str, Any] = {}
+    for credential_name, field in fields.items():
+        if not _credential_allowed_for_kind(kind, credential_name):
+            continue
+        if credential_name == "api-key":
+            credentials[credential_name] = _api_key_credential_metadata(
+                provider_key, provider_cfg, kind
+            )
+        elif credential_name == "vertex-json":
+            credentials[credential_name] = _vertex_credential_metadata(
+                provider_key, provider_cfg
+            )
+        else:
+            credentials[credential_name] = _credential_metadata(provider_key, credential_name)
+            credentials[credential_name]["configured"] = bool(
+                provider_cfg.get(field) and credentials[credential_name].get("uploaded")
+            )
+    return {
+        "provider_key": provider_key,
+        "type": kind,
+        "credentials": credentials,
+    }
+
+
+@router.post("/providers/{provider_key}/credentials/api-key")
+async def upload_provider_api_key(provider_key: str, payload: Dict[str, Any]):
+    _merged, _provider_cfg, kind = _get_provider_block(provider_key)
+    if not _credential_allowed_for_kind(kind, "api-key"):
+        raise HTTPException(status_code=400, detail=f"api-key is not valid for provider type '{kind}'")
+    api_key = str(payload.get("api_key") or "").strip()
+    if not api_key:
+        raise HTTPException(status_code=400, detail="api_key is required")
+    path = _provider_secret_path(provider_key, "api-key")
+    await asyncio.to_thread(
+        _write_provider_secret,
+        provider_key,
+        "api-key",
+        api_key.encode("utf-8"),
+    )
+    await asyncio.to_thread(
+        _update_provider_credentials_field,
+        provider_key,
+        "api_key_file",
+        path,
+    )
+    return {"status": "success", "restart_pending": True, "path": path}
+
+
+@router.post("/providers/{provider_key}/credentials/agent-id")
+async def upload_provider_agent_id(provider_key: str, payload: Dict[str, Any]):
+    _merged, _provider_cfg, kind = _get_provider_block(provider_key)
+    if not _credential_allowed_for_kind(kind, "agent-id"):
+        raise HTTPException(status_code=400, detail=f"agent-id is not valid for provider type '{kind}'")
+    agent_id = str(payload.get("agent_id") or "").strip()
+    if not agent_id:
+        raise HTTPException(status_code=400, detail="agent_id is required")
+    path = _provider_secret_path(provider_key, "agent-id")
+    await asyncio.to_thread(
+        _write_provider_secret,
+        provider_key,
+        "agent-id",
+        agent_id.encode("utf-8"),
+    )
+    await asyncio.to_thread(
+        _update_provider_credentials_field,
+        provider_key,
+        "agent_id_file",
+        path,
+    )
+    return {"status": "success", "restart_pending": True, "path": path}
+
+
+@router.post("/providers/{provider_key}/credentials/vertex-json")
+async def upload_provider_vertex_json(provider_key: str, file: UploadFile = File(...)):
+    import json
+
+    _merged, _provider_cfg, kind = _get_provider_block(provider_key)
+    if not _credential_allowed_for_kind(kind, "vertex-json"):
+        raise HTTPException(status_code=400, detail=f"vertex-json is not valid for provider type '{kind}'")
+    if not file.filename or not file.filename.endswith(".json"):
+        raise HTTPException(status_code=400, detail="File must be a JSON file")
+    try:
+        content = await file.read()
+        creds = json.loads(content)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON file")
+    required_fields = ["type", "project_id", "private_key", "client_email"]
+    missing = [field for field in required_fields if field not in creds]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Invalid service account JSON. Missing fields: {', '.join(missing)}")
+    if creds.get("type") != "service_account":
+        raise HTTPException(status_code=400, detail="JSON file must be a service account key (type: service_account)")
+    path = _provider_secret_path(provider_key, "vertex-json")
+    await asyncio.to_thread(
+        _write_provider_secret,
+        provider_key,
+        "vertex-json",
+        content,
+    )
+    await asyncio.to_thread(
+        _update_provider_credentials_field,
+        provider_key,
+        "credentials_path",
+        path,
+    )
+    return {
+        "status": "success",
+        "restart_pending": True,
+        "path": path,
+        "project_id": creds.get("project_id"),
+        "client_email": creds.get("client_email"),
+    }
+
+
+@router.delete("/providers/{provider_key}/credentials/{credential_name}")
+async def delete_provider_credential(provider_key: str, credential_name: str):
+    helpers = _provider_instances_module()
+    fields = helpers["credential_fields"]
+    if credential_name not in fields:
+        raise HTTPException(status_code=400, detail="credential_name must be one of: api-key, agent-id, vertex-json")
+    merged, provider_cfg, kind = _get_provider_block(provider_key)
+    if not _credential_allowed_for_kind(kind, credential_name):
+        raise HTTPException(status_code=400, detail=f"{credential_name} is not valid for provider type '{kind}'")
+    field = fields[credential_name]
+    path = str(provider_cfg.get(field) or _provider_secret_path(provider_key, credential_name))
+    providers = merged.get("providers") if isinstance(merged.get("providers"), dict) else {}
+    references = [
+        name
+        for name, cfg in providers.items()
+        if isinstance(cfg, dict) and str(cfg.get(field) or "") == path
+    ]
+    if references and references != [provider_key]:
+        raise HTTPException(
+            status_code=409,
+            detail={"message": "Credential file is referenced by other providers", "references": references},
+        )
+    provider_cfg.pop(field, None)
+    providers[provider_key] = provider_cfg
+    merged["providers"] = providers
+    await asyncio.to_thread(_save_merged_config, merged)
+    # Compute the on-disk path locally from (provider_key,
+    # credential_name) so the unlink target is constructed from
+    # validated inputs only — same no-taint shape as
+    # _write_provider_secret / _credential_metadata.
+    try:
+        canonical_str = helpers["safe_secret_path"](
+            provider_key,
+            _credential_filename(credential_name),
+            root=PROVIDER_SECRETS_ROOT,
+        )
+    except helpers["ProviderInstanceError"]:
+        # Defensive: provider_key just passed validation above, so this
+        # shouldn't happen in practice. If it does, the YAML field has
+        # already been popped and we just don't unlink.
+        return {"status": "success", "restart_pending": True}
+    canonical = Path(canonical_str)
+    if canonical.exists():
+        await asyncio.to_thread(canonical.unlink)
+    return {"status": "success", "restart_pending": True}
+
+
+@router.post("/providers/{provider_key}/credentials/verify")
+async def verify_provider_credentials(provider_key: str):
+    import httpx
+
+    _merged, provider_cfg, kind = _get_provider_block(provider_key)
+    helpers = _provider_instances_module()
+    legacy_env_names = {
+        "openai_realtime": ("OPENAI_API_KEY",),
+        "openai": (f"{provider_key.rsplit('_llm', 1)[0].upper()}_API_KEY", "OPENAI_API_KEY"),
+        "deepgram": ("DEEPGRAM_API_KEY",),
+        "google_live": ("GOOGLE_API_KEY",),
+        "google": ("GOOGLE_API_KEY",),
+        "telnyx": ("TELNYX_API_KEY",),
+        "telenyx": ("TELNYX_API_KEY",),
+        "minimax": ("MINIMAX_API_KEY",),
+        "elevenlabs_agent": ("ELEVENLABS_API_KEY",),
+        "grok": ("XAI_API_KEY",),
+        "fishaudio": ("FISH_AUDIO_API_KEY",),
+    }.get(kind, ())
+    api_key = helpers["resolve_secret_value"](
+        provider_cfg,
+        file_field="api_key_file",
+        env_field="api_key_env",
+        inline_field="api_key",
+        legacy_env_names=legacy_env_names,
+    )
+    try:
+        if kind == "google_live" and provider_cfg.get("credentials_path"):
+            from google.oauth2 import service_account
+            from google.auth.transport.requests import Request
+
+            def _refresh_credentials():
+                creds = service_account.Credentials.from_service_account_file(
+                    provider_cfg["credentials_path"],
+                    scopes=["https://www.googleapis.com/auth/cloud-platform"],
+                )
+                creds.refresh(Request())
+                return creds
+
+            credentials = await asyncio.to_thread(_refresh_credentials)
+            return {
+                "status": "success",
+                "message": "Vertex credentials verified successfully",
+                "token_expiry": credentials.expiry.isoformat() if credentials.expiry else None,
+            }
+        if kind == "openai_realtime":
+            if not api_key:
+                raise HTTPException(status_code=400, detail="OpenAI API key is not configured")
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get("https://api.openai.com/v1/models", headers={"Authorization": f"Bearer {api_key}"})
+            if resp.status_code >= 400:
+                raise HTTPException(status_code=400, detail="OpenAI API key verification failed")
+            return {"status": "success", "message": "OpenAI API key verified"}
+        if kind == "deepgram":
+            if not api_key:
+                raise HTTPException(status_code=400, detail="Deepgram API key is not configured")
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get("https://api.deepgram.com/v1/projects", headers={"Authorization": f"Token {api_key}"})
+            if resp.status_code >= 400:
+                raise HTTPException(status_code=400, detail="Deepgram API key verification failed")
+            return {"status": "success", "message": "Deepgram API key verified"}
+        if kind == "google_live":
+            if not api_key:
+                raise HTTPException(status_code=400, detail="Google API key or Vertex credentials are not configured")
+            # Pass the API key via httpx `params=` rather than f-string
+            # interpolation. The hostname is hardcoded, so this isn't an
+            # SSRF risk in practice, but the f-string trips CodeQL's
+            # partial-SSRF rule (alert ID 1715) because the interpolated
+            # value crosses the URL boundary; httpx handles encoding
+            # cleanly and the request stays on the intended host.
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    "https://generativelanguage.googleapis.com/v1beta/models",
+                    params={"key": api_key},
+                )
+            if resp.status_code >= 400:
+                raise HTTPException(status_code=400, detail="Google API key verification failed")
+            return {"status": "success", "message": "Google Developer API key verified"}
+        if kind == "elevenlabs_agent":
+            agent_id = helpers["resolve_secret_value"](
+                provider_cfg,
+                file_field="agent_id_file",
+                env_field="agent_id_env",
+                inline_field="agent_id",
+                legacy_env_names=("ELEVENLABS_AGENT_ID",),
+            )
+            if not api_key or not agent_id:
+                raise HTTPException(status_code=400, detail="ElevenLabs API key and agent_id are required")
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get("https://api.elevenlabs.io/v1/voices", headers={"xi-api-key": api_key})
+            if resp.status_code >= 400:
+                raise HTTPException(status_code=400, detail="ElevenLabs API key verification failed")
+            return {"status": "success", "message": "ElevenLabs credentials verified"}
+        if kind == "grok":
+            if not api_key:
+                raise HTTPException(status_code=400, detail="xAI API key is not configured")
+            # xAI exposes an OpenAI-compatible /v1/models endpoint for credential check.
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get("https://api.x.ai/v1/models", headers={"Authorization": f"Bearer {api_key}"})
+            if resp.status_code >= 400:
+                raise HTTPException(status_code=400, detail="xAI API key verification failed")
+            return {"status": "success", "message": "xAI API key verified"}
+        if kind == "fishaudio":
+            if not api_key:
+                raise HTTPException(status_code=400, detail="Fish Audio API key is not configured")
+            model_url = fish_audio_verification_url(
+                str(provider_cfg.get("base_url") or "https://api.fish.audio/v1")
+            )
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    model_url,
+                    params={"page_size": 1},
+                    headers={"Authorization": f"Bearer {api_key}"},
+                )
+            if resp.status_code != 200:
+                raise HTTPException(status_code=400, detail="Fish Audio API key verification failed")
+            return {"status": "success", "message": "Fish Audio API key verified"}
+        if kind == "google":
+            if not api_key:
+                raise HTTPException(status_code=400, detail="Google API key is not configured")
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    "https://generativelanguage.googleapis.com/v1beta/models",
+                    params={"key": api_key},
+                )
+            if resp.status_code >= 400:
+                raise HTTPException(status_code=400, detail="Google API key verification failed")
+            return {"status": "success", "message": "Google API key verified"}
+        if kind in {"openai", "telnyx", "telenyx", "minimax"}:
+            if not api_key:
+                raise HTTPException(status_code=400, detail=f"{kind} API key is not configured")
+            if api_key.lower() == "not-needed":
+                if kind != "openai":
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"{kind} API key is not configured",
+                    )
+                return {
+                    "status": "success",
+                    "message": "No-auth provider credential configuration accepted",
+                }
+            if kind == "openai":
+                configured_base = provider_cfg.get("chat_base_url") or provider_cfg.get("base_url") or ""
+                fallback_base = "https://api.openai.com/v1"
+                label = "OpenAI-compatible"
+            elif kind in {"telnyx", "telenyx"}:
+                configured_base = provider_cfg.get("chat_base_url") or provider_cfg.get("base_url") or ""
+                fallback_base = "https://api.telnyx.com/v2/ai"
+                label = "Telnyx"
+            else:
+                configured_base = provider_cfg.get("chat_base_url") or provider_cfg.get("base_url") or ""
+                fallback_base = "https://api.minimax.io/v1"
+                label = "MiniMax"
+            if configured_base:
+                base_url = _safe_base_url(str(configured_base), "")
+                if not base_url or _url_host(base_url) != _url_host(str(configured_base)):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"{label} verification URL is not allowlisted",
+                    )
+            else:
+                base_url = fallback_base
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    f"{base_url}/models",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                )
+            if resp.status_code >= 400:
+                raise HTTPException(status_code=400, detail=f"{label} API key verification failed")
+            return {"status": "success", "message": f"{label} API key verified"}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"Error verifying provider credentials: {exc}")
+        raise HTTPException(status_code=400, detail=f"Verification failed: {exc}")
+    raise HTTPException(status_code=400, detail=f"Unsupported provider type '{kind}'")
 VERTEX_REGIONS = [
+    {"value": "us", "label": "US (multi-region)"},
+    {"value": "eu", "label": "EU (multi-region)"},
     {"value": "us-central1", "label": "US Central (Iowa)"},
     {"value": "us-east1", "label": "US East (South Carolina)"},
     {"value": "us-east4", "label": "US East (Northern Virginia)"},
+    {"value": "us-east5", "label": "US East (Ohio)"},
+    {"value": "us-south1", "label": "US South (Texas)"},
     {"value": "us-west1", "label": "US West (Oregon)"},
     {"value": "us-west4", "label": "US West (Las Vegas)"},
+    {"value": "europe-central2", "label": "Europe Central (Warsaw)"},
+    {"value": "europe-north1", "label": "Europe North (Finland)"},
+    {"value": "europe-southwest1", "label": "Europe Southwest (Madrid)"},
     {"value": "europe-west1", "label": "Europe West (Belgium)"},
     {"value": "europe-west2", "label": "Europe West (London)"},
     {"value": "europe-west3", "label": "Europe West (Frankfurt)"},
     {"value": "europe-west4", "label": "Europe West (Netherlands)"},
+    {"value": "europe-west8", "label": "Europe West (Milan)"},
     {"value": "asia-east1", "label": "Asia East (Taiwan)"},
     {"value": "asia-northeast1", "label": "Asia Northeast (Tokyo)"},
     {"value": "asia-southeast1", "label": "Asia Southeast (Singapore)"},
@@ -2176,6 +3972,7 @@ def _read_google_calendar_entry(key: str) -> dict:
 
 
 _ALLOWED_CREDENTIALS_DIRS = (
+    "/app/project/secrets/providers",
     "/app/project/secrets",
     "/app/secrets",
     "/secrets",
@@ -3286,6 +5083,12 @@ def _ms_device_flow_worker(flow_id: str, tenant_id: str, client_id: str, account
                 }
             return
         _persist_ms_token_cache(cache, account_key)
+        # Capture the canonical cache path for the success payload. The
+        # caller surfaces this in /devices/poll so the UI can show where
+        # the token cache landed. Was referenced at the result-dict
+        # assembly below but never defined in this scope — CodeRabbit
+        # critical on PR #396.
+        token_cache_path = _ms_token_cache_path_for_key(account_key)
         access_token = result["access_token"]
         me = _ms_graph_request_with_token(access_token, "GET", "/me")
         # Paginate /me/calendars. Without this, accounts with many calendars
@@ -3592,3 +5395,47 @@ async def disconnect_microsoft_calendar(req: _MicrosoftDisconnectRequest):
                 },
             ) from exc
     return {"status": "success", "removed": removed, "token_cache_path": safe_path}
+
+
+@router.get("/providers/meta")
+async def get_providers_voice_meta():
+    """Per-provider voice metadata for the Agent form (v7.3.0).
+
+    Returns each configured provider instance with its full-agent kind,
+    voice_mode (static | freeform | platform_managed | unsupported), the
+    curated voice list for that kind, and the instance's configured default
+    voice. Deepgram entries also expose their normalized Voice Agent language
+    so the Agent form cannot offer a voice that runtime preflight will reject.
+    Catalog + kind inference live in src/utils/voice_catalog.py (single source
+    shared with the engine's soft validation).
+    """
+    project_root = getattr(settings, "PROJECT_ROOT", None)
+    if project_root and project_root not in sys.path:
+        sys.path.insert(0, project_root)
+    from src.utils.voice_catalog import full_agent_kind, provider_voice_meta
+
+    cfg = _read_merged_config_dict() or {}
+    providers = cfg.get("providers") or {}
+    out = []
+    for name, entry in providers.items():
+        if not isinstance(entry, dict):
+            continue
+        kind = full_agent_kind(name, entry)
+        meta = provider_voice_meta(kind)
+        voice_field = meta.get("voice_field")
+        default_voice = entry.get(voice_field) if voice_field else None
+        agent_language = None
+        if kind == "deepgram":
+            raw_language = str(entry.get("agent_language") or "en").strip().lower()
+            agent_language = raw_language.replace("_", "-").split("-", 1)[0] or "en"
+        out.append({
+            "name": name,
+            "kind": kind,
+            "is_full_agent": kind is not None,
+            "enabled": bool(entry.get("enabled", True)),
+            "voice_mode": meta["voice_mode"],
+            "voices": meta["voices"],
+            "default_voice": default_voice,
+            "agent_language": agent_language,
+        })
+    return {"providers": out}

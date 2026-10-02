@@ -3,25 +3,43 @@
 ## User Documentation
 
 - **[Quick Start Guide](../README.md)** - Get started in 10 minutes
-- **[Installation Guide](INSTALLATION.md)** - Complete setup instructions
+- **[Installation and Upgrade Guide](INSTALLATION.md)** - Fresh setup, v7.6.1 upgrade steps, and older-installation updater recovery
 - **[Admin UI Guide](ADMIN_UI_GUIDE.md)** - Web interface for configuration and monitoring
 - **[FreePBX Integration Guide](FreePBX-Integration-Guide.md)** - Dialplan and queue configuration
 - **[Outbound Calling (Alpha)](OUTBOUND_CALLING.md)** - Scheduled outbound campaigns, voicemail drop, consent gate
+- **[VICIdial Remote Agents (Alpha)](Vicidial-Setup.md)** - VICIdial-owned campaigns routed to mapped AAVA Agents
 - **[Configuration Reference](Configuration-Reference.md)** - All settings explained
+- **[WebSocket Transport](WebSocket-Transport.md)** - Opt-in Asterisk Media WebSocket setup, authenticated loopback/WSS topology, qualification, and rollback
+- **[Caller Inactivity Watchdog](Configuration-Reference.md#caller-inactivity-no_input)** - 30-second inbound silence protection, per-agent overrides, and safe terminal playback (v7.3.1+)
+- **[Agents](AGENTS.md)** - v7.4 Agent routing, dialplan selection, and per-Agent tool access
+- **[v7.6.1 Validation Matrix](baselines/golden/v7.6.1-validation-matrix.md)** - Fish Audio, calendar and credential handling, transfer safety, and dependency security evidence
+- **[v7.6.0 Validation Matrix](baselines/golden/v7.6.0-validation-matrix.md)** - Asterisk Media WebSocket, call metadata, support-package privacy, and legacy-transport regression evidence
+- **[v7.5.6 Validation Matrix](baselines/golden/v7.5.6-validation-matrix.md)** - outbound lead context, Agent-scoped hangup markers, and configured post-call summary LLM evidence
+- **[v7.5.5 Validation Matrix](baselines/golden/v7.5.5-validation-matrix.md)** - Admin UI sidebar, post-call webhook variable, and extension availability mapping evidence
+- **[v7.5.4 Validation Matrix](baselines/golden/v7.5.4-validation-matrix.md)** - diagnostic privacy, ARI fault recovery, Deepgram telephony compatibility, Docker status, and updater-state evidence
+- **[v7.5.3 Validation Matrix](baselines/golden/v7.5.3-validation-matrix.md)** - audio recovery, transfer safety, post-deploy calls, and known-issue evidence
+- **[v7.5.2 Validation Matrix](baselines/golden/v7.5.2-validation-matrix.md)** - 16 kHz AudioSocket, G.722 provider/pipeline calls, compatibility, and deployment evidence
+- **[v7.5.1 Validation Matrix](baselines/golden/v7.5.1-validation-matrix.md)** - hotfix automation, UI update, and runtime verification evidence
+- **[v7.4 Validation Matrix](baselines/golden/v7.4.0-validation-matrix.md)** - Agent migration and scoped-tools release evidence
+- **[Voice Selection](VOICE_SELECTION.md)** - Per-agent voices (v7.3.0+): precedence, per-provider behavior, troubleshooting
 - **[Tool Calling Guide](TOOL_CALLING_GUIDE.md)** - Using telephony and business tools
 - **[MCP Tool Integration](MCP_INTEGRATION.md)** - Experimental MCP tools (design + branch guide)
 - **[Troubleshooting Guide](TROUBLESHOOTING_GUIDE.md)** - Common issues and solutions
 - **[Migration Guide](MIGRATION.md)** - Upgrading between major versions
+- **[Operator Migration Guide](OPERATOR_MIGRATION.md)** - Contexts → Agents import, recovery, and rollback boundaries for v7.4
 
 ## Provider Setup Guides
 
-- **[Google Live API Setup](Provider-Google-Setup.md)** - Google Cloud Speech integration
+- **[Google Live API Setup](Provider-Google-Setup.md)** - Gemini Live native-audio full-agent integration
 - **[Deepgram Voice Agent Setup](Provider-Deepgram-Setup.md)** - Deepgram all-in-one provider
-- **[OpenAI Realtime API Setup](Provider-OpenAI-Setup.md)** - GPT-4o Realtime integration
+- **[OpenAI Realtime API Setup](Provider-OpenAI-Setup.md)** - OpenAI GA `gpt-realtime` full-agent integration
 - **[ElevenLabs Agent Setup](Provider-ElevenLabs-Setup.md)** - ElevenLabs Conversational AI with premium voices
+- **[xAI Grok Voice Agent Setup](Provider-Grok-Setup.md)** - Grok realtime full-agent provider (μ-law @ 8 kHz, server VAD, tools, and long-session guidance)
 - **[Telnyx AI Inference Setup](Provider-Telnyx-Setup.md)** - OpenAI-compatible LLM via Telnyx
 - **[Azure Speech Service Setup](Provider-Azure-Setup.md)** - Azure STT & TTS pipeline adapters
-- **[MiniMax LLM Setup](Provider-MiniMax-Setup.md)** - MiniMax M2.7 LLM via OpenAI-compatible API
+- **[MiniMax LLM Setup](Provider-MiniMax-Setup.md)** - MiniMax M3 LLM via OpenAI-compatible API
+- **[Fish Audio TTS Setup](Provider-FishAudio-Setup.md)** - Streaming PCM modular TTS with managed credentials
+- **[Multi-Instance Full-Agent Providers](Multi-Instance-Full-Agent-Providers.md)** - Run multiple instances of the same provider type with isolated credentials
 
 ## Local AI & GPU Setup
 

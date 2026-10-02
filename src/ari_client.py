@@ -7,11 +7,14 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import time
 import uuid
 import audioop
 import wave
-from typing import Dict, Any, Optional, Callable, List
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Dict, Any, Optional, Callable, List, Mapping, Tuple
 import aiohttp
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import websockets
@@ -27,15 +30,134 @@ from .logging_config import get_logger
 
 logger = get_logger(__name__)
 
+_UNSAFE_DIALPLAN_TARGET_RE = re.compile(r"[,()\x00-\x1f\x7f]")
+
+
+# These are Asterisk module *identities*, not display-name fragments.  The ARI
+# endpoint commonly reports a ``.so`` suffix; normalize only that suffix before
+# comparing so (for example) ``chan_websocket_extra.so`` cannot satisfy
+# ``chan_websocket``.
+WEBSOCKET_MEDIA_REQUIRED_MODULES = frozenset(
+    {
+        "chan_websocket",
+        "res_websocket_client",
+        "res_http_websocket",
+        "res_ari_channels",
+    }
+)
+_TIMING_MODULE_PREFIX = "res_timing_"
+
+
+@dataclass(frozen=True)
+class ARIModuleInventory:
+    """Immutable ARI module snapshot for one connected ARI generation.
+
+    ``available`` means that the inventory endpoint returned a well-formed
+    response.  It deliberately does not imply that a particular transport is
+    supported.  Callers must use a transport-specific capability helper.
+    """
+
+    modules: Mapping[str, str]
+    available: bool
+    connection_generation: int
+    captured_at_monotonic: Optional[float]
+    error: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class WebSocketMediaModuleCapability:
+    """Fail-closed module capability result for Asterisk Media WebSocket."""
+
+    inventory_available: bool
+    ready: bool
+    missing_required_modules: Tuple[str, ...]
+    non_running_required_modules: Tuple[str, ...]
+    running_timing_modules: Tuple[str, ...]
+    inventory_generation: int
+    reason: Optional[str] = None
+
+
+def websocket_media_module_capability(
+    inventory: ARIModuleInventory,
+) -> WebSocketMediaModuleCapability:
+    """Evaluate exact required modules plus one running timing backend.
+
+    This intentionally does not inspect ``websocket_client.conf``.  ARI has no
+    authoritative REST resource for that named client stanza, so treating a
+    guessed configuration as verified would create a false-ready state.
+    """
+
+    if not inventory.available:
+        return WebSocketMediaModuleCapability(
+            inventory_available=False,
+            ready=False,
+            missing_required_modules=tuple(sorted(WEBSOCKET_MEDIA_REQUIRED_MODULES)),
+            non_running_required_modules=(),
+            running_timing_modules=(),
+            inventory_generation=inventory.connection_generation,
+            reason=inventory.error or "Asterisk module inventory is unavailable",
+        )
+
+    missing = tuple(
+        sorted(module for module in WEBSOCKET_MEDIA_REQUIRED_MODULES if module not in inventory.modules)
+    )
+    non_running = tuple(
+        sorted(
+            module
+            for module in WEBSOCKET_MEDIA_REQUIRED_MODULES
+            if module in inventory.modules
+            and str(inventory.modules[module]).strip().casefold() != "running"
+        )
+    )
+    timing = tuple(
+        sorted(
+            module
+            for module, status in inventory.modules.items()
+            if module.startswith(_TIMING_MODULE_PREFIX)
+            and str(status).strip().casefold() == "running"
+        )
+    )
+    ready = not missing and not non_running and bool(timing)
+    reason = None
+    if not ready:
+        parts: List[str] = []
+        if missing:
+            parts.append(f"missing: {', '.join(missing)}")
+        if non_running:
+            parts.append(f"not running: {', '.join(non_running)}")
+        if not timing:
+            parts.append("no running res_timing_* module")
+        reason = "; ".join(parts)
+    return WebSocketMediaModuleCapability(
+        inventory_available=True,
+        ready=ready,
+        missing_required_modules=missing,
+        non_running_required_modules=non_running,
+        running_timing_modules=timing,
+        inventory_generation=inventory.connection_generation,
+        reason=reason,
+    )
+
 class ARIClient:
     """A client for interacting with the Asterisk REST Interface (ARI)."""
 
-    def __init__(self, username: str, password: str, base_url: str, app_name: str, ssl_verify: bool = True):
+    def __init__(
+        self,
+        username: str,
+        password: str,
+        base_url: str,
+        app_name: str,
+        ssl_verify: bool = True,
+        ws_ping_interval_sec: float = 10.0,
+        ws_ping_timeout_sec: float = 10.0,
+    ):
         self.username = username
         self.password = password
         self.app_name = app_name
         self.http_url = base_url
         self.ssl_verify = ssl_verify
+        self.ws_ping_interval_sec = float(ws_ping_interval_sec)
+        self.ws_ping_timeout_sec = float(ws_ping_timeout_sec)
         # Determine WebSocket scheme based on HTTP scheme
         if base_url.startswith("https://"):
             ws_scheme = "wss"
@@ -53,6 +175,16 @@ class ARIClient:
         self._reconnect_attempt = 0
         self._max_reconnect_backoff = 60  # Max seconds between reconnect attempts
         self._connected = False  # True readiness state for /ready endpoint
+        self.asterisk_version: Optional[str] = None
+        self._connection_generation = 0
+        self._module_inventory_lock = asyncio.Lock()
+        self._module_inventory = ARIModuleInventory(
+            modules=MappingProxyType({}),
+            available=False,
+            connection_generation=0,
+            captured_at_monotonic=None,
+            error="ARI module inventory has not been collected",
+        )
         self._listener_active = False  # Guard against duplicate listener supervisors
         self.event_handlers: Dict[str, List[Callable]] = {}
         self.active_playbacks: Dict[str, str] = {}
@@ -66,6 +198,209 @@ class ARIClient:
     def is_connected(self) -> bool:
         """Return true ARI connection state for readiness checks."""
         return self._connected and self.running and self.websocket is not None
+
+    @property
+    def module_inventory(self) -> ARIModuleInventory:
+        """Return the latest immutable ARI module snapshot.
+
+        A snapshot belongs to a single ARI connection generation.  It becomes
+        unavailable immediately on disconnect and is recollected after every
+        successful WebSocket connection, preventing stale capability results
+        from surviving a PBX reconnect or module reload.
+        """
+
+        return self._module_inventory
+
+    def websocket_media_module_capability(self) -> WebSocketMediaModuleCapability:
+        """Return the fail-closed WebSocket module/timing capability result."""
+
+        return websocket_media_module_capability(self._module_inventory)
+
+    def _set_module_inventory_unavailable(self, error: str) -> ARIModuleInventory:
+        snapshot = ARIModuleInventory(
+            modules=MappingProxyType({}),
+            available=False,
+            connection_generation=self._connection_generation,
+            captured_at_monotonic=time.monotonic(),
+            error=error,
+        )
+        self._module_inventory = snapshot
+        return snapshot
+
+    def _invalidate_module_inventory_unless_newer(
+        self,
+        *,
+        request_started_at: float,
+        connection_generation: int,
+        error: str,
+    ) -> ARIModuleInventory:
+        """Fail closed without erasing a concurrent/newer probe result.
+
+        A caller that times out waiting for another refresh cannot know whether
+        the old snapshot is still valid.  It must not leave that old success
+        usable for WebSocket admission, but it also must not overwrite a result
+        captured by the in-flight refresh or a newer ARI connection.
+        """
+
+        snapshot = self._module_inventory
+        captured_at = snapshot.captured_at_monotonic
+        if snapshot.connection_generation != connection_generation or (
+            captured_at is not None and captured_at >= request_started_at
+        ):
+            return snapshot
+        return self._set_module_inventory_unavailable(error)
+
+    @staticmethod
+    def _canonical_module_name(name: Any) -> str:
+        """Normalize the conventional dynamic-module suffix and nothing else."""
+
+        value = str(name or "").strip()
+        return value[:-3] if value.endswith(".so") else value
+
+    async def refresh_module_inventory(
+        self, *, timeout_sec: float = 3.0
+    ) -> ARIModuleInventory:
+        """Fetch one current ARI module inventory without affecting ARI connectivity.
+
+        Calls are serialized because readiness and per-call admission may ask at
+        the same time.  A reconnect during a request wins: a response collected
+        for the previous generation is discarded instead of being applied to the
+        new connection.  Errors and malformed replies create an unavailable
+        snapshot, which is fail-closed for WebSocket callers only.
+        """
+
+        request_started_at = time.monotonic()
+        request_generation = self._connection_generation
+        try:
+            timeout = float(timeout_sec)
+        except (TypeError, ValueError):
+            timeout = 3.0
+        if timeout <= 0:
+            return self._invalidate_module_inventory_unless_newer(
+                request_started_at=request_started_at,
+                connection_generation=request_generation,
+                error="ARI module inventory timeout must be positive",
+            )
+
+        deadline = request_started_at + timeout
+        lock_acquired = False
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return self._invalidate_module_inventory_unless_newer(
+                    request_started_at=request_started_at,
+                    connection_generation=request_generation,
+                    error="ARI module inventory refresh timed out waiting for its probe slot",
+                )
+            try:
+                await asyncio.wait_for(self._module_inventory_lock.acquire(), timeout=remaining)
+                lock_acquired = True
+            except asyncio.TimeoutError:
+                return self._invalidate_module_inventory_unless_newer(
+                    request_started_at=request_started_at,
+                    connection_generation=request_generation,
+                    error="ARI module inventory refresh timed out waiting for its probe slot",
+                )
+
+            # A refresh that completed while this caller was waiting is exactly
+            # the result it requested, including an unavailable result.
+            snapshot = self._module_inventory
+            if snapshot.connection_generation != request_generation or (
+                snapshot.captured_at_monotonic is not None
+                and snapshot.captured_at_monotonic >= request_started_at
+            ):
+                return snapshot
+
+            generation = self._connection_generation
+            session = self.http_session
+            if not self.is_connected or session is None or session.closed:
+                return self._invalidate_module_inventory_unless_newer(
+                    request_started_at=request_started_at,
+                    connection_generation=generation,
+                    error="ARI connection or HTTP session is unavailable for module inventory",
+                )
+
+            async def _fetch() -> Mapping[str, str]:
+                async with session.get(f"{self.http_url}/asterisk/modules") as response:
+                    if response.status != 200:
+                        raise ConnectionError(
+                            f"ARI module inventory request failed. Status: {response.status}"
+                        )
+                    payload = await response.json(content_type=None)
+                if not isinstance(payload, list):
+                    raise ValueError("ARI module inventory response was not a list")
+
+                modules: Dict[str, str] = {}
+                for entry in payload:
+                    if not isinstance(entry, dict):
+                        continue
+                    name = self._canonical_module_name(entry.get("name"))
+                    status = str(entry.get("status") or "").strip()
+                    if name:
+                        modules[name] = status
+                return modules
+
+            try:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError()
+                modules = await asyncio.wait_for(_fetch(), timeout=remaining)
+            except Exception as exc:
+                error = f"ARI module inventory unavailable: {type(exc).__name__}"
+                previous = self._module_inventory
+                if generation == self._connection_generation:
+                    snapshot = self._invalidate_module_inventory_unless_newer(
+                        request_started_at=request_started_at,
+                        connection_generation=generation,
+                        error=error,
+                    )
+                else:
+                    snapshot = self._module_inventory
+                log = logger.debug if (
+                    not previous.available and previous.error == error
+                ) else logger.warning
+                log(
+                    "ARI module inventory refresh failed; ARI connection remains usable",
+                    error=type(exc).__name__,
+                    connection_generation=generation,
+                )
+                return snapshot
+
+            if generation != self._connection_generation or not self.is_connected:
+                # A reconnect made this response stale.  Preserve the newer
+                # generation's explicitly unavailable/pending snapshot.  The
+                # connection check also rejects a response that raced a
+                # disconnect before its reconnect increments the generation.
+                return self._module_inventory
+
+            previous = self._module_inventory
+            snapshot = ARIModuleInventory(
+                modules=MappingProxyType(dict(modules)),
+                available=True,
+                connection_generation=generation,
+                captured_at_monotonic=time.monotonic(),
+                error=None,
+            )
+            self._module_inventory = snapshot
+            log = logger.debug if (
+                previous.available and dict(previous.modules) == dict(snapshot.modules)
+            ) else logger.info
+            log(
+                "ARI module inventory refreshed",
+                module_count=len(modules),
+                connection_generation=generation,
+            )
+            return snapshot
+        except asyncio.CancelledError:
+            self._invalidate_module_inventory_unless_newer(
+                request_started_at=request_started_at,
+                connection_generation=request_generation,
+                error="ARI module inventory refresh was cancelled",
+            )
+            raise
+        finally:
+            if lock_acquired:
+                self._module_inventory_lock.release()
 
     async def connect(self):
         """Connect to the ARI WebSocket and establish an HTTP session."""
@@ -103,7 +438,15 @@ class ARIClient:
             async with self.http_session.get(f"{self.http_url}/asterisk/info") as response:
                 if response.status != 200:
                     raise ConnectionError(f"Failed to connect to ARI HTTP endpoint. Status: {response.status}")
-                logger.info("Successfully connected to ARI HTTP endpoint.", scheme=http_scheme, ssl_verify=self.ssl_verify)
+                info = await response.json(content_type=None)
+                system_info = info.get("system", {}) if isinstance(info, dict) else {}
+                self.asterisk_version = str(system_info.get("version") or "").strip() or None
+                logger.info(
+                    "Successfully connected to ARI HTTP endpoint.",
+                    scheme=http_scheme,
+                    ssl_verify=self.ssl_verify,
+                    asterisk_version=self.asterisk_version,
+                )
 
             # Then, connect to the WebSocket. Close any stale socket first so a reconnect
             # never reuses a dead iterator.
@@ -112,13 +455,37 @@ class ARIClient:
                     await self.websocket.close()
                 self.websocket = None
 
-            self.websocket = await websockets.connect(self.ws_url, ssl=ssl_context)
+            self.websocket = await websockets.connect(
+                self.ws_url,
+                ssl=ssl_context,
+                ping_interval=self.ws_ping_interval_sec,
+                ping_timeout=self.ws_ping_timeout_sec,
+            )
             self.running = True
             self._connected = True
             self._reconnect_attempt = 0  # Reset on successful connect
-            logger.info("Successfully connected to ARI WebSocket.", scheme=ws_scheme)
+            self._connection_generation += 1
+            self._set_module_inventory_unavailable(
+                "ARI module inventory refresh pending after connection"
+            )
+            # Capability discovery augments ARI health.  A PBX ACL or older
+            # endpoint must not make ordinary ARI operation fail; WebSocket
+            # callers consume the unavailable snapshot fail-closed instead.
+            await self.refresh_module_inventory()
+            logger.info(
+                "Successfully connected to ARI WebSocket.",
+                scheme=ws_scheme,
+                ping_interval_seconds=self.ws_ping_interval_sec,
+                ping_timeout_seconds=self.ws_ping_timeout_sec,
+                silent_failure_bound_seconds=(
+                    self.ws_ping_interval_sec + self.ws_ping_timeout_sec
+                ),
+            )
         except Exception as e:
             self._connected = False
+            self._set_module_inventory_unavailable(
+                f"ARI connection unavailable: {type(e).__name__}"
+            )
             logger.error("Failed to connect to ARI", error=str(e), attempt=self._reconnect_attempt + 1)
             if self.http_session and not self.http_session.closed:
                 await self.http_session.close()
@@ -149,6 +516,7 @@ class ARIClient:
         """Clear ARI connection state and sleep before reconnecting."""
         self._connected = False
         self.running = False
+        self._set_module_inventory_unavailable("ARI connection is disconnected")
 
         websocket = self.websocket
         self.websocket = None
@@ -265,6 +633,7 @@ class ARIClient:
         self._should_reconnect = False  # Stop the reconnect supervisor
         self._connected = False
         self.running = False
+        self._set_module_inventory_unavailable("ARI connection was explicitly disconnected")
         if self.websocket:
             with contextlib.suppress(Exception):
                 await self.websocket.close()
@@ -322,13 +691,6 @@ class ARIClient:
         (useful for idempotent cleanup cases like 404 on DELETE of already-gone resources).
         """
         url = f"{self.http_url}/{resource}"
-        
-        # Handle channelVars specially - they need to be in the JSON body, not query params
-        if params and "channelVars" in params:
-            channel_vars = params.pop("channelVars")
-            if data is None:
-                data = {}
-            data["channelVars"] = channel_vars
         
         try:
             async with self.http_session.request(method, url, json=data, params=params) as response:
@@ -397,9 +759,8 @@ class ARIClient:
         if caller_id:
             # ARI uses the same callerId format as dialplan: "Name <Number>" or just "Number".
             params["callerId"] = str(caller_id)
-        if channel_vars:
-            params["channelVars"] = channel_vars
-        return await self.send_command("POST", "channels", params=params)
+        data = {"variables": dict(channel_vars)} if channel_vars else None
+        return await self.send_command("POST", "channels", data=data, params=params)
 
     async def continue_in_dialplan(
         self,
@@ -409,8 +770,15 @@ class ARIClient:
         extension: str = "s",
         priority: int = 1,
         label: Optional[str] = None,
-    ) -> bool:
-        """Return a Stasis channel back to the dialplan (POST /channels/{id}/continue)."""
+    ) -> Optional[bool]:
+        """Return the tri-state outcome of handing a Stasis channel to dialplan.
+
+        A 2xx response confirms acceptance, an explicit 4xx response rejects the
+        command, and ``None`` represents an indeterminate 5xx, missing, redirect,
+        or malformed response. Callers must retain ownership while reconciling an
+        indeterminate result because Asterisk may have accepted the request before
+        the HTTP response was lost.
+        """
         params: Dict[str, Any] = {
             "context": str(context),
             "extension": str(extension),
@@ -420,24 +788,122 @@ class ARIClient:
             params["label"] = str(label)
         resp = await self.send_command("POST", f"channels/{channel_id}/continue", params=params)
         status = resp.get("status") if isinstance(resp, dict) else None
-        if status is not None and int(status) >= 400:
+        if status is None:
+            return None
+        try:
+            status_code = int(status)
+        except (TypeError, ValueError):
+            return None
+        if 200 <= status_code < 300:
+            return True
+        if 400 <= status_code < 500:
             return False
-        return True
+        return None
+
+    async def dialplan_target_exists(
+        self,
+        channel_id: str,
+        *,
+        context: str,
+        extension: str = "s",
+        priority: int = 1,
+    ) -> Optional[bool]:
+        """Return whether a concrete dialplan destination exists for this channel.
+
+        ``None`` means Asterisk could not answer the discovery probe. Callers that
+        require fail-closed recovery can treat it as false, while normal transfer
+        paths may still attempt ``continue`` and use that command's result as the
+        authoritative handoff outcome.
+
+        ARI can accept ``continue`` before Asterisk resolves the destination.  An
+        invalid target therefore looks successful to the caller of
+        :meth:`continue_in_dialplan` but is immediately hung up by Asterisk.  Read
+        Asterisk's ``DIALPLAN_EXISTS`` function first so recovery code can retain
+        channel ownership and use its safe fallback instead.
+        """
+        context = str(context or "").strip()
+        extension = str(extension or "").strip()
+        try:
+            priority = int(priority)
+        except (TypeError, ValueError):
+            return False
+
+        # Function arguments are comma-separated. Reject delimiters/control bytes
+        # rather than allowing configuration to alter the function expression.
+        if (
+            not context
+            or not extension
+            or priority < 1
+            or _UNSAFE_DIALPLAN_TARGET_RE.search(context)
+            or _UNSAFE_DIALPLAN_TARGET_RE.search(extension)
+        ):
+            logger.error(
+                "Unsafe or invalid dialplan redirect target",
+                channel_id=channel_id,
+                context=context,
+                extension=extension,
+                priority=priority,
+            )
+            return False
+
+        variable = f"DIALPLAN_EXISTS({context},{extension},{priority})"
+        try:
+            resp = await self.send_command(
+                "GET",
+                f"channels/{channel_id}/variable",
+                params={"variable": variable},
+                tolerate_statuses=[404],
+            )
+        except Exception:
+            logger.warning(
+                "Failed to validate dialplan redirect target",
+                channel_id=channel_id,
+                context=context,
+                extension=extension,
+                priority=priority,
+                exc_info=True,
+            )
+            return None
+
+        if not isinstance(resp, dict):
+            return None
+        status = resp.get("status")
+        if status is not None:
+            try:
+                if int(status) >= 400:
+                    return None
+            except (TypeError, ValueError):
+                return None
+
+        value = str(resp.get("value") or "").strip().lower()
+        if value in {"1", "true", "yes", "on"}:
+            return True
+        if value in {"0", "false", "no", "off"}:
+            return False
+        return None
 
     async def answer_channel(self, channel_id: str):
         """Answer a channel."""
         logger.info("Answering channel", channel_id=channel_id)
         await self.send_command("POST", f"channels/{channel_id}/answer")
 
-    async def hangup_channel(self, channel_id: str):
-        """Hang up a channel."""
+    async def hangup_channel(self, channel_id: str) -> bool:
+        """Hang up a channel and report whether ARI accepted the request."""
         logger.info("Hanging up channel", channel_id=channel_id)
-        # We add a check here. If the command fails with a 404, we log it
-        # as a debug message instead of an error, as this can happen in race
-        # conditions during cleanup and is not necessarily a critical failure.
+        # A 404 here is the normal post-StasisEnd race: caller disconnected first,
+        # Asterisk destroyed the channel, and our cleanup hangup arrives a beat later.
+        # Not a failure — log neutrally so it doesn't read as an error in RCAs.
         response = await self.send_command("DELETE", f"channels/{channel_id}", tolerate_statuses=[404])
         if response and response.get("status") == 404:
-            logger.debug("Channel hangup failed (404), likely already hung up.", channel_id=channel_id)
+            logger.debug(
+                "Hangup no-op: channel already destroyed (expected post-StasisEnd race)",
+                channel_id=channel_id,
+            )
+            return True
+        if not isinstance(response, dict):
+            return False
+        status = response.get("status")
+        return status is None or int(status) < 400
 
     async def execute_application(self, channel_id: str, app_name: str, app_data: str) -> bool:
         """Execute an Asterisk application on a channel."""
@@ -530,8 +996,13 @@ class ARIClient:
                 f"channels/{channel_id}/variable",
                 data={"variable": variable, "value": value},
             )
-            # Some ARI implementations return {} on success.
-            return resp is not None
+            # Some ARI implementations return {} on success. send_command()
+            # also returns a status dictionary for HTTP/transport failures, so
+            # non-None alone is not a success signal.
+            if not isinstance(resp, dict):
+                return False
+            status = resp.get("status")
+            return status is None or int(status) < 400
         except Exception:
             logger.error("Failed to set channel variable", channel_id=channel_id, variable=variable, exc_info=True)
             return False
@@ -562,9 +1033,18 @@ class ARIClient:
     async def stop_playback(self, playback_id: str) -> bool:
         """Stop an active playback by its playbackId."""
         try:
-            response = await self.send_command("DELETE", f"playbacks/{playback_id}")
+            response = await self.send_command(
+                "DELETE",
+                f"playbacks/{playback_id}",
+                tolerate_statuses=[404],
+            )
             status = response.get("status") if isinstance(response, dict) else None
             if status is not None:
+                if int(status) == 404:
+                    # Idempotent cleanup: finite media or channel teardown may
+                    # already have removed the playback.
+                    logger.debug("Playback already absent", playback_id=playback_id)
+                    return True
                 if 200 <= int(status) < 300:
                     logger.info("Playback stopped", playback_id=playback_id, status=status)
                     return True
@@ -1012,7 +1492,19 @@ class ARIClient:
                          error=str(e))
             return False
 
-    async def create_external_media_channel(self, app: str, external_host: str, format: str = "ulaw", direction: str = "both", encapsulation: str = "rtp") -> Optional[Dict[str, Any]]:
+    async def create_external_media_channel(
+        self,
+        app: str,
+        external_host: str,
+        format: str = "ulaw",
+        direction: str = "both",
+        encapsulation: str = "rtp",
+        *,
+        transport: Optional[str] = None,
+        connection_type: Optional[str] = None,
+        transport_data: Optional[str] = None,
+        channel_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         """
         Create an External Media channel for RTP communication.
         
@@ -1021,22 +1513,38 @@ class ARIClient:
             external_host: External host:port for RTP (e.g., "127.0.0.1:18080")
             format: Audio format (default: "ulaw")
             direction: Media direction (default: "both") - both, sendonly, recvonly
-            encapsulation: Transport protocol (default: "rtp")
+            encapsulation: Media encapsulation (default: "rtp")
+            transport: Underlying transport. Defaults to ``udp`` for the
+                established RTP path; WebSocket callers pass ``websocket``.
+            connection_type: Optional ARI externalMedia connection type.
+            transport_data: Driver-specific options such as ``f(json)v(...)``.
+            channel_id: Optional application-chosen ARI channel ID used to
+                correlate asynchronous Stasis and media connection events.
             
         Returns:
             Channel information dict or None if failed
         """
         try:
+            payload: Dict[str, Any] = {
+                "app": app,
+                "external_host": external_host,
+                "format": format,
+                "direction": direction,
+                "encapsulation": encapsulation,
+            }
+            if transport:
+                payload["transport"] = transport
+            if connection_type:
+                payload["connection_type"] = connection_type
+            if transport_data:
+                payload["transport_data"] = transport_data
+            if channel_id:
+                payload["channelId"] = channel_id
+
             response = await self.send_command(
                 "POST",
                 "channels/externalMedia",
-                data={
-                    "app": app,
-                    "external_host": external_host,
-                    "format": format,
-                    "direction": direction,
-                    "encapsulation": encapsulation
-                }
+                data=payload,
             )
             
             if response and response.get("id"):

@@ -10,16 +10,22 @@ import json
 import logging
 import os
 import re
+import shutil
+import sqlite3
+import subprocess
 import sys
+import wave
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query, Response
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from zoneinfo import ZoneInfo
+
+import settings
 
 # Add project root to path for imports
 project_root = os.environ.get("PROJECT_ROOT", "/app/project")
@@ -40,6 +46,16 @@ def _get_server_timezone():
 
 
 _DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _csv_safe_cell(value: Any) -> Any:
+    """Prevent spreadsheet applications from evaluating untrusted CSV cells."""
+    if isinstance(value, str):
+        starts_with_control = value.startswith(("\t", "\r", "\n"))
+        starts_with_formula = value.lstrip().startswith(("=", "+", "-", "@"))
+        if starts_with_control or starts_with_formula:
+            return f"'{value}"
+    return value
 
 
 def _parse_datetime_param(value: Optional[str], *, end_of_day_if_date_only: bool) -> Optional[datetime]:
@@ -84,18 +100,32 @@ class CallRecordSummaryResponse(BaseModel):
     call_id: str
     caller_number: Optional[str] = None
     caller_name: Optional[str] = None
+    called_number: Optional[str] = None
     start_time: Optional[str] = None
     end_time: Optional[str] = None
     duration_seconds: float = 0.0
     provider_name: str = "unknown"
     pipeline_name: Optional[str] = None
     context_name: Optional[str] = None
+    routing_method: Optional[str] = None  # 'ai_agent' | 'ai_context' | 'default' | None
+    # Additive v7 aliases (do not replace context_name/routing_method):
+    # agent_slug mirrors the resolved agent (context_name) whenever the call was
+    # routed to one -- ai_agent, ai_context or default routing -- and is null for
+    # unknown/None routing. routing_method still tells you *how* it was selected.
+    # agent_name is a best-effort display-name lookup, null if agents.db is
+    # unavailable or the slug has no matching agent.
+    agent_slug: Optional[str] = None
+    agent_name: Optional[str] = None
     outcome: str = "completed"
     error_message: Optional[str] = None
     avg_turn_latency_ms: float = 0.0
     total_turns: int = 0
     barge_in_count: int = 0
     created_at: Optional[str] = None
+    external_platform: Optional[str] = None
+    external_call_id: Optional[str] = None
+    external_direction: Optional[str] = None
+    external_disposition: Optional[str] = None
 
 
 class CallRecordResponse(BaseModel):
@@ -104,24 +134,41 @@ class CallRecordResponse(BaseModel):
     call_id: str
     caller_number: Optional[str] = None
     caller_name: Optional[str] = None
+    called_number: Optional[str] = None
     start_time: Optional[str] = None
     end_time: Optional[str] = None
     duration_seconds: float = 0.0
     provider_name: str = "unknown"
     pipeline_name: Optional[str] = None
-    pipeline_components: dict = {}
+    pipeline_components: dict = Field(default_factory=dict)
     context_name: Optional[str] = None
-    conversation_history: list = []
+    routing_method: Optional[str] = None  # 'ai_agent' | 'ai_context' | 'default' | None
+    voice: Optional[str] = None  # Resolved session voice (v7.3.0; None = provider default)
+    voice_source: Optional[str] = None  # 'override' | 'agent' | 'provider-default' | None
+    # Additive v7 aliases (see CallRecordSummaryResponse for semantics).
+    agent_slug: Optional[str] = None
+    agent_name: Optional[str] = None
+    conversation_history: list = Field(default_factory=list)
     outcome: str = "completed"
     transfer_destination: Optional[str] = None
     error_message: Optional[str] = None
-    tool_calls: list = []
+    external_platform: Optional[str] = None
+    external_call_id: Optional[str] = None
+    external_direction: Optional[str] = None
+    external_disposition: Optional[str] = None
+    external_metadata: dict = Field(default_factory=dict)
+    call_metadata: dict = Field(default_factory=dict)
+    call_metadata_updates: list = Field(default_factory=list)
+    tool_calls: list = Field(default_factory=list)
+    pre_call_tool_calls: list = Field(default_factory=list)
+    post_call_tool_calls: list = Field(default_factory=list)
     avg_turn_latency_ms: float = 0.0
     max_turn_latency_ms: float = 0.0
     total_turns: int = 0
     caller_audio_format: str = "ulaw"
     codec_alignment_ok: bool = True
     barge_in_count: int = 0
+    diagnostics_snapshot: dict = Field(default_factory=dict)
     created_at: Optional[str] = None
 
 
@@ -163,6 +210,15 @@ class FilterOptionsResponse(BaseModel):
     outcomes: List[str] = []
 
 
+class ToolRedactionPolicyResponse(BaseModel):
+    """Safe Call History privacy status; never returns arbitrary environment data."""
+
+    configured_mode: str = "strict"
+    configured_value_valid: bool = True
+    pending_restart: Optional[bool] = None
+    modes: Dict[str, str] = Field(default_factory=dict)
+
+
 class ProviderHealthStatus(BaseModel):
     """Health status for a single provider."""
     status: str
@@ -186,6 +242,29 @@ def _get_call_history_store():
         raise HTTPException(status_code=500, detail="Call history module not available")
 
 
+def _configured_tool_redaction_policy() -> tuple[str, bool]:
+    """Read and validate only the Call History tool-redaction setting from .env."""
+    raw_value: Optional[str] = None
+    try:
+        from dotenv import dotenv_values
+
+        values = dotenv_values(settings.ENV_PATH) if os.path.exists(settings.ENV_PATH) else {}
+        value = (values or {}).get("CALL_HISTORY_TOOL_REDACTION_MODE")
+        raw_value = str(value) if value is not None else None
+    except Exception:
+        raw_value = None
+
+    from src.tools.execution_history import (
+        CALL_HISTORY_TOOL_REDACTION_MODES,
+        normalize_call_history_tool_redaction_mode,
+    )
+
+    normalized = normalize_call_history_tool_redaction_mode(raw_value)
+    candidate = str(raw_value or "").strip().lower()
+    valid = not candidate or candidate in CALL_HISTORY_TOOL_REDACTION_MODES
+    return normalized, valid
+
+
 def _normalize_tool_calls(tool_calls: list) -> list:
     """Normalize tool call records for UI consumption (params as object when possible)."""
     normalized: list = []
@@ -204,13 +283,74 @@ def _normalize_tool_calls(tool_calls: list) -> list:
     return normalized
 
 
-def _record_to_response(record) -> CallRecordResponse:
+def _normalize_phase_tool_calls(entries: list, phase: str) -> list:
+    """
+    Normalize pre-call / post-call tool execution entries for UI consumption.
+
+    Ensures every entry has a ``phase`` field set (older rows might omit it).
+    Filters non-dict entries defensively. Does NOT mutate the input.
+    """
+    normalized: list = []
+    for item in (entries or []):
+        if not isinstance(item, dict):
+            continue
+        entry = dict(item)
+        if not entry.get("phase"):
+            entry["phase"] = phase
+        normalized.append(entry)
+    return normalized
+
+
+def _agent_name_map() -> Dict[str, str]:
+    """Best-effort {slug: display_name} from the operator agents.db.
+
+    Never raises: a missing, locked, or unreadable agents.db (e.g. headless/YAML-only
+    installs) just yields an empty map, so call-history responses still serve with
+    agent_name=None. Build this once per request and pass it into the converters to
+    avoid N+1 lookups."""
+    try:
+        from agents_store import AgentsStore
+        with AgentsStore() as store:  # close the sqlite connection promptly
+            return {
+                a["slug"]: a.get("display_name")
+                for a in store.list_all()
+                if a.get("slug")
+            }
+    except (ImportError, OSError, sqlite3.Error):
+        # Expected best-effort failures: agents_store unavailable (ImportError),
+        # the agents.db dir/file is missing or unreadable (OSError), or the DB is
+        # locked/corrupt (sqlite3.Error). Genuine logic bugs still surface.
+        return {}
+
+
+def _resolve_agent(record, agent_names: Optional[Dict[str, str]]):
+    """Compute the additive (agent_slug, agent_name) aliases for a record.
+
+    These reflect the resolved agent whenever the call was routed to one, so
+    integrations can consume the selected agent uniformly: agent_slug mirrors
+    context_name (the resolved agent slug) for ai_agent, ai_context and default
+    routing. routing_method remains the field that explains *how* the agent was
+    selected. For unknown/None routing they stay None.
+
+    agent_name is a best-effort display-name lookup keyed on the slug and is None
+    when the agents DB is unavailable or has no matching slug."""
+    routing_method = getattr(record, "routing_method", None)
+    context_name = record.context_name
+    if routing_method not in ("ai_agent", "ai_context", "default") or not context_name:
+        return None, None
+    agent_name = (agent_names or {}).get(context_name)
+    return context_name, agent_name
+
+
+def _record_to_response(record, agent_names: Optional[Dict[str, str]] = None) -> CallRecordResponse:
     """Convert a CallRecord to a response model."""
+    agent_slug, agent_name = _resolve_agent(record, agent_names)
     return CallRecordResponse(
         id=record.id,
         call_id=record.call_id,
         caller_number=record.caller_number,
         caller_name=record.caller_name,
+        called_number=getattr(record, "called_number", None),
         start_time=record.start_time.isoformat() if record.start_time else None,
         end_time=record.end_time.isoformat() if record.end_time else None,
         duration_seconds=record.duration_seconds,
@@ -218,36 +358,64 @@ def _record_to_response(record) -> CallRecordResponse:
         pipeline_name=record.pipeline_name,
         pipeline_components=record.pipeline_components or {},
         context_name=record.context_name,
+        routing_method=getattr(record, "routing_method", None),
+        voice=getattr(record, "voice", None),
+        voice_source=getattr(record, "voice_source", None),
+        agent_slug=agent_slug,
+        agent_name=agent_name,
         conversation_history=record.conversation_history or [],
         outcome=record.outcome,
         transfer_destination=record.transfer_destination,
         error_message=record.error_message,
+        external_platform=getattr(record, "external_platform", None),
+        external_call_id=getattr(record, "external_call_id", None),
+        external_direction=getattr(record, "external_direction", None),
+        external_disposition=getattr(record, "external_disposition", None),
+        external_metadata=getattr(record, "external_metadata", {}) or {},
+        call_metadata=getattr(record, "call_metadata", {}) or {},
+        call_metadata_updates=getattr(record, "call_metadata_updates", []) or [],
         tool_calls=_normalize_tool_calls(record.tool_calls or []),
+        pre_call_tool_calls=_normalize_phase_tool_calls(
+            getattr(record, "pre_call_tool_calls", None) or [], "pre_call"
+        ),
+        post_call_tool_calls=_normalize_phase_tool_calls(
+            getattr(record, "post_call_tool_calls", None) or [], "post_call"
+        ),
         avg_turn_latency_ms=record.avg_turn_latency_ms,
         max_turn_latency_ms=record.max_turn_latency_ms,
         total_turns=record.total_turns,
         caller_audio_format=record.caller_audio_format,
         codec_alignment_ok=record.codec_alignment_ok,
         barge_in_count=record.barge_in_count,
+        diagnostics_snapshot=getattr(record, "diagnostics_snapshot", {}) or {},
         created_at=record.created_at.isoformat() if record.created_at else None,
     )
 
 
-def _record_to_summary_response(record) -> CallRecordSummaryResponse:
+def _record_to_summary_response(record, agent_names: Optional[Dict[str, str]] = None) -> CallRecordSummaryResponse:
     """Convert a CallRecord to a summary response model."""
+    agent_slug, agent_name = _resolve_agent(record, agent_names)
     return CallRecordSummaryResponse(
         id=record.id,
         call_id=record.call_id,
         caller_number=record.caller_number,
         caller_name=record.caller_name,
+        called_number=getattr(record, "called_number", None),
         start_time=record.start_time.isoformat() if record.start_time else None,
         end_time=record.end_time.isoformat() if record.end_time else None,
         duration_seconds=record.duration_seconds,
         provider_name=record.provider_name,
         pipeline_name=record.pipeline_name,
         context_name=record.context_name,
+        routing_method=getattr(record, "routing_method", None),
+        agent_slug=agent_slug,
+        agent_name=agent_name,
         outcome=record.outcome,
         error_message=record.error_message,
+        external_platform=getattr(record, "external_platform", None),
+        external_call_id=getattr(record, "external_call_id", None),
+        external_direction=getattr(record, "external_direction", None),
+        external_disposition=getattr(record, "external_disposition", None),
         avg_turn_latency_ms=record.avg_turn_latency_ms,
         total_turns=record.total_turns,
         barge_in_count=record.barge_in_count,
@@ -284,7 +452,8 @@ async def get_providers_health():
             if name not in provider_stats:
                 provider_stats[name] = {"total": 0, "succeeded": 0, "failed": 0}
             provider_stats[name]["total"] += 1
-            # Valid CallRecord.outcome values: completed, transferred, error, abandoned
+            # no_input_timeout is an expected policy outcome, not a provider failure.
+            # Valid values: completed, transferred, error, abandoned, no_input_timeout.
             if r.outcome in ("error", "abandoned"):
                 provider_stats[name]["failed"] += 1
             else:
@@ -332,6 +501,8 @@ async def list_calls(
     min_duration: Optional[float] = Query(None, description="Minimum duration in seconds"),
     max_duration: Optional[float] = Query(None, description="Maximum duration in seconds"),
     transcript_search: Optional[str] = Query(None, min_length=1, max_length=256, description="Search within conversation transcripts (case-insensitive substring match)"),
+    call_metadata_key: Optional[str] = Query(None, max_length=64, description="Exact call metadata field name"),
+    call_metadata_value: Optional[str] = Query(None, max_length=1024, description="Exact call metadata value"),
     order_by: str = Query("start_time", description="Column to order by"),
     order_dir: str = Query("DESC", description="Order direction (ASC/DESC)"),
 ):
@@ -342,6 +513,15 @@ async def list_calls(
     
     parsed_start = _parse_datetime_param(start_date, end_of_day_if_date_only=False)
     parsed_end = _parse_datetime_param(end_date, end_of_day_if_date_only=True)
+    if (call_metadata_key is None) != (call_metadata_value is None):
+        raise HTTPException(status_code=422, detail="call_metadata_key and call_metadata_value must be provided together")
+    if call_metadata_key is not None:
+        from src.core.call_metadata import CallMetadataValidationError, validate_call_metadata_key
+
+        try:
+            call_metadata_key = validate_call_metadata_key(call_metadata_key)
+        except CallMetadataValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
     
     # Get total count (with all filters for accurate pagination)
     total = await store.count(
@@ -357,6 +537,8 @@ async def list_calls(
         min_duration=min_duration,
         max_duration=max_duration,
         transcript_search=transcript_search,
+        call_metadata_key=call_metadata_key,
+        call_metadata_value=call_metadata_value,
     )
     
     # Get paginated records
@@ -376,15 +558,18 @@ async def list_calls(
         min_duration=min_duration,
         max_duration=max_duration,
         transcript_search=transcript_search,
+        call_metadata_key=call_metadata_key,
+        call_metadata_value=call_metadata_value,
         order_by=order_by,
         order_dir=order_dir,
         include_details=False,
     )
     
     total_pages = (total + page_size - 1) // page_size if total > 0 else 1
-    
+
+    agent_names = _agent_name_map()  # one best-effort lookup for the whole page
     return CallListResponse(
-        calls=[_record_to_summary_response(r) for r in records],
+        calls=[_record_to_summary_response(r, agent_names) for r in records],
         total=total,
         page=page,
         page_size=page_size,
@@ -457,6 +642,34 @@ async def get_filter_options():
     )
 
 
+@router.get("/calls/redaction-policy", response_model=ToolRedactionPolicyResponse)
+async def get_tool_redaction_policy():
+    """Return the configured tool-history privacy mode without exposing .env."""
+    configured_mode, configured_value_valid = _configured_tool_redaction_policy()
+    pending_restart: Optional[bool] = None
+    try:
+        from . import config as config_api
+
+        env_status = await config_api.get_env_status()
+        drift = (env_status.get("drift") or {}).get("ai_engine") or []
+        pending_restart = "CALL_HISTORY_TOOL_REDACTION_MODE" in drift
+    except Exception:
+        # Docker/env drift inspection is best-effort. The configured policy is
+        # still useful when container state cannot be inspected.
+        pending_restart = None
+
+    return ToolRedactionPolicyResponse(
+        configured_mode=configured_mode,
+        configured_value_valid=configured_value_valid,
+        pending_restart=pending_restart,
+        modes={
+            "strict": "Redact credentials, caller data, free text, and routing details.",
+            "show_routing": "Show destinations and extensions while redacting credentials and caller data.",
+            "off": "Persist in-call tool diagnostics verbatim.",
+        },
+    )
+
+
 @router.get("/calls/{record_id}", response_model=CallRecordResponse)
 async def get_call(record_id: str):
     """
@@ -468,7 +681,7 @@ async def get_call(record_id: str):
     if not record:
         raise HTTPException(status_code=404, detail="Call record not found")
     
-    return _record_to_response(record)
+    return _record_to_response(record, _agent_name_map())
 
 
 @router.get("/calls/{record_id}/transcript")
@@ -494,6 +707,7 @@ async def get_call_transcript(record_id: str):
 
 _RECORDING_BASE = Path("/mnt/asterisk_recordings")
 _MIN_VALID_WAV_SIZE = 44  # WAV header is 44 bytes; files <= header size have no audio
+_RECORDING_EXTENSIONS = {".wav", ".ulaw", ".gsm"}
 
 
 def _has_exact_call_id(filename: str, call_id: str) -> bool:
@@ -509,6 +723,10 @@ def _has_exact_call_id(filename: str, call_id: str) -> bool:
     return bool(re.search(rf"(?<![0-9]){re.escape(call_id)}(?![0-9])", filename))
 
 
+def _is_supported_recording(match: Path) -> bool:
+    return match.suffix.lower() in _RECORDING_EXTENSIONS
+
+
 def _find_recording(call_id: str, start_time=None) -> Optional[Path]:
     """Find a recording file matching the given Asterisk call_id."""
     base = _RECORDING_BASE
@@ -517,12 +735,13 @@ def _find_recording(call_id: str, start_time=None) -> Optional[Path]:
 
     import glob as _glob_mod
     safe_id = _glob_mod.escape(call_id)
-    pattern = f"*{safe_id}*.wav"
+    pattern = f"*{safe_id}*.*"
 
     def _check(match: Path) -> bool:
         return (
             match.is_file()
             and match.resolve().is_relative_to(base.resolve())
+            and _is_supported_recording(match)
             and _has_exact_call_id(match.name, call_id)
         )
 
@@ -531,21 +750,129 @@ def _find_recording(call_id: str, start_time=None) -> Optional[Path]:
         dt = start_time if isinstance(start_time, datetime) else datetime.fromisoformat(str(start_time))
         date_dir = base / dt.strftime("%Y") / dt.strftime("%m") / dt.strftime("%d")
         if date_dir.is_dir():
-            for match in date_dir.glob(pattern):
+            for match in sorted(date_dir.glob(pattern)):
                 if _check(match):
                     return match
 
     # Fallback: root directory (legacy flat layout)
-    for match in base.glob(pattern):
+    for match in sorted(base.glob(pattern)):
         if _check(match):
             return match
 
     # Last resort: recursive search across all date folders
-    for match in base.glob(f"*/*/*/*{safe_id}*.wav"):
+    for match in sorted(base.glob(f"*/*/*/*{safe_id}*.*")):
         if _check(match):
             return match
 
     return None
+
+
+def _ulaw_recording_to_wav_bytes(recording: Path) -> bytes:
+    """Wrap raw 8 kHz mu-law bytes in a browser-playable PCM WAV container."""
+    import audioop
+
+    ulaw_data = recording.read_bytes()
+    pcm16 = audioop.ulaw2lin(ulaw_data, 2)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wavf:
+        wavf.setnchannels(1)
+        wavf.setsampwidth(2)
+        wavf.setframerate(8000)
+        wavf.writeframes(pcm16)
+    return buf.getvalue()
+
+
+def _wav_recording_requires_transcode(recording: Path) -> bool:
+    """Decide whether a .wav/.WAV recording needs a sox transcode for browser playback.
+
+    Decision is based on the WAV header (compression type), not filename
+    case. Previously `.WAV` (uppercase) was unconditionally marked as
+    transcode-required, which forced `sox` for what may be a perfectly
+    standard PCM WAV — and failed with 415 in environments without
+    `sox`. We now probe the actual content for both cases (Codex P2 on
+    PR #396).
+    """
+    if recording.suffix.lower() != ".wav":
+        return False
+    try:
+        with wave.open(str(recording), "rb") as wavf:
+            return wavf.getcomptype() != "NONE"
+    except (wave.Error, EOFError, OSError):
+        # Not a parseable WAV header (truncated, non-PCM container,
+        # corrupted) — needs sox to interpret whatever the file
+        # actually contains.
+        return True
+
+
+def _transcode_recording_to_wav_bytes(recording: Path) -> bytes:
+    sox = shutil.which("sox")
+    if not sox:
+        raise HTTPException(
+            status_code=415,
+            detail="Recording format requires sox for browser playback, but sox is not installed",
+        )
+    raw_timeout = os.getenv("AAVA_RECORDING_TRANSCODE_TIMEOUT_SEC", "120")
+    try:
+        timeout_sec = float(raw_timeout or "120")
+        if timeout_sec <= 0:
+            raise ValueError("must be > 0")
+    except (TypeError, ValueError):
+        # Don't let a typo'd env var (e.g. "120s" or empty string) escape
+        # as a 500 — fall back to the documented default. CodeRabbit
+        # quick-win on PR #396.
+        logger.warning(
+            "Invalid AAVA_RECORDING_TRANSCODE_TIMEOUT_SEC=%r; defaulting to 120s",
+            raw_timeout,
+        )
+        timeout_sec = 120.0
+    try:
+        result = subprocess.run(
+            [sox, str(recording), "-t", "wav", "-"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout_sec,
+        )
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="Recording transcode timed out")
+
+    if result.returncode != 0 or not result.stdout:
+        stderr = result.stderr.decode("utf-8", errors="replace").strip()
+        logger.warning("Failed to transcode recording for playback: %s", stderr)
+        raise HTTPException(status_code=422, detail="Recording file could not be decoded for playback")
+    return result.stdout
+
+
+def _recording_response(recording: Path):
+    suffix = recording.suffix.lower()
+    if suffix == ".ulaw":
+        try:
+            wav_bytes = _ulaw_recording_to_wav_bytes(recording)
+        except Exception as err:
+            # Corrupt .ulaw should surface as a controlled client error,
+            # not a 500. Mirrors the sox transcode-failure path
+            # (CodeRabbit on PR #396).
+            logger.warning("Failed to decode .ulaw recording for playback: %s", err)
+            raise HTTPException(
+                status_code=422,
+                detail="Recording file could not be decoded for playback",
+            ) from err
+        return Response(
+            content=wav_bytes,
+            media_type="audio/wav",
+            headers={"Content-Disposition": f'inline; filename="{recording.with_suffix(".wav").name}"'},
+        )
+    if suffix == ".gsm" or _wav_recording_requires_transcode(recording):
+        return Response(
+            content=_transcode_recording_to_wav_bytes(recording),
+            media_type="audio/wav",
+            headers={"Content-Disposition": f'inline; filename="{recording.with_suffix(".wav").name}"'},
+        )
+    return FileResponse(
+        path=str(recording),
+        media_type="audio/wav",
+        filename=recording.name,
+    )
 
 
 class RecordingInfoResponse(BaseModel):
@@ -578,9 +905,8 @@ async def get_call_recording_info(record_id: str):
     )
 
 
-@router.get("/calls/{record_id}/recording.wav")
-async def stream_call_recording(record_id: str):
-    """Stream the call recording WAV file for browser playback."""
+async def _stream_call_recording(record_id: str):
+    """Stream the call recording file for browser playback."""
     store = _get_call_history_store()
     record = await store.get(record_id)
     if not record:
@@ -590,14 +916,27 @@ async def stream_call_recording(record_id: str):
     if not recording or not recording.is_file():
         raise HTTPException(status_code=404, detail="Recording file not found")
 
-    if recording.stat().st_size <= _MIN_VALID_WAV_SIZE:
+    # Codec-aware empty detection: the 44-byte threshold is WAV-header
+    # specific. A .ulaw / .gsm recording with 44 bytes of audio is short
+    # but valid; only reject when (a) size==0, or (b) it's a .wav and
+    # the file is at or below the bare WAV header size (CodeRabbit on
+    # PR #396).
+    size = recording.stat().st_size
+    is_wav = recording.suffix.lower() == ".wav"
+    if size == 0 or (is_wav and size <= _MIN_VALID_WAV_SIZE):
         raise HTTPException(status_code=404, detail="Recording is empty (no audio captured)")
 
-    return FileResponse(
-        path=str(recording),
-        media_type="audio/wav",
-        filename=recording.name,
-    )
+    return _recording_response(recording)
+
+
+@router.get("/calls/{record_id}/recording/audio")
+async def stream_call_recording_audio(record_id: str):
+    return await _stream_call_recording(record_id)
+
+
+@router.get("/calls/{record_id}/recording.wav")
+async def stream_call_recording(record_id: str):
+    return await _stream_call_recording(record_id)
 
 
 @router.delete("/calls/{record_id}")
@@ -655,6 +994,8 @@ async def export_calls_csv(
     has_tool_calls: Optional[bool] = Query(None, description="Filter by tool usage"),
     min_duration: Optional[float] = Query(None, description="Minimum duration in seconds"),
     max_duration: Optional[float] = Query(None, description="Maximum duration in seconds"),
+    call_metadata_key: Optional[str] = Query(None, max_length=64),
+    call_metadata_value: Optional[str] = Query(None, max_length=1024),
 ):
     """
     Export call records as CSV with all filters matching the UI.
@@ -663,6 +1004,14 @@ async def export_calls_csv(
     
     parsed_start = _parse_datetime_param(start_date, end_of_day_if_date_only=False)
     parsed_end = _parse_datetime_param(end_date, end_of_day_if_date_only=True)
+    if (call_metadata_key is None) != (call_metadata_value is None):
+        raise HTTPException(status_code=422, detail="call_metadata_key and call_metadata_value must be provided together")
+    if call_metadata_key is not None:
+        from src.core.call_metadata import CallMetadataValidationError, validate_call_metadata_key
+        try:
+            call_metadata_key = validate_call_metadata_key(call_metadata_key)
+        except CallMetadataValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
     
     # Get all matching records (limit to 10000 for safety)
     records = await store.list(
@@ -679,6 +1028,8 @@ async def export_calls_csv(
         has_tool_calls=has_tool_calls,
         min_duration=min_duration,
         max_duration=max_duration,
+        call_metadata_key=call_metadata_key,
+        call_metadata_value=call_metadata_value,
         include_details=True,
     )
     
@@ -693,12 +1044,12 @@ async def export_calls_csv(
         "Provider", "Pipeline", "Context", "Outcome",
         "Transfer Destination", "Error Message",
         "Tool Calls", "Avg Latency (ms)", "Max Latency (ms)",
-        "Total Turns", "Barge-ins"
+        "Total Turns", "Barge-ins", "Call Metadata"
     ])
     
     # Data rows
     for r in records:
-        writer.writerow([
+        row = [
             r.id, r.call_id, r.caller_number or "", r.caller_name or "",
             r.start_time.isoformat() if r.start_time else "",
             r.end_time.isoformat() if r.end_time else "",
@@ -706,8 +1057,10 @@ async def export_calls_csv(
             r.provider_name, r.pipeline_name or "", r.context_name or "", r.outcome,
             r.transfer_destination or "", r.error_message or "",
             len(r.tool_calls), round(r.avg_turn_latency_ms, 2), round(r.max_turn_latency_ms, 2),
-            r.total_turns, r.barge_in_count
-        ])
+            r.total_turns, r.barge_in_count,
+            json.dumps(getattr(r, "call_metadata", {}) or {}, ensure_ascii=False, sort_keys=True),
+        ]
+        writer.writerow([_csv_safe_cell(value) for value in row])
     
     csv_content = output.getvalue()
     
@@ -733,6 +1086,8 @@ async def export_calls_json(
     has_tool_calls: Optional[bool] = Query(None, description="Filter by tool usage"),
     min_duration: Optional[float] = Query(None, description="Minimum duration in seconds"),
     max_duration: Optional[float] = Query(None, description="Maximum duration in seconds"),
+    call_metadata_key: Optional[str] = Query(None, max_length=64),
+    call_metadata_value: Optional[str] = Query(None, max_length=1024),
 ):
     """
     Export call records as JSON with all filters matching the UI.
@@ -741,6 +1096,14 @@ async def export_calls_json(
     
     parsed_start = _parse_datetime_param(start_date, end_of_day_if_date_only=False)
     parsed_end = _parse_datetime_param(end_date, end_of_day_if_date_only=True)
+    if (call_metadata_key is None) != (call_metadata_value is None):
+        raise HTTPException(status_code=422, detail="call_metadata_key and call_metadata_value must be provided together")
+    if call_metadata_key is not None:
+        from src.core.call_metadata import CallMetadataValidationError, validate_call_metadata_key
+        try:
+            call_metadata_key = validate_call_metadata_key(call_metadata_key)
+        except CallMetadataValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
     
     # Get all matching records (limit to 10000 for safety)
     records = await store.list(
@@ -757,14 +1120,17 @@ async def export_calls_json(
         has_tool_calls=has_tool_calls,
         min_duration=min_duration,
         max_duration=max_duration,
+        call_metadata_key=call_metadata_key,
+        call_metadata_value=call_metadata_value,
         include_details=True,
     )
     
     # Convert to JSON-serializable format
+    agent_names = _agent_name_map()
     data = {
         "exported_at": datetime.now().isoformat(),
         "total_records": len(records),
-        "records": [_record_to_response(r).model_dump() for r in records]
+        "records": [_record_to_response(r, agent_names).model_dump() for r in records]
     }
     
     json_content = json.dumps(data, indent=2)

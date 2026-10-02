@@ -6,6 +6,7 @@ Complete guide to diagnosing and fixing issues with Asterisk AI Voice Agent.
 
 - [Installation](#installation)
 - [Quick Diagnostics](#quick-diagnostics)
+- [Bounded Diagnostic Audio Capture](#bounded-diagnostic-audio-capture)
 - [Common Issues](#common-issues)
 - [Troubleshooting Tools](#troubleshooting-tools)
 - [Log Analysis](#log-analysis)
@@ -83,12 +84,14 @@ Note: The CLI binary and the Python engine may have different version strings de
 
 ### Available Tools
 
-- **`agent setup`** - Interactive setup wizard (v5.3.1)
-- **`agent check`** - Standard diagnostics report (v5.3.1)
-- **`agent rca`** - Post-call root cause analysis (v5.3.1)
+- **`agent setup`** - Interactive setup wizard
+- **`agent check`** - Standard diagnostics report
+- **`agent rca`** - Post-call root cause analysis
+- **`agent config validate`** - Validate providers, pipelines, models, transport, and audio settings
+- **`agent dialplan`** - Generate an `AI_AGENT` dialplan snippet
 - **`agent update`** - Pull latest code + rebuild/restart as needed (v5.1+)
 
-Legacy aliases (v5.3.1; hidden from `--help`):
+Legacy aliases (hidden from `--help`):
 - `agent init` → `agent setup`
 - `agent doctor` → `agent check`
 - `agent troubleshoot` → `agent rca`
@@ -110,6 +113,14 @@ This performs comprehensive system checks:
 - ✅ Configuration validation
 - ✅ Provider API connectivity
 - ✅ Recent call history
+
+For full-local demos, also run:
+
+```bash
+agent check --local
+```
+
+This validates `local_ai_server` STT/LLM/TTS and reports the active Faster-Whisper device/compute, LLM context/max tokens/tool capability, GPU runtime status, and runtime flags such as `LOCAL_ENABLE_FILLER_AUDIO` and `LOCAL_LLM_STREAMING_TTS_OVERLAP`. For a CPU-only demo, the fast baseline is Faster-Whisper `tiny.en` on `cpu/int8`, Piper TTS, and a small GGUF LLM such as Qwen 2.5 0.5B or 1.5B.
 
 **Exit codes:**
 - `0` - All checks passed
@@ -173,6 +184,60 @@ Notes:
   - `LOCAL_WS_HOST=0.0.0.0`
   - `LOCAL_WS_AUTH_TOKEN=...` (required; server refuses to start if exposed without auth)
 
+### Export a Support Package for One Call
+
+For a problem tied to a specific call, use the Admin UI before collecting broad
+system logs:
+
+1. Open **Call History**, select the affected call, and click **Troubleshoot**.
+2. Review the diagnostic summary, lifecycle coverage, effective settings, tool
+   counts, and technical evidence.
+3. Leave the optional sources selected unless the page says they are probably
+   not needed, then click **Download Support Package**.
+4. Attach the ZIP to the GitHub issue or share it with support on Discord.
+
+The call package contains only evidence correlated to that call: AI Engine
+lifecycle logs, selected Local AI Server/Admin UI entries that reference the
+call ID, sanitized conversation text, pre-call/in-call/post-call tool execution
+details, basic system information, and the call-time provider, pipeline, Audio
+Profile, transport, codec, VAD, barge-in, and streaming settings. It never
+contains a recording, caller name, phone number, API key, password, prompt, or
+secret value.
+
+New calls keep an immutable settings snapshot. Older calls remain exportable,
+but the package notes when that snapshot was not captured. Console and JSON log
+formats are both supported, including mixed retained logs. DEBUG is not
+required: the snapshot and lifecycle header are captured independently at INFO;
+the package manifest reports the log formats and levels that were actually
+available.
+
+Use **System Logs → Export → System diagnostics** only when an issue is not tied
+to one call. That advanced package is time-bounded and sanitized, but it may
+contain operational events from multiple calls. **Download current view** saves
+only the raw lines visible after the current container, level, and search
+filters.
+
+### Bounded Diagnostic Audio Capture
+
+Diagnostic WAVs can contain caller audio, agent audio, names, phone numbers, or
+other sensitive content. Enable them only for a short, controlled reproduction
+and handle the resulting files according to your retention policy.
+
+1. Set `DIAG_ENABLE_TAPS=true`, rebuild or restart `ai_engine`, and reproduce the
+   issue once. Playback taps use `/tmp/ai-engine-taps`; full-call RCA streams use
+   `/tmp/ai-engine-captures/<call_id>/`.
+2. Collect only the required call with `agent rca` or `scripts/rca_collect.sh`.
+3. Set `DIAG_ENABLE_TAPS=false` and restart `ai_engine` before returning the
+   system to normal service.
+4. Remove retained WAVs explicitly when the investigation is complete.
+
+Disabling diagnostics prevents new per-call writes; it never deletes historical
+artifacts. The restricted empty capture root may remain present. The legacy
+`AAVA_AUDIO_DIAGNOSTICS` switch can independently enable playback taps, so leave
+both settings false or unset for a no-write call path. Enabled writers reject
+symlinked, foreign-owned, or unsafe writable directory paths and disable only the
+affected diagnostic writer rather than failing the call.
+
 ### Step 2: Analyze Recent Call
 
 ```bash
@@ -180,18 +245,21 @@ agent rca
 ```
 
 Automatically analyzes your most recent call with:
-- Log collection and parsing (from Docker logs)
+- Canonical outcome, provider/pipeline, duration, and latency from Call History
+- Call-scoped log collection and parsing
 - Metrics extraction
 - Format alignment check
 - Baseline comparison
-- AI-powered diagnosis
+- Optional AI-powered interpretation
 
 **How it works:**
+- Reads the persisted Call History record first so unrelated provider names in other log lines cannot select the wrong baseline
 - Reads logs directly from Docker: `docker logs ai_engine`
 - Analyzes calls from last 24 hours
 - No file logging required (LOG_TO_FILE not needed)
 - Requires `ai_engine` container to be running
 - Works with both console and JSON log formats
+- Treats delivery drift as observational; drift alone does not make a successful call fail
 
 **Log Format Recommendation:**
 For best troubleshooting results, use JSON format in `.env`:
@@ -291,6 +359,9 @@ external_media:
   rtp_port: 18080
   # Optional: allocate per-call RTP ports
   # port_range: "18080:18099"
+
+# Opt-in, version-gated Asterisk Media WebSocket — see docs/WebSocket-Transport.md
+# audio_transport: websocket
 ```
 
 #### Dialplan Not Passing to Stasis
@@ -512,6 +583,33 @@ docker logs ai_engine | grep -i "transcript\|stt\|speech"
 
 ---
 
+### 6. Caller Inactivity Watchdog Does Not Check In or Hang Up
+
+**Expected v7.3.1 behavior:** once the call is ready and both sides are idle, the inbound watchdog asks “Are you still there?” after 30 seconds, waits 15 seconds, speaks the full final warning, then records `no_input_timeout` and hangs up.
+
+Check the effective configuration:
+
+```yaml
+no_input:
+  enabled: true
+  inbound_enabled: true
+  initial_timeout_sec: 30
+  grace_timeout_sec: 15
+  max_check_ins: 1
+```
+
+Then search the call logs for:
+
+```text
+Caller inactivity watchdog registered
+Caller inactivity check-in
+Caller-facing audio drain complete
+Caller inactivity timeout reached
+Executing terminal ARI hangup
+```
+
+If the timer never starts, check for a stuck `processing`, caller-input, transfer, or output-active state. If announcements play but hangup is late, upgrade to v7.3.1 or newer; older native-AEC paths could wait 25 seconds because output completion was coupled to TTS gating. For ElevenLabs, enable `agent_response_complete`, set its hosted turn timeout to 30 seconds, and disable provider silence hangup (`silence_end_call_timeout: -1`). Outbound calls require an explicit per-agent `outbound_enabled: true` override.
+
 ## Troubleshooting Tools
 
 ### agent check
@@ -569,17 +667,26 @@ agent rca -v
 
 # Force LLM analysis (even for healthy calls)
 agent rca --llm
+
+# Deterministic evidence only (recommended for automation)
+agent rca --call 1761424308.2043 --no-llm --json
+
+# Latest persisted local/pipeline call and Community Test Matrix data
+agent rca --local
 ```
 
 **What it analyzes:**
-- **Call Logs:** Filters logs for specific call ID
+- **Call History:** Canonical provider/pipeline, outcome, duration, turns, latency, routing, and codec result
+- **Call Logs:** Filters diagnostic evidence for the selected call ID
 - **Metrics:** Provider bytes, drift, underflows, SNR
 - **Format Alignment:** AudioSocket, provider, frame sizes
 - **VAD Settings:** Aggressiveness, thresholds
 - **Audio Gating:** Gate closures, flutter detection
 - **Baseline Comparison:** vs golden configs
-- **Quality Score:** 0-100 based on metrics
+- **Quality Score:** Deterministic score based on actionable metrics
 - **LLM Diagnosis:** AI-powered root cause analysis
+
+Delivery wall time includes pauses, barge-in, synthesis, and queue waits. RCA therefore reports drift as evidence but does not fail a call or invoke LLM diagnosis from drift alone. Modular pipeline wall time and very short/empty segments are excluded from drift assessment. Underflows are rated against the estimated number of 20 ms frames rather than by raw count alone.
 
 **Symptoms Supported:**
 - `no-audio` - Complete silence
@@ -597,43 +704,13 @@ agent rca --llm
 6. Call Quality Verdict (0-100 score)
 7. AI Diagnosis (if enabled)
 
-Note: Advanced `agent troubleshoot` flags (list/symptoms/collect-only/etc.) still exist as a hidden legacy alias in v5.0, but `agent rca` is the recommended surface.
+Note: Advanced `agent troubleshoot` flags (list/symptoms/collect-only/etc.) remain as a hidden compatibility path, but `agent rca` is the recommended surface.
 
 ---
 
-### agent demo
+### agent demo (legacy)
 
-**Audio pipeline validation without making real calls.**
-
-```bash
-# Run basic validation
-agent demo
-
-# Use custom audio file
-agent demo --wav /path/to/test.wav
-
-# Run multiple iterations
-agent demo --loop 5
-
-# Save generated audio files
-agent demo --save
-
-# Verbose output
-agent demo -v
-```
-
-**What it tests:**
-- AudioSocket server connectivity
-- Container health
-- Configuration validation
-- Provider API connectivity
-- Audio processing pipeline
-
-**Use Cases:**
-- Pre-production validation
-- CI/CD testing
-- Configuration verification
-- Provider API testing
+`agent demo` is a hidden compatibility alias for `agent check`. The old `--wav`, `--loop`, and `--save` workflow is no longer implemented; those flags return an explicit error. Validate a real audio path with a test call followed by `agent rca`.
 
 ---
 
@@ -645,9 +722,8 @@ agent demo -v
 # Run setup wizard
 agent setup
 
-# Flags below are planned; they may exist but are not implemented in v5.3.1:
-# agent setup --non-interactive
-# agent setup --template <name>
+# Show targets discovered from base and local configuration without changing files
+agent setup --list-targets
 ```
 
 **What it configures:**
@@ -656,6 +732,54 @@ agent setup
 - AI provider selection
 - Pipeline configuration
 - Configuration validation
+
+The wizard writes operator changes to `config/ai-agent.local.yaml`. Switching from a pipeline to a full-agent provider clears the previous `active_pipeline` override.
+
+---
+
+## Outbound Lead Context Is Missing
+
+**Symptoms:** an AAVA-managed outbound attempt has nonempty `custom_vars`, but
+the Agent does not receive a `## Lead Context` block, or the attempt ends with
+`outbound custom_vars could not be confirmed after answer`.
+
+1. Find the attempt, lead, and channel identifiers in **Call Scheduling** and
+   the AI Engine logs. AAVA deliberately does not log the context payload.
+2. While the call is ringing, list the matching Local channels and inspect both
+   halves:
+
+   ```bash
+   asterisk -rx "core show channels concise" | grep 'Local/'
+   for half in 1 2; do
+     if asterisk -rx "core show channel <local-channel>;$half" \
+       | grep -q 'AAVA_CUSTOM_VARS_JSON'; then
+       echo "Local channel ;$half: AAVA_CUSTOM_VARS_JSON present"
+     else
+       echo "Local channel ;$half: AAVA_CUSTOM_VARS_JSON missing"
+     fi
+   done
+   ```
+
+   Keep this check presence-only. Printing the variable would expose the lead
+   context in the terminal and any retained RCA transcript.
+
+3. After answer, check for the sanitized confirmation or rejection markers:
+
+   ```bash
+   docker compose -p asterisk-ai-voice-agent logs ai_engine 2>&1 \
+     | grep -Ei \
+       'outbound custom_vars could not be confirmed after answer|outbound attempt metadata unavailable after answer|outbound custom_vars metadata is invalid after answer'
+   ```
+
+4. If the lead failed before dialing, reduce `custom_vars` below the 8,192-byte
+   serialized limit and retry with a new or recycled lead. Do not place secrets
+   in this field.
+5. If the variable is absent despite a current engine build, verify ARI write
+   permissions and retain the attempt/channel identifiers for RCA collection.
+
+AAVA fails closed for nonempty unconfirmed context: the attempt becomes
+`error`, the lead becomes `failed`, the answered channel is hung up, and the AI
+provider is not started.
 
 ---
 
@@ -980,12 +1104,17 @@ ERROR: received 4000 (private use) invalid_request_error.missing_model
 
 **Cause:** Wrong model specified for Realtime API.
 
-**Fix:** Use correct model:
+**Fix:** Use a current GA Realtime model (OpenAI sunset the Beta Realtime API on 2026-05-12 and removed `gpt-4o-realtime-preview-*` snapshots on 2026-05-07):
 ```yaml
 providers:
   openai_realtime:
-    model: "gpt-4o-realtime-preview-2024-12-17"  # NOT gpt-4o!
+    api_version: ga
+    model: gpt-realtime         # NOT gpt-4o, NOT gpt-4o-realtime-preview-*
+    # Other current GA options: gpt-realtime-1.5 (best audio quality),
+    #                           gpt-realtime-2 (reasoning voice model),
+    #                           gpt-realtime-mini (cost-optimized).
 ```
+If you see `error.code: model_not_found` despite a valid key, your OpenAI org may not have Realtime API access enabled — check **OpenAI Console → Settings → Limits**.
 
 **3. Authentication Failed**
 ```
@@ -1487,7 +1616,8 @@ streaming:
 [from-ai-agent]
 exten => s,1,NoOp(AI Voice Agent)
  same => n,Answer()
- same => n,Set(AI_CONTEXT=demo_openai)  ; Optional: select context
+ same => n,Set(AI_AGENT=default)         ; Select an operator-managed agent
+ ; same => n,Set(AI_PROVIDER=deepgram)  ; Optional provider/pipeline override
  same => n,Stasis(asterisk-ai-voice-agent)
  same => n,Hangup()
 ```
@@ -1495,11 +1625,12 @@ exten => s,1,NoOp(AI Voice Agent)
 **Transport is controlled in config, not dialplan:**
 - Set `audio_transport: externalmedia` for **pipelines** (hybrid, local_only)
 - Set `audio_transport: audiosocket` for **full agents** (Deepgram, OpenAI Realtime)
+- Set `audio_transport: websocket` only for the opt-in, version-gated Asterisk Media WebSocket transport — see [WebSocket-Transport.md](WebSocket-Transport.md)
 
-The `ai_engine` service automatically creates the AudioSocket server or RTP endpoint based on your config. You don't need to add `AudioSocket()` to the dialplan.
+The `ai_engine` service automatically creates the AudioSocket server, RTP endpoint, or WebSocket listener based on your config. You don't need to add `AudioSocket()` to the dialplan.
 
-**Context Selection:**
-Use `AI_CONTEXT` to select different agent personalities/configurations from `config/ai-agent.yaml`.
+**Agent Selection:**
+Use `AI_AGENT` to select an operator-managed agent. Normally its configured target is authoritative; set `AI_PROVIDER` only for an intentional per-call provider or pipeline override. Generate a current snippet with `agent dialplan --agent <slug>`.
 
 See [docs/Transport-Mode-Compatibility.md](Transport-Mode-Compatibility.md) for transport mode details.
 
@@ -1512,7 +1643,7 @@ See [docs/Transport-Mode-Compatibility.md](Transport-Mode-Compatibility.md) for 
 | Metric | Excellent | Acceptable | Poor | Critical |
 |--------|-----------|------------|------|----------|
 | **Provider Bytes Ratio** | 0.99-1.01 | 0.95-1.05 | 0.90-1.10 | <0.90 or >1.10 |
-| **Drift** | <5% | 5-10% | 10-20% | >20% |
+| **Delivery drift** | Observational | Correlate with caller experience | Investigate with format/underflow evidence | Never critical by itself |
 | **Underflow Rate** | 0% | <1% | 1-5% | >5% |
 | **Gate Closures** | <5 | 5-20 | 20-50 | >50 |
 | **Quality Score** | >90 | 70-90 | 50-70 | <50 |
@@ -1528,5 +1659,5 @@ See [docs/Transport-Mode-Compatibility.md](Transport-Mode-Compatibility.md) for 
 
 ---
 
-**Last Updated:** April 26, 2026  
-**Version:** v6.4.2
+**Last Updated:** June 2026
+**Version:** v7.2.0

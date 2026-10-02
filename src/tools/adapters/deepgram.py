@@ -149,11 +149,14 @@ class DeepgramToolAdapter:
             call_id=context['call_id'],
             caller_channel_id=context.get('caller_channel_id'),
             bridge_id=context.get('bridge_id'),
+            caller_number=context.get('caller_number'),
+            caller_name=context.get('caller_name'),
             called_number=context.get('called_number'),
             context_name=context.get('context_name'),
             session_store=context['session_store'],
             ari_client=context['ari_client'],
             config=context.get('config'),
+            tool_registry=self.registry,
             provider_name="deepgram",
             user_input=context.get('user_input')
         )
@@ -225,7 +228,11 @@ class DeepgramToolAdapter:
             return
         
         # Build response per actual Deepgram spec
-        safe_result = sanitize_tool_result_for_json_string(result, max_bytes=12000)
+        safe_result = sanitize_tool_result_for_json_string(
+            result,
+            max_bytes=12000,
+            tool_name=function_name,
+        )
         response = {
             "type": "FunctionCallResponse",
             "id": function_call_id,

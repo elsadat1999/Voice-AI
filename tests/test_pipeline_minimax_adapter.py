@@ -19,7 +19,7 @@ def _build_app_config() -> AppConfig:
         "minimax_llm": {
             "api_key": "test-minimax-key",
             "chat_base_url": "https://api.minimax.io/v1",
-            "chat_model": "MiniMax-M2.7",
+            "chat_model": "MiniMax-M3",
             "temperature": 1.0,
             "response_timeout_sec": 10.0,
             "type": "minimax",
@@ -39,7 +39,7 @@ def _build_app_config() -> AppConfig:
         default_provider="minimax",
         providers=providers,
         asterisk={"host": "127.0.0.1", "username": "ari", "password": "secret"},
-        llm={"initial_greeting": "hi", "prompt": "You are a helpful assistant.", "model": "MiniMax-M2.7"},
+        llm={"initial_greeting": "hi", "prompt": "You are a helpful assistant.", "model": "MiniMax-M3"},
         audio_transport="audiosocket",
         downstream_mode="stream",
         pipelines=pipelines,
@@ -153,12 +153,19 @@ async def test_minimax_llm_chat_completion():
     )
 
     await adapter.start()
-    response = await adapter.generate("call-1", "hello", {"system_prompt": "Be helpful."}, {})
+    summary_prompt = "Summarize the call. Do not use the agent persona."
+    response = await adapter.generate(
+        "call-1",
+        "hello",
+        {"system_prompt": summary_prompt},
+        {"system_prompt": summary_prompt, "instructions": summary_prompt},
+    )
     assert response.text == "Hello! How can I help?"
     assert response.tool_calls == []
 
     request = fake_session.requests[0]
-    assert request["json"]["model"] == "MiniMax-M2.7"
+    assert request["json"]["model"] == "MiniMax-M3"
+    assert request["json"]["messages"][0] == {"role": "system", "content": summary_prompt}
     assert request["url"] == "https://api.minimax.io/v1/chat/completions"
     assert request["headers"]["Authorization"] == "Bearer test-minimax-key"
 

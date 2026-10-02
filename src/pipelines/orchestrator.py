@@ -20,6 +20,7 @@ from ..config import (
     AzureSTTProviderConfig,
     AzureTTSProviderConfig,
     CambAiProviderConfig,
+    FishAudioProviderConfig,
     DeepgramProviderConfig,
     ElevenLabsProviderConfig,
     GoogleProviderConfig,
@@ -31,7 +32,8 @@ from ..config import (
     TelnyxLLMProviderConfig,
 )
 from ..logging_config import get_logger
-from .base import Component, STTComponent, LLMComponent, TTSComponent
+from ..config.provider_instances import resolve_secret_value
+from .base import Component, STTComponent, LLMComponent, LLMResponse, TTSComponent
 from .deepgram import DeepgramSTTAdapter, DeepgramTTSAdapter
 from .deepgram_flux import DeepgramFluxSTTAdapter
 from .elevenlabs import ElevenLabsTTSAdapter
@@ -44,6 +46,7 @@ from .minimax import MiniMaxLLMAdapter
 from .telnyx import TelnyxLLMAdapter
 from .azure import AzureSTTFastAdapter, AzureSTTRealtimeAdapter, AzureTTSAdapter
 from .cambai import CambAiTTSAdapter
+from .fish_audio import FishAudioTTSAdapter
 
 logger = get_logger(__name__)
 
@@ -228,14 +231,15 @@ class PipelineOrchestrator:
         if registry:
             self._registry.update(registry)
 
-        self._local_provider_config: Optional[LocalProviderConfig] = self._hydrate_local_config()
+        self._local_component_configs = self._hydrate_local_component_configs()
         self._deepgram_provider_config: Optional[DeepgramProviderConfig] = self._hydrate_deepgram_config()
-        self._openai_provider_config: Optional[OpenAIProviderConfig] = self._hydrate_openai_config()
+        self._openai_component_configs = self._hydrate_openai_component_configs()
         self._telnyx_llm_provider_config: Optional[TelnyxLLMProviderConfig] = self._hydrate_telnyx_llm_config()
         self._minimax_llm_provider_config: Optional[MiniMaxLLMProviderConfig] = self._hydrate_minimax_llm_config()
         self._google_provider_config: Optional[GoogleProviderConfig] = self._hydrate_google_config()
         self._elevenlabs_provider_config: Optional[ElevenLabsProviderConfig] = self._hydrate_elevenlabs_config()
         self._cambai_provider_config: Optional[CambAiProviderConfig] = self._hydrate_cambai_config()
+        self._fishaudio_component_configs = self._hydrate_fishaudio_component_configs()
         self._groq_stt_provider_config: Optional[GroqSTTProviderConfig] = self._hydrate_groq_stt_config()
         self._groq_tts_provider_config: Optional[GroqTTSProviderConfig] = self._hydrate_groq_tts_config()
         self._azure_stt_provider_config: Optional[AzureSTTProviderConfig] = self._hydrate_azure_stt_config()
@@ -247,6 +251,7 @@ class PipelineOrchestrator:
         self._enabled: bool = bool(getattr(config, "pipelines", {}) or {})
         self._active_pipeline_name: Optional[str] = getattr(config, "active_pipeline", None)
         self._invalid_pipelines: Dict[str, str] = {}
+        self._pipeline_validation_results: Dict[str, Dict[str, Any]] = {}
 
     @property
     def started(self) -> bool:
@@ -255,6 +260,64 @@ class PipelineOrchestrator:
     @property
     def enabled(self) -> bool:
         return self._enabled
+
+    def pipeline_status(self) -> Dict[str, Dict[str, Any]]:
+        """Return readiness details for every configured pipeline."""
+        pipelines = getattr(self.config, "pipelines", {}) or {}
+        status: Dict[str, Dict[str, Any]] = {}
+        for name in pipelines:
+            if name in self._invalid_pipelines:
+                status[name] = {
+                    "valid": False,
+                    "healthy": False,
+                    "error": self._invalid_pipelines[name],
+                    "failures": [],
+                }
+                continue
+            result = self._pipeline_validation_results.get(name, {})
+            status[name] = {
+                "valid": True,
+                "healthy": bool(result.get("healthy", False)),
+                "error": None,
+                "failures": list(result.get("failures", [])),
+            }
+        return status
+
+    def is_pipeline_ready(self, pipeline_name: Optional[str]) -> bool:
+        if not pipeline_name or not self._started:
+            return False
+        details = self.pipeline_status().get(pipeline_name)
+        return bool(details and details.get("valid") and details.get("healthy"))
+
+    @staticmethod
+    def _uses_local_component(entry: PipelineEntry) -> bool:
+        return any(
+            str(component or "").startswith("local_")
+            for component in (entry.stt, entry.llm, entry.tts)
+        )
+
+    async def refresh_unhealthy_local_pipelines(self) -> int:
+        """Retry startup connectivity checks for valid local-component pipelines.
+
+        Local AI Server commonly becomes reachable after the engine. Static
+        validation errors remain unavailable, and cloud-only pipelines are not
+        polled in the background. Returns the number of local pipelines that
+        are still unhealthy after the refresh.
+        """
+        if not self._started:
+            return 0
+
+        pipelines = getattr(self.config, "pipelines", {}) or {}
+        remaining = 0
+        for name, entry in pipelines.items():
+            if name in self._invalid_pipelines or not self._uses_local_component(entry):
+                continue
+            current = self._pipeline_validation_results.get(name, {})
+            if not current.get("healthy", False):
+                self._pipeline_validation_results[name] = await self._validate_pipeline_connectivity(name, entry)
+            if not self._pipeline_validation_results.get(name, {}).get("healthy", False):
+                remaining += 1
+        return remaining
 
     async def start(self) -> None:
         if not self.enabled:
@@ -281,24 +344,19 @@ class PipelineOrchestrator:
             details = "; ".join([f"{name}: {err}" for name, err in self._invalid_pipelines.items()])
             raise PipelineOrchestratorError(f"No valid pipelines available. Fix pipeline configuration. Details: {details}")
 
-        # If the active pipeline is invalid, fall back to the first valid pipeline.
+        # Never silently substitute an explicitly configured provider stack.
         if self._active_pipeline_name and self._active_pipeline_name in self._invalid_pipelines:
-            try:
-                fallback = next(iter(valid_pipelines.keys()))
-            except StopIteration:
-                fallback = None
-            logger.warning(
-                "Active pipeline is invalid; falling back to first valid pipeline",
+            logger.error(
+                "Active pipeline is invalid and will not be substituted",
                 requested_pipeline=self._active_pipeline_name,
-                fallback_pipeline=fallback,
                 error=self._invalid_pipelines.get(self._active_pipeline_name),
             )
-            self._active_pipeline_name = fallback
 
         # Phase 2: Validate connectivity for valid pipelines
-        validation_results = {}
+        validation_results: Dict[str, Dict[str, Any]] = {}
         for name, entry in valid_pipelines.items():
             validation_results[name] = await self._validate_pipeline_connectivity(name, entry)
+        self._pipeline_validation_results = validation_results
         
         # Check if active pipeline is healthy
         # NOTE: Validation failures should NOT disable the pipeline - it may still work!
@@ -359,37 +417,24 @@ class PipelineOrchestrator:
         selected_name = pipeline_name or self._active_pipeline_name
 
         if not selected_name:
-            try:
-                selected_name = next(iter(pipelines.keys()))
-            except StopIteration:
-                logger.error("No pipelines available to assign", call_id=call_id)
+            selected_name = next(
+                (name for name in pipelines if name not in self._invalid_pipelines),
+                None,
+            )
+            if not selected_name:
+                logger.error("No valid pipelines available to assign", call_id=call_id)
                 return None
         if selected_name in self._invalid_pipelines:
-            logger.warning(
-                "Requested pipeline is invalid; falling back to first valid pipeline",
-                call_id=call_id,
-                requested_pipeline=selected_name,
-                error=self._invalid_pipelines.get(selected_name),
+            raise PipelineOrchestratorError(
+                f"Requested pipeline '{selected_name}' is invalid: "
+                f"{self._invalid_pipelines[selected_name]}"
             )
-            selected_name = None
 
-        entry = pipelines.get(selected_name) if selected_name else None
-        if entry is None or selected_name in self._invalid_pipelines:
-            logger.warning(
-                "Requested pipeline not found; falling back to first available pipeline",
-                call_id=call_id,
-                requested_pipeline=selected_name,
+        entry = pipelines.get(selected_name)
+        if entry is None:
+            raise PipelineOrchestratorError(
+                f"Requested pipeline '{selected_name}' was not found in configuration"
             )
-            try:
-                for candidate_name, candidate_entry in pipelines.items():
-                    if candidate_name in self._invalid_pipelines:
-                        continue
-                    selected_name, entry = candidate_name, candidate_entry
-                    break
-                else:
-                    return None
-            except StopIteration:
-                return None
 
         resolution = self._build_resolution(call_id, selected_name, entry)
         self._assignments[call_id] = resolution
@@ -403,22 +448,149 @@ class PipelineOrchestrator:
         for adapter in (resolution.stt_adapter, resolution.llm_adapter, resolution.tts_adapter):
             await self._shutdown_component(adapter, call_id)
 
+    async def generate_once(
+        self,
+        *,
+        component_key: str,
+        call_id: str,
+        transcript: str,
+        system_prompt: str,
+        max_words: int,
+        timeout_sec: float,
+    ) -> tuple[str, str]:
+        """Run an isolated text-generation job with one configured LLM.
+
+        Provider configuration supplies only the selected component's
+        credentials, endpoint, and model.  The job owns its prompt, tools,
+        sampling, token, and timeout settings; it must never inherit the live
+        agent persona.  The component is isolated from live call pipeline state
+        and is always closed. Unknown, disabled, or credential-less components
+        fail instead of resolving to the wildcard placeholder or another
+        provider.
+        """
+        if _extract_role(component_key) != "llm":
+            raise PipelineOrchestratorError(
+                f"Summary provider '{component_key}' is not an LLM component"
+            )
+        if self._provider_explicitly_disabled(component_key):
+            raise PipelineOrchestratorError(
+                f"Summary provider '{component_key}' is disabled"
+            )
+        factory = self._resolve_factory(component_key)
+        if getattr(factory, _PLACEHOLDER_FACTORY_ATTR, None):
+            raise PipelineOrchestratorError(
+                f"Summary provider '{component_key}' is unavailable or not configured"
+            )
+
+        # Reasoning-capable OpenAI-compatible models may consume completion
+        # tokens internally before emitting visible summary text. Keep a
+        # modest floor so low word limits do not produce an empty response;
+        # the requested word cap remains explicit in the summary prompt.
+        max_tokens = max(256, min(4096, int(max_words) * 3))
+        options: Dict[str, Any] = {
+            "tools": [],
+            # Adapters compose runtime options before request context. Pass the
+            # job prompt through both supported prompt keys so provider/global
+            # agent defaults cannot shadow the post-call summary instructions.
+            "system_prompt": system_prompt,
+            "instructions": system_prompt,
+            "temperature": 0.3,
+            "max_tokens": max_tokens,
+            "max_output_tokens": max_tokens,
+            "timeout_sec": timeout_sec,
+            "response_timeout_sec": timeout_sec,
+            "request_timeout_sec": timeout_sec,
+        }
+        component = self._build_component(component_key, options)
+        if not isinstance(component, LLMComponent):
+            raise PipelineOrchestratorError(
+                f"Summary provider '{component_key}' did not resolve to an LLM"
+            )
+
+        try:
+            await component.start()
+            await component.open_call(call_id, options)
+            response = await component.generate(
+                call_id,
+                transcript,
+                {
+                    "system_prompt": system_prompt,
+                    "prior_messages": [],
+                },
+                options,
+            )
+            text = response.text if isinstance(response, LLMResponse) else str(response or "")
+            return text.strip(), self._configured_llm_model(component_key)
+        finally:
+            await self._shutdown_component(component, call_id)
+
+    def _provider_explicitly_disabled(self, component_key: str) -> bool:
+        providers = getattr(self.config, "providers", {}) or {}
+        if not isinstance(providers, dict):
+            return False
+        for key in (component_key, _extract_provider(component_key)):
+            if not key or key not in providers:
+                continue
+            provider_cfg = providers.get(key)
+            if isinstance(provider_cfg, dict):
+                return provider_cfg.get("enabled") is False
+            if getattr(provider_cfg, "enabled", None) is False:
+                return True
+        return False
+
+    def _configured_llm_model(self, component_key: str) -> str:
+        providers = getattr(self.config, "providers", {}) or {}
+        provider_cfg: Any = None
+        for key in (component_key, _extract_provider(component_key)):
+            if key and providers.get(key) is not None:
+                provider_cfg = providers.get(key)
+                break
+
+        if isinstance(provider_cfg, dict):
+            payload = provider_cfg
+        else:
+            dump = getattr(provider_cfg, "model_dump", None)
+            payload = dump() if callable(dump) else {}
+
+        configured = payload.get("chat_model") or payload.get("llm_model") or payload.get("model")
+        if configured:
+            return str(configured)
+
+        if isinstance(provider_cfg, OpenAIProviderConfig):
+            kind = "openai"
+        elif isinstance(provider_cfg, GoogleProviderConfig):
+            kind = "google"
+        elif isinstance(provider_cfg, TelnyxLLMProviderConfig):
+            kind = "telnyx"
+        elif isinstance(provider_cfg, MiniMaxLLMProviderConfig):
+            kind = "minimax"
+        elif isinstance(provider_cfg, LocalProviderConfig):
+            kind = "local"
+        else:
+            kind = str(payload.get("type") or _extract_provider(component_key) or "").lower()
+
+        defaults = {
+            "openai": OpenAIProviderConfig().chat_model,
+            "google": GoogleProviderConfig().llm_model,
+            "telnyx": TelnyxLLMProviderConfig().chat_model,
+            "telenyx": TelnyxLLMProviderConfig().chat_model,
+            "minimax": MiniMaxLLMProviderConfig().chat_model,
+            "ollama": "llama3.2",
+        }
+        return defaults.get(kind, "")
+
     def register_factory(self, component_key: str, factory: ComponentFactory) -> None:
         self._registry[component_key] = factory
 
-    def _hydrate_local_config(self) -> Optional[LocalProviderConfig]:
+    def _hydrate_local_config(
+        self,
+        raw_config: Any = None,
+        *,
+        component_key: str = "local",
+    ) -> Optional[LocalProviderConfig]:
         providers = getattr(self.config, "providers", {}) or {}
-        raw_config = providers.get("local")
-        if not raw_config:
-            # Fallback: accept modular local providers (local_stt/local_llm/local_tts)
-            for name, cfg in providers.items():
-                try:
-                    lower = str(name).lower()
-                except Exception:
-                    lower = ""
-                if lower.startswith("local_") or (isinstance(cfg, dict) and str(cfg.get("type", "")).lower() == "local"):
-                    raw_config = cfg
-                    break
+        if raw_config is None:
+            raw_config = providers.get(component_key)
         if not raw_config:
             return None
         if isinstance(raw_config, LocalProviderConfig):
@@ -426,19 +598,21 @@ class PipelineOrchestrator:
         elif isinstance(raw_config, dict):
             enabled = raw_config.get("enabled", True)
             if not enabled:
-                logger.debug("Local provider disabled via configuration")
+                logger.debug("Local pipeline component disabled", component=component_key)
                 return None
             try:
                 cfg = LocalProviderConfig(**raw_config)
             except Exception as exc:
                 logger.warning(
                     "Failed to hydrate Local provider config for pipelines",
+                    component=component_key,
                     error=str(exc),
                 )
                 return None
         else:
             logger.warning(
                 "Unsupported Local provider config type for pipelines",
+                component=component_key,
                 config_type=type(raw_config).__name__,
             )
             return None
@@ -448,6 +622,21 @@ class PipelineOrchestrator:
             return None
 
         return cfg
+
+    def _hydrate_local_component_configs(self) -> Dict[str, LocalProviderConfig]:
+        """Hydrate each local role independently, falling back to providers.local."""
+        providers = getattr(self.config, "providers", {}) or {}
+        base = self._hydrate_local_config(providers.get("local"), component_key="local")
+        configs: Dict[str, LocalProviderConfig] = {}
+        for role in ("stt", "llm", "tts"):
+            key = f"local_{role}"
+            if key in providers:
+                config = self._hydrate_local_config(providers.get(key), component_key=key)
+            else:
+                config = base
+            if config is not None:
+                configs[key] = config
+        return configs
 
     def _hydrate_deepgram_config(self) -> Optional[DeepgramProviderConfig]:
         providers = getattr(self.config, "providers", {}) or {}
@@ -472,26 +661,17 @@ class PipelineOrchestrator:
         return None
 
     def _register_builtin_factories(self) -> None:
-        if self._local_provider_config:
-            stt_factory = self._make_local_stt_factory(self._local_provider_config)
-            llm_factory = self._make_local_llm_factory(self._local_provider_config)
-            tts_factory = self._make_local_tts_factory(self._local_provider_config)
-
-            self.register_factory("local_stt", stt_factory)
-            self.register_factory("local_llm", llm_factory)
-            self.register_factory("local_tts", tts_factory)
-
-            # Log configured backends from LocalProviderConfig
-            stt_backend = getattr(self._local_provider_config, 'stt_backend', 'vosk')
-            tts_backend = getattr(self._local_provider_config, 'tts_backend', 'piper')
-            
+        if self._local_component_configs:
+            factory_builders = {
+                "local_stt": self._make_local_stt_factory,
+                "local_llm": self._make_local_llm_factory,
+                "local_tts": self._make_local_tts_factory,
+            }
+            for key, provider_config in self._local_component_configs.items():
+                self.register_factory(key, factory_builders[key](provider_config))
             logger.info(
                 "Local pipeline adapters registered",
-                stt_factory="local_stt",
-                llm_factory="local_llm",
-                tts_factory="local_tts",
-                stt_backend=stt_backend,
-                tts_backend=tts_backend,
+                components=sorted(self._local_component_configs),
             )
         else:
             logger.debug("Local pipeline adapters not registered - provider config unavailable or disabled")
@@ -514,20 +694,17 @@ class PipelineOrchestrator:
         else:
             logger.debug("Deepgram pipeline adapters not registered - provider config unavailable")
 
-        if self._openai_provider_config:
-            stt_factory = self._make_openai_stt_factory(self._openai_provider_config)
-            llm_factory = self._make_openai_llm_factory(self._openai_provider_config)
-            tts_factory = self._make_openai_tts_factory(self._openai_provider_config)
-
-            self.register_factory("openai_stt", stt_factory)
-            self.register_factory("openai_llm", llm_factory)
-            self.register_factory("openai_tts", tts_factory)
-
+        if self._openai_component_configs:
+            factory_builders = {
+                "openai_stt": self._make_openai_stt_factory,
+                "openai_llm": self._make_openai_llm_factory,
+                "openai_tts": self._make_openai_tts_factory,
+            }
+            for key, provider_config in self._openai_component_configs.items():
+                self.register_factory(key, factory_builders[key](provider_config))
             logger.info(
                 "OpenAI pipeline adapters registered",
-                stt_factory="openai_stt",
-                llm_factory="openai_llm",
-                tts_factory="openai_tts",
+                components=sorted(self._openai_component_configs),
             )
         else:
             logger.debug("OpenAI pipeline adapters not registered - provider config unavailable or invalid")
@@ -631,26 +808,50 @@ class PipelineOrchestrator:
         else:
             logger.debug("CAMB AI TTS pipeline adapter not registered - API key unavailable or config missing")
 
+        # Fish Audio TTS adapters. Register each configured provider under its
+        # exact YAML key so Admin UI-created custom ``*_tts`` instances work in
+        # pipelines instead of only the canonical ``fishaudio_tts`` key.
+        if self._fishaudio_component_configs:
+            for component_key, provider_config in self._fishaudio_component_configs.items():
+                tts_factory = self._make_fishaudio_tts_factory(provider_config)
+                self.register_factory(component_key, tts_factory)
+                logger.info(
+                    "Fish Audio TTS pipeline adapter registered",
+                    tts_factory=component_key,
+                    model=provider_config.model,
+                    reference_id=provider_config.reference_id,
+                )
+        else:
+            logger.debug(
+                "Fish Audio TTS pipeline adapters not registered - API key unavailable or config missing"
+            )
+
         # Ollama LLM adapter - for self-hosted local LLMs
         # Read config from providers.ollama_llm in YAML if available
         ollama_provider_config = {}
+        ollama_enabled = True
         providers = getattr(self.config, "providers", {}) or {}
         if isinstance(providers, dict) and "ollama_llm" in providers:
             ollama_cfg = providers.get("ollama_llm", {})
-            if isinstance(ollama_cfg, dict) and ollama_cfg.get("enabled", True) is not False:
-                ollama_provider_config = dict(ollama_cfg)
-        
-        ollama_llm_factory = self._make_ollama_llm_factory(ollama_provider_config)
-        self.register_factory("ollama_llm", ollama_llm_factory)
-        configured_url = ollama_provider_config.get("base_url", "http://localhost:11434")
-        logger.info(
-            "Ollama LLM adapter registered",
-            llm_factory="ollama_llm",
-            configured_endpoint=configured_url,
-            note="Self-hosted LLM with optional tool calling",
-        )
+            if isinstance(ollama_cfg, dict):
+                ollama_enabled = ollama_cfg.get("enabled", True) is not False
+                if ollama_enabled:
+                    ollama_provider_config = dict(ollama_cfg)
 
-        self._register_openai_compatible_llm_factories()
+        if ollama_enabled:
+            ollama_llm_factory = self._make_ollama_llm_factory(ollama_provider_config)
+            self.register_factory("ollama_llm", ollama_llm_factory)
+            configured_url = ollama_provider_config.get("base_url", "http://localhost:11434")
+            logger.info(
+                "Ollama LLM adapter registered",
+                llm_factory="ollama_llm",
+                configured_endpoint=configured_url,
+                note="Self-hosted LLM with optional tool calling",
+            )
+        else:
+            logger.debug("Ollama LLM adapter disabled by provider configuration")
+
+        self._register_configured_llm_factories()
 
         # Azure STT adapters
         if self._azure_stt_provider_config:
@@ -696,7 +897,8 @@ class PipelineOrchestrator:
             logger.debug("Azure TTS pipeline adapter not registered - API key unavailable or config missing")
 
 
-    def _register_openai_compatible_llm_factories(self) -> None:
+    def _register_configured_llm_factories(self) -> None:
+        """Register every supported modular ``*_llm`` provider by its YAML key."""
         providers = getattr(self.config, "providers", {}) or {}
         if not isinstance(providers, dict):
             return
@@ -710,25 +912,81 @@ class PipelineOrchestrator:
                 continue
             if role != "llm":
                 continue
-            if str(cfg.get("type", "")).lower() != "openai":
-                continue
             if cfg.get("enabled") is False:
                 continue
-
+            provider_type = str(cfg.get("type", "")).strip().lower()
             provider_prefix = _extract_provider(str(name))
             if not provider_prefix:
                 continue
 
             payload = dict(cfg)
-            # Prefer config-expanded api_key; fallback to environment variable named after provider key
-            payload["api_key"] = cfg.get("api_key") or os.getenv(f"{provider_prefix.upper()}_API_KEY")
             try:
-                provider_cfg = OpenAIProviderConfig(**payload)
+                if provider_type == "openai":
+                    payload["api_key"] = resolve_secret_value(
+                        payload,
+                        file_field="api_key_file",
+                        env_field="api_key_env",
+                        inline_field="api_key",
+                        legacy_env_names=(f"{provider_prefix.upper()}_API_KEY",),
+                    )
+                    if not payload["api_key"]:
+                        continue
+                    factory = self._make_openai_llm_factory(OpenAIProviderConfig(**payload))
+                elif provider_type == "ollama":
+                    factory = self._make_ollama_llm_factory(payload)
+                elif provider_type == "local":
+                    local_cfg = self._hydrate_local_config(payload, component_key=str(name))
+                    if local_cfg is None:
+                        continue
+                    factory = self._make_local_llm_factory(local_cfg)
+                elif provider_type == "google":
+                    payload["api_key"] = resolve_secret_value(
+                        payload,
+                        file_field="api_key_file",
+                        env_field="api_key_env",
+                        inline_field="api_key",
+                        legacy_env_names=(f"{provider_prefix.upper()}_API_KEY", "GOOGLE_API_KEY"),
+                    )
+                    if not (
+                        payload["api_key"]
+                        or payload.get("credentials_path")
+                        or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+                    ):
+                        continue
+                    factory = self._make_google_llm_factory(GoogleProviderConfig(**payload))
+                elif provider_type in {"telnyx", "telenyx"}:
+                    payload["api_key"] = resolve_secret_value(
+                        payload,
+                        file_field="api_key_file",
+                        env_field="api_key_env",
+                        inline_field="api_key",
+                        legacy_env_names=(f"{provider_prefix.upper()}_API_KEY", "TELNYX_API_KEY"),
+                    )
+                    if not payload["api_key"]:
+                        continue
+                    factory = self._make_telnyx_llm_factory(TelnyxLLMProviderConfig(**payload))
+                elif provider_type == "minimax":
+                    payload["api_key"] = resolve_secret_value(
+                        payload,
+                        file_field="api_key_file",
+                        env_field="api_key_env",
+                        inline_field="api_key",
+                        legacy_env_names=(f"{provider_prefix.upper()}_API_KEY", "MINIMAX_API_KEY"),
+                    )
+                    if not payload["api_key"]:
+                        continue
+                    factory = self._make_minimax_llm_factory(MiniMaxLLMProviderConfig(**payload))
+                else:
+                    continue
             except Exception:
+                logger.warning(
+                    "Failed to register configured modular LLM",
+                    component=str(name),
+                    provider_type=provider_type,
+                    exc_info=True,
+                )
                 continue
-
-            llm_factory = self._make_openai_llm_factory(provider_cfg)
-            self.register_factory(str(name), llm_factory)
+            self.register_factory(str(name), factory)
 
     def _make_ollama_llm_factory(self, provider_config: Dict[str, Any]) -> ComponentFactory:
         """Create factory for Ollama LLM adapter (self-hosted local models)."""
@@ -1005,16 +1263,48 @@ class PipelineOrchestrator:
 
         return factory
 
+    def _make_fishaudio_tts_factory(
+        self,
+        provider_config: FishAudioProviderConfig,
+    ) -> ComponentFactory:
+        """Create factory for Fish Audio TTS adapter."""
+        config_payload = provider_config.model_dump()
+
+        def factory(component_key: str, options: Dict[str, Any]) -> Component:
+            return FishAudioTTSAdapter(
+                component_key,
+                self.config,
+                FishAudioProviderConfig(**config_payload),
+                options,
+            )
+
+        return factory
+
     def _hydrate_google_config(self) -> Optional[GoogleProviderConfig]:
         providers = getattr(self.config, "providers", {}) or {}
         raw_config = providers.get("google")
         if not raw_config:
             return None
-        if isinstance(raw_config, GoogleProviderConfig):
-            config = raw_config
-        elif isinstance(raw_config, dict):
+        if (
+            isinstance(raw_config, dict) and raw_config.get("enabled") is False
+        ) or getattr(raw_config, "enabled", None) is False:
+            logger.debug("Google pipeline adapters disabled by provider configuration")
+            return None
+        if isinstance(raw_config, (GoogleProviderConfig, dict)):
             try:
-                config = GoogleProviderConfig(**raw_config)
+                payload = (
+                    raw_config.model_dump()
+                    if isinstance(raw_config, GoogleProviderConfig)
+                    else dict(raw_config)
+                )
+                payload["api_key"] = resolve_secret_value(
+                    payload,
+                    file_field="api_key_file",
+                    env_field="api_key_env",
+                    inline_field="api_key",
+                    legacy_env_names=("GOOGLE_API_KEY",),
+                )
+                config = GoogleProviderConfig(**payload)
             except Exception as exc:
                 logger.warning(
                     "Failed to hydrate Google provider config for pipelines",
@@ -1115,6 +1405,98 @@ class PipelineOrchestrator:
 
         return config
 
+    def _hydrate_fishaudio_component_configs(self) -> Dict[str, FishAudioProviderConfig]:
+        """Hydrate every enabled Fish Audio TTS provider from YAML or env."""
+        providers = getattr(self.config, "providers", {}) or {}
+        candidates: Dict[str, Any] = {}
+        if isinstance(providers, dict):
+            for name, provider in providers.items():
+                if not isinstance(provider, (dict, FishAudioProviderConfig)):
+                    continue
+                provider_type = (
+                    str(provider.get("type") or "").strip().lower()
+                    if isinstance(provider, dict)
+                    else "fishaudio"
+                )
+                try:
+                    role = _extract_role(str(name))
+                except Exception:
+                    role = None
+                if str(name) in {"fishaudio", "fishaudio_tts"} or (
+                    role == "tts" and provider_type == "fishaudio"
+                ):
+                    component_key = (
+                        "fishaudio_tts" if str(name) == "fishaudio" else str(name)
+                    )
+                    candidates[component_key] = provider
+
+        if not candidates:
+            api_key = os.getenv("FISH_AUDIO_API_KEY")
+            reference_id = os.getenv("FISH_AUDIO_REFERENCE_ID")
+            if api_key and reference_id:
+                return {
+                    "fishaudio_tts": FishAudioProviderConfig(
+                        api_key=api_key,
+                        reference_id=reference_id,
+                    )
+                }
+            return {}
+
+        hydrated: Dict[str, FishAudioProviderConfig] = {}
+        for component_key, raw_config in candidates.items():
+            if isinstance(raw_config, FishAudioProviderConfig):
+                payload = raw_config.model_dump()
+            else:
+                if raw_config.get("enabled") is False:
+                    logger.debug(
+                        "Fish Audio TTS adapter disabled by provider configuration",
+                        component=component_key,
+                    )
+                    continue
+                payload = dict(raw_config)
+            try:
+                known_fields = set(FishAudioProviderConfig.model_fields.keys())
+                filtered = {}
+                for key, value in payload.items():
+                    if key not in known_fields:
+                        continue
+                    if isinstance(value, str) and value == "":
+                        continue
+                    filtered[key] = value
+                filtered["api_key"] = resolve_secret_value(
+                    payload,
+                    file_field="api_key_file",
+                    env_field="api_key_env",
+                    inline_field="api_key",
+                    legacy_env_names=("FISH_AUDIO_API_KEY",),
+                )
+                config = FishAudioProviderConfig(**filtered)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to hydrate Fish Audio provider config for pipelines",
+                    component=component_key,
+                    error=str(exc),
+                )
+                continue
+
+            if not config.enabled:
+                continue
+            if not config.api_key:
+                logger.warning(
+                    "Fish Audio TTS adapter requires a configured API key",
+                    component=component_key,
+                )
+                continue
+            if not str(config.reference_id or "").strip():
+                logger.warning(
+                    "Fish Audio TTS adapter requires a reference_id voice model",
+                    component=component_key,
+                )
+                continue
+            hydrated[component_key] = config
+
+        return hydrated
+
     def _hydrate_cambai_config(self) -> Optional[CambAiProviderConfig]:
         """Hydrate CAMB AI provider config from YAML or env."""
         providers = getattr(self.config, "providers", {}) or {}
@@ -1160,63 +1542,99 @@ class PipelineOrchestrator:
 
         return config
 
-    def _hydrate_openai_config(self) -> Optional[OpenAIProviderConfig]:
-        providers = getattr(self.config, "providers", {}) or {}
-        merged: Dict[str, Any] = {}
+    def _hydrate_openai_config(
+        self,
+        raw_config: Any,
+        *,
+        component_key: str,
+        base_config: Optional[Dict[str, Any]] = None,
+    ) -> Optional[OpenAIProviderConfig]:
+        if isinstance(raw_config, dict) and not raw_config.get("enabled", True):
+            logger.debug("OpenAI pipeline component disabled", component=component_key)
+            return None
 
-        # Base OpenAI config (optional)
-        raw_base = providers.get("openai")
-        if isinstance(raw_base, dict):
-            merged.update(raw_base)
-        elif isinstance(raw_base, OpenAIProviderConfig):
-            merged.update(raw_base.model_dump())
-
-        # Prefer explicit modular OpenAI provider blocks when present.
-        for key in ("openai_llm", "openai_stt", "openai_tts"):
-            raw = providers.get(key)
-            if isinstance(raw, dict):
-                merged.update(raw)
-            elif isinstance(raw, OpenAIProviderConfig):
-                merged.update(raw.model_dump())
-
-        # Backward-compatible fallback: accept any openai_* provider entries but skip realtime agent.
-        if not merged:
-            for name, cfg in providers.items():
-                try:
-                    lower = str(name).lower()
-                except Exception:
-                    lower = ""
-                if "realtime" in lower:
-                    continue
-                if not lower.startswith("openai_"):
-                    continue
-                if isinstance(cfg, dict):
-                    merged.update(cfg)
-                elif isinstance(cfg, OpenAIProviderConfig):
-                    merged.update(cfg.model_dump())
+        merged: Dict[str, Any] = dict(base_config or {})
+        if isinstance(raw_config, dict):
+            merged.update(raw_config)
+        elif isinstance(raw_config, OpenAIProviderConfig):
+            merged.update(raw_config.model_dump())
+        elif raw_config is not None:
+            logger.warning(
+                "Unsupported OpenAI provider config type for pipelines",
+                component=component_key,
+                config_type=type(raw_config).__name__,
+            )
+            return None
 
         if not merged:
             return None
+
+        provider_prefix = _extract_provider(component_key) or "openai"
+        merged["api_key"] = resolve_secret_value(
+            merged,
+            file_field="api_key_file",
+            env_field="api_key_env",
+            inline_field="api_key",
+            legacy_env_names=(f"{provider_prefix.upper()}_API_KEY",),
+        )
 
         try:
             config = OpenAIProviderConfig(**merged)
         except Exception as exc:
             logger.warning(
                 "Failed to hydrate OpenAI provider config for pipelines",
+                component=component_key,
                 error=str(exc),
             )
             return None
 
         if not config.api_key:
-            logger.warning("OpenAI pipeline adapters require an API key; falling back to placeholder adapters")
+            logger.warning(
+                "OpenAI pipeline component requires an API key; using placeholder adapter",
+                component=component_key,
+            )
             return None
-
         return config
+
+    def _hydrate_openai_component_configs(self) -> Dict[str, OpenAIProviderConfig]:
+        """Hydrate OpenAI STT/LLM/TTS without merging role-specific settings."""
+        providers = getattr(self.config, "providers", {}) or {}
+        raw_base = providers.get("openai")
+        base: Dict[str, Any] = {}
+        if isinstance(raw_base, dict):
+            if raw_base.get("enabled", True):
+                base.update(raw_base)
+        elif isinstance(raw_base, OpenAIProviderConfig):
+            base.update(raw_base.model_dump())
+
+        configs: Dict[str, OpenAIProviderConfig] = {}
+        for role in ("stt", "llm", "tts"):
+            key = f"openai_{role}"
+            if key in providers:
+                config = self._hydrate_openai_config(
+                    providers.get(key), component_key=key, base_config=base
+                )
+            else:
+                config = self._hydrate_openai_config(
+                    raw_base, component_key=key
+                )
+            if config is not None:
+                configs[key] = config
+        return configs
 
     def _hydrate_telnyx_llm_config(self) -> Optional[TelnyxLLMProviderConfig]:
         providers = getattr(self.config, "providers", {}) or {}
-        raw = providers.get("telnyx_llm") or providers.get("telenyx_llm") or providers.get("telnyx")
+        raw = (
+            providers.get("telnyx_llm")
+            or providers.get("telenyx_llm")
+            or providers.get("telnyx")
+            or providers.get("telenyx")
+        )
         merged: Dict[str, Any] = {}
+
+        if isinstance(raw, dict) and raw.get("enabled") is False:
+            logger.debug("Telnyx LLM adapter disabled by provider configuration")
+            return None
 
         if isinstance(raw, TelnyxLLMProviderConfig):
             merged.update(raw.model_dump())
@@ -1242,6 +1660,13 @@ class PipelineOrchestrator:
             return None
 
         merged.setdefault("chat_base_url", "https://api.telnyx.com/v2/ai")
+        merged["api_key"] = resolve_secret_value(
+            merged,
+            file_field="api_key_file",
+            env_field="api_key_env",
+            inline_field="api_key",
+            legacy_env_names=("TELNYX_API_KEY",),
+        )
 
         try:
             config = TelnyxLLMProviderConfig(**merged)
@@ -1262,6 +1687,10 @@ class PipelineOrchestrator:
         providers = getattr(self.config, "providers", {}) or {}
         raw = providers.get("minimax_llm") or providers.get("minimax")
         merged: Dict[str, Any] = {}
+
+        if isinstance(raw, dict) and raw.get("enabled") is False:
+            logger.debug("MiniMax LLM adapter disabled by provider configuration")
+            return None
 
         if isinstance(raw, MiniMaxLLMProviderConfig):
             merged.update(raw.model_dump())
@@ -1285,6 +1714,13 @@ class PipelineOrchestrator:
             return None
 
         merged.setdefault("chat_base_url", "https://api.minimax.io/v1")
+        merged["api_key"] = resolve_secret_value(
+            merged,
+            file_field="api_key_file",
+            env_field="api_key_env",
+            inline_field="api_key",
+            legacy_env_names=("MINIMAX_API_KEY",),
+        )
 
         try:
             config = MiniMaxLLMProviderConfig(**merged)

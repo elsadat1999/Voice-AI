@@ -23,7 +23,11 @@ from urllib.parse import urlparse
 import aiohttp
 import websockets
 
-from ..audio import convert_pcm16le_to_target_format, resample_audio
+from ..audio import (
+    convert_pcm16le_to_target_format,
+    resample_audio,
+    resolve_output_resampler_policy,
+)
 from ..config import AppConfig, OpenAIProviderConfig
 from ..logging_config import get_logger
 from .base import LLMComponent, STTComponent, TTSComponent, LLMResponse
@@ -459,9 +463,10 @@ class OpenAILLMAdapter(LLMComponent):
         # Do not gate tools by provider-level flags; contexts are the source of truth for tool availability.
         tools_list = merged.get("tools")
         tool_schemas = []
+        call_tool_registry = self.tool_registry_or(tool_registry)
         if tools_list and isinstance(tools_list, list):
             for tool_name in tools_list:
-                tool = tool_registry.get(tool_name)
+                tool = call_tool_registry.get(tool_name)
                 if tool:
                     try:
                         from src.tools.base import ToolPhase
@@ -679,10 +684,10 @@ class OpenAILLMAdapter(LLMComponent):
         # Include tools in streaming request so the LLM can return tool calls
         tools_list = merged.get("tools")
         tool_schemas = []
+        call_tool_registry = self.tool_registry_or(tool_registry)
         if tools_list and isinstance(tools_list, list):
-            from src.tools.registry import tool_registry
             for tool_name in tools_list:
-                tool = tool_registry.get(tool_name)
+                tool = call_tool_registry.get(tool_name)
                 if tool:
                     tool_schemas.append(tool.definition.to_openai_schema())
         if tool_schemas:
@@ -898,6 +903,12 @@ class OpenAILLMAdapter(LLMComponent):
 class OpenAITTSAdapter(TTSComponent):
     """# Milestone7: OpenAI TTS adapter calling the audio.speech REST API."""
 
+    wideband_output_format = {
+        "encoding": "linear16",
+        "sample_rate": 16000,
+        "options": {"response_format": "pcm"},
+    }
+
     def __init__(
         self,
         component_key: str,
@@ -1075,6 +1086,7 @@ class OpenAITTSAdapter(TTSComponent):
             source_rate,
             merged["target_format"]["encoding"],
             merged["target_format"]["sample_rate"],
+            merged["output_resampler"],
         )
 
         logger.info(
@@ -1150,7 +1162,16 @@ class OpenAITTSAdapter(TTSComponent):
             ),
             "source_format": merged_source,
             "target_format": merged_target,
+            "output_resampler": runtime_options.get(
+                "output_resampler",
+                self._pipeline_defaults.get(
+                    "output_resampler", self._provider_defaults.output_resampler
+                ),
+            ),
         }
+        merged["output_resampler"] = resolve_output_resampler_policy(
+            provider_mode=merged.get("output_resampler")
+        )[0]
         return merged
 
     @staticmethod
@@ -1203,11 +1224,17 @@ class OpenAITTSAdapter(TTSComponent):
         source_rate: int,
         target_encoding: str,
         target_rate: int,
+        output_resampler: str = "linear",
     ) -> bytes:
         if not pcm_bytes:
             return b""
         if int(source_rate) != int(target_rate):
-            pcm_bytes, _ = resample_audio(pcm_bytes, int(source_rate), int(target_rate))
+            pcm_bytes, _ = resample_audio(
+                pcm_bytes,
+                int(source_rate),
+                int(target_rate),
+                mode=output_resampler,
+            )
         return convert_pcm16le_to_target_format(pcm_bytes, target_encoding)
 
 

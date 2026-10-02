@@ -379,6 +379,47 @@ class TestSanitizerPreservesData:
         # message should still be present
         assert "message" in sanitized
 
+    def test_check_extension_status_keeps_only_public_fields(self):
+        """check_extension_status should return a compact provider-agnostic payload."""
+        tool_result = {
+            "status": "success",
+            "target": "6000",
+            "extension": "6000",
+            "device_state_name": "SIP/6000",
+            "device_state": "INUSE",
+            "available": True,
+            "availability_source": "endpoint_state",
+            "endpoint_state": "online",
+            "tech": "SIP",
+            "resolution_source": "config.device_state_tech",
+            "extension_resolution_source": "config.key",
+            "device_state_id": "SIP/6000",
+            "destination_key": "support",
+            "destination_target": "6000",
+            "destination_type": "extension",
+            "state": "INUSE",
+        }
+
+        sanitized = sanitize_tool_result_for_json_string(tool_result, tool_name="check_extension_status")
+
+        assert sanitized["status"] == "success"
+        assert sanitized["target"] == "6000"
+        assert sanitized["extension"] == "6000"
+        assert sanitized["device_state_name"] == "SIP/6000"
+        assert sanitized["device_state"] == "INUSE"
+        assert sanitized["available"] is True
+        assert sanitized["availability_source"] == "endpoint_state"
+        assert sanitized["endpoint_state"] == "online"
+        assert sanitized["tech"] == "SIP"
+
+        assert "resolution_source" not in sanitized
+        assert "extension_resolution_source" not in sanitized
+        assert "device_state_id" not in sanitized
+        assert "destination_key" not in sanitized
+        assert "destination_target" not in sanitized
+        assert "destination_type" not in sanitized
+        assert "state" not in sanitized
+
     def test_multibyte_message_truncated_within_budget(self):
         """Multibyte text in message must not exceed max_bytes after truncation."""
         # Each emoji is 4 bytes in UTF-8
@@ -390,3 +431,98 @@ class TestSanitizerPreservesData:
         sanitized = sanitize_tool_result_for_json_string(tool_result, max_bytes=max_bytes)
         encoded = json.dumps(sanitized, ensure_ascii=False)
         assert len(encoded.encode("utf-8")) <= max_bytes
+
+
+class TestSanitizerPreservesCalendarResults:
+    @pytest.mark.parametrize("tool_name", ["google_calendar", "microsoft_calendar"])
+    def test_list_events_keeps_structured_events_for_all_calendar_tools(self, tool_name):
+        """Both calendar integrations retain public events and filter internal fields."""
+        events = [
+            {
+                "id": "event-1",
+                "summary": "Customer appointment",
+                "start": "2026-09-20T09:00:00-07:00",
+                "end": "2026-09-20T09:30:00-07:00",
+                "calendar": "default",
+                "attendees": [{"email": "private@example.com"}],
+                "internal_secret": "must not reach the provider",
+            }
+        ]
+        sanitized = sanitize_tool_result_for_json_string(
+            {
+                "status": "success",
+                "message": "Events listed.",
+                "events": events,
+                "internal_debug": "must not reach the provider",
+            },
+            tool_name=tool_name,
+        )
+
+        assert sanitized["events"] == [
+            {
+                "id": "event-1",
+                "summary": "Customer appointment",
+                "start": "2026-09-20T09:00:00-07:00",
+                "end": "2026-09-20T09:30:00-07:00",
+                "calendar": "default",
+            }
+        ]
+        assert "attendees" not in sanitized["events"][0]
+        assert "internal_secret" not in sanitized["events"][0]
+        assert sanitized["total_events"] == 1
+        assert sanitized["events_returned"] == 1
+        assert sanitized["events_truncated"] is False
+        assert "internal_debug" not in sanitized
+
+    def test_large_event_list_is_truncated_but_not_discarded(self):
+        """Oversized event lists keep a useful prefix and truthful count metadata."""
+        events = [
+            {
+                "id": f"event-{idx}",
+                "summary": f"Appointment {idx} " + ("x" * 120),
+                "start": f"2026-09-20T{idx % 24:02d}:00:00-07:00",
+                "end": f"2026-09-20T{idx % 24:02d}:30:00-07:00",
+                "calendar": "default",
+            }
+            for idx in range(40)
+        ]
+
+        sanitized = sanitize_tool_result_for_json_string(
+            {"status": "success", "message": "Events listed.", "events": events},
+            tool_name="google_calendar",
+            max_bytes=1800,
+        )
+
+        encoded = json.dumps(sanitized, ensure_ascii=False).encode("utf-8")
+        assert len(encoded) <= 1800
+        assert 0 < len(sanitized["events"]) < len(events)
+        assert sanitized["events"][0]["id"] == "event-0"
+        assert sanitized["total_events"] == len(events)
+        assert sanitized["events_returned"] == len(sanitized["events"])
+        assert sanitized["events_truncated"] is True
+
+    def test_free_slots_keeps_paired_structured_times(self):
+        """Free-slot start/end pairs and availability mode survive sanitization."""
+        sanitized = sanitize_tool_result_for_json_string(
+            {
+                "status": "success",
+                "message": "Free slots found.",
+                "slots": ["2026-09-20T09:00:00-07:00"],
+                "slots_with_end": [
+                    {
+                        "start": "2026-09-20T09:00:00-07:00",
+                        "end": "2026-09-20T09:30:00-07:00",
+                    }
+                ],
+                "slot_duration_minutes": 30,
+                "calendar_timezone": "America/Los_Angeles",
+                "availability_mode": "freebusy",
+                "total_slots_available": 1,
+                "slots_truncated": False,
+            },
+            tool_name="google_calendar",
+        )
+
+        assert sanitized["slots"] == ["2026-09-20T09:00:00-07:00"]
+        assert sanitized["slots_with_end"][0]["end"] == "2026-09-20T09:30:00-07:00"
+        assert sanitized["availability_mode"] == "freebusy"

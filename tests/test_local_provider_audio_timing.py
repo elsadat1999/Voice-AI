@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -24,6 +25,16 @@ class _FakeWebSocket:
 
     async def send(self, message):
         self.sent.append(message)
+
+
+class _ClosableFakeWebSocket(_FakeWebSocket):
+    def __init__(self, messages=()):
+        super().__init__(messages)
+        self.closed = False
+
+    async def close(self):
+        self.closed = True
+        self.state = type("State", (), {"name": "CLOSED"})()
 
 
 class _GatewayFakeWebSocket(_FakeWebSocket):
@@ -79,6 +90,93 @@ class _BargeAckFakeWebSocket(_FakeWebSocket):
 
 
 @pytest.mark.asyncio
+async def test_stop_session_cancels_server_work_on_persistent_websocket():
+    provider = LocalProvider(LocalProviderConfig(), on_event=None)
+    provider._active_call_id = "call-stop"
+    provider.websocket = _FakeWebSocket([])
+
+    await provider.stop_session()
+
+    payloads = [json.loads(message) for message in provider.websocket.sent]
+    cancel = next(payload for payload in payloads if payload.get("type") == "barge_in")
+    assert cancel["call_id"] == "call-stop"
+    assert cancel["reason"] == "stop_session"
+    assert cancel["request_id"].startswith("stop-")
+
+
+@pytest.mark.asyncio
+async def test_close_releases_call_owned_websocket_and_background_tasks():
+    provider = LocalProvider(LocalProviderConfig(), on_event=None)
+    provider._active_call_id = "call-close"
+    websocket = _ClosableFakeWebSocket()
+    provider.websocket = websocket
+
+    async def _idle():
+        await asyncio.Event().wait()
+
+    listener = asyncio.create_task(_idle())
+    sender = asyncio.create_task(_idle())
+    reconnect = asyncio.create_task(_idle())
+    provider._listener_task = listener
+    provider._sender_task = sender
+    provider._background_reconnect_task = reconnect
+
+    await provider.close()
+
+    assert websocket.closed is True
+    assert provider.websocket is None
+    assert provider._active_call_id is None
+    assert listener.cancelled()
+    assert sender.cancelled()
+    assert reconnect.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_close_releases_all_shared_future_waiters_without_cancelling_tasks():
+    provider = LocalProvider(
+        LocalProviderConfig(response_timeout_sec=10),
+        on_event=None,
+    )
+    provider._active_call_id = "call-close-waiters"
+    provider.websocket = _ClosableFakeWebSocket()
+
+    waiters = [
+        asyncio.create_task(provider._request_status(timeout_sec=10)),
+        asyncio.create_task(
+            provider._request_llm_text(
+                text="repair",
+                call_id="call-close-waiters",
+                timeout_sec=10,
+            )
+        ),
+        asyncio.create_task(
+            provider._apply_system_prompt(
+                "prompt",
+                call_id="call-close-waiters",
+            )
+        ),
+        asyncio.create_task(provider.text_to_speech("close waiter test")),
+    ]
+    for _ in range(200):
+        if (
+            provider._pending_status_future is not None
+            and provider._pending_switch_future is not None
+            and provider._pending_llm_responses
+            and provider._pending_tts_responses
+        ):
+            break
+        await asyncio.sleep(0)
+    else:
+        raise AssertionError("provider did not register every shared-future waiter")
+
+    await provider.close()
+    results = await asyncio.gather(*waiters)
+
+    assert results == [None, None, False, None]
+    assert all(task.cancelled() is False for task in waiters)
+
+
+@pytest.mark.asyncio
 async def test_binary_audio_emits_metadata_and_delayed_done():
     events = []
 
@@ -93,6 +191,8 @@ async def test_binary_audio_emits_metadata_and_delayed_done():
                 {
                     "type": "tts_audio",
                     "call_id": "call-1",
+                    "mode": "tool_result",
+                    "request_id": "tool-result-1",
                     "encoding": "mulaw",
                     "sample_rate_hz": 8000,
                     "byte_length": 800,
@@ -108,6 +208,7 @@ async def test_binary_audio_emits_metadata_and_delayed_done():
     done_events = [e for e in events if e.get("type") == "AgentAudioDone"]
     assert len(agent_events) == 1
     assert agent_events[0]["encoding"] == "mulaw"
+    assert agent_events[0]["source_mode"] == "tool_result"
     assert agent_events[0]["sample_rate"] == 8000
     assert done_events == []
 
@@ -115,6 +216,60 @@ async def test_binary_audio_emits_metadata_and_delayed_done():
     done_events = [e for e in events if e.get("type") == "AgentAudioDone"]
     assert len(done_events) == 1
     await provider.clear_active_call_id()
+
+
+@pytest.mark.asyncio
+async def test_late_binary_audio_is_not_reassigned_to_next_call():
+    events = []
+
+    async def on_event(event):
+        events.append(event)
+
+    provider = LocalProvider(LocalProviderConfig(), on_event=on_event)
+    provider._active_call_id = "call-new"
+    provider.websocket = _FakeWebSocket(
+        [
+            json.dumps({
+                "type": "tts_audio",
+                "call_id": "call-old",
+                "request_id": "old-audio",
+                "encoding": "mulaw",
+                "sample_rate_hz": 8000,
+            }),
+            b"\x00" * 160,
+        ]
+    )
+
+    await provider._receive_loop()
+
+    assert [event for event in events if event.get("type") == "AgentAudio"] == []
+
+    await provider.clear_active_call_id()
+
+
+@pytest.mark.asyncio
+async def test_send_tool_result_has_correlatable_audio_request_id():
+    provider = LocalProvider(LocalProviderConfig(), on_event=None)
+    provider._active_call_id = "call-tool-result"
+    provider.websocket = _FakeWebSocket([])
+
+    assert await provider.send_tool_result(
+        "generated-local-invocation-1",
+        {
+            "status": "success",
+            "farewell_message": "Thanks for calling. Goodbye!",
+            "will_hangup": True,
+        },
+        call_id="call-tool-result",
+        tool_name="hangup_call",
+    )
+
+    payload = json.loads(provider.websocket.sent[-1])
+    assert payload["type"] == "tool_result"
+    assert payload["call_id"] == "call-tool-result"
+    assert payload["function_call_id"] == "generated-local-invocation-1"
+    assert payload["tool_name"] == "hangup_call"
+    assert payload["request_id"].startswith("tool-result-")
 
 
 @pytest.mark.asyncio
@@ -155,7 +310,7 @@ async def test_tts_response_uses_payload_audio_format():
 
 
 @pytest.mark.asyncio
-async def test_binary_audio_defaults_to_mulaw_when_metadata_missing():
+async def test_binary_audio_without_metadata_is_dropped():
     events = []
 
     async def on_event(event):
@@ -170,10 +325,8 @@ async def test_binary_audio_defaults_to_mulaw_when_metadata_missing():
 
     agent_events = [e for e in events if e.get("type") == "AgentAudio"]
     done_events = [e for e in events if e.get("type") == "AgentAudioDone"]
-    assert len(agent_events) == 1
-    assert agent_events[0]["encoding"] == "mulaw"
-    assert agent_events[0]["sample_rate"] == 8000
-    assert len(done_events) == 1
+    assert agent_events == []
+    assert done_events == []
     await provider.clear_active_call_id()
 
 
@@ -266,6 +419,52 @@ def test_local_tool_policy_can_be_overridden_in_config():
 
 
 @pytest.mark.asyncio
+async def test_full_local_fails_closed_when_server_cannot_accept_custom_markers():
+    provider = LocalProvider(LocalProviderConfig(mode="full"), on_event=None)
+    provider._request_status = AsyncMock(return_value={"capabilities": {}})
+    provider._apply_system_prompt = AsyncMock(return_value=True)
+    provider._send_tool_context = AsyncMock(return_value=True)
+
+    with pytest.raises(RuntimeError, match="call-scoped hangup markers"):
+        await provider._prime_runtime_status_and_context(
+            context={
+                "prompt": "p",
+                "hangup_policy": {
+                    "markers": {"end_call": ["goodbye", "да", "нет"]}
+                },
+                "hangup_marker_source": "agent_extend",
+            },
+            call_id="call-old-server",
+        )
+
+
+@pytest.mark.asyncio
+async def test_tool_context_sends_effective_call_scoped_markers():
+    provider = LocalProvider(LocalProviderConfig(mode="full"), on_event=None)
+    provider.websocket = _FakeWebSocket([])
+    provider._allowed_tools = {"hangup_call"}
+    provider._hangup_policy = {
+        "mode": "normal",
+        "enforce_transcript_offer": True,
+        "block_during_contact_capture": True,
+        "markers": {
+            "end_call": ["да", "нет"],
+            "assistant_farewell": ["goodbye"],
+            "affirmative": ["yes"],
+            "negative": ["no"],
+        },
+    }
+    provider._hangup_marker_source = "agent_replace"
+    provider._hangup_marker_digest = "0123456789abcdef"
+
+    assert await provider._send_tool_context(call_id="call-russian") is True
+    payload = json.loads(provider.websocket.sent[-1])
+    assert payload["hangup_policy"]["markers"]["end_call"] == ["да", "нет"]
+    assert payload["hangup_marker_source"] == "agent_replace"
+    assert payload["hangup_marker_digest"] == "0123456789abcdef"
+
+
+@pytest.mark.asyncio
 async def test_full_local_uses_structured_tool_gateway_for_tool_events():
     events = []
 
@@ -298,6 +497,32 @@ async def test_full_local_uses_structured_tool_gateway_for_tool_events():
     assert tool_events[0]["tool_calls"][0]["name"] == "hangup_call"
     transcript_events = [e for e in events if e.get("type") == "agent_transcript"]
     assert transcript_events
+
+
+@pytest.mark.asyncio
+async def test_terminal_tool_result_does_not_duplicate_farewell_transcript():
+    events = []
+
+    async def on_event(event):
+        events.append(event)
+
+    provider = LocalProvider(LocalProviderConfig(), on_event=on_event)
+    provider._active_call_id = "call-terminal"
+    provider.websocket = _FakeWebSocket([
+        json.dumps({
+            "type": "llm_response",
+            "call_id": "call-terminal",
+            "text": "Goodbye.",
+            "request_id": "tool-result-1",
+            "tool_result_final": True,
+            "tool_gateway_done": True,
+            "tool_path": "terminal_farewell",
+        }),
+    ])
+
+    await provider._receive_loop()
+
+    assert [e for e in events if e.get("type") == "agent_transcript"] == []
 
 
 @pytest.mark.asyncio
@@ -342,7 +567,9 @@ async def test_notify_barge_in_ack_roundtrip():
     provider._active_call_id = "call-barge-ack"
     provider.websocket = _BargeAckFakeWebSocket([])
 
-    await provider.notify_barge_in("call-barge-ack")
+    await provider.notify_barge_in(
+        "call-barge-ack", rollback_assistant=True
+    )
     await provider._receive_loop()
     await asyncio.sleep(0.05)
 
@@ -350,6 +577,8 @@ async def test_notify_barge_in_ack_roundtrip():
     barge_payloads = [payload for payload in sent_payloads if payload.get("type") == "barge_in"]
     assert len(barge_payloads) == 1
     assert barge_payloads[0].get("request_id")
+    assert barge_payloads[0]["protocol_version"] == 2
+    assert barge_payloads[0]["rollback_assistant"] is True
     assert provider._pending_barge_in_acks == {}
 
 
