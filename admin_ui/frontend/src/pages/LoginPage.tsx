@@ -32,13 +32,13 @@ const LoginPage: React.FC = () => {
         <div className="min-h-screen flex items-center justify-center bg-background p-4">
             <div className="w-full max-w-md space-y-8 bg-card p-8 rounded-lg border border-border shadow-lg">
                 <div className="text-center">
-                    <div className="flex items-center justify-center mb-4">
+                    <div className="flex flex-col items-center justify-center mb-4">
                         <img
-                            src="/mascot_transparent.png"
-                            alt="AVA Mascot"
-                            className="w-24 h-auto relative z-10 -mr-6"
+                            src="/logo.svg"
+                            alt="voice-ai"
+                            className="w-16 h-16 mb-2 rounded-2xl shadow-md"
                         />
-                        <h2 className="text-3xl font-bold text-foreground relative z-0">Asterisk AI Voice Agent</h2>
+                        <h2 className="text-3xl font-bold text-foreground">voice-ai</h2>
                     </div>
                     <p className="mt-2 text-sm text-muted-foreground">
                         Sign in to manage your AI Voice Agent
