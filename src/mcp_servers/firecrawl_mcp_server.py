@@ -13,6 +13,24 @@ FIRECRAWL_API_URL = os.environ.get(
 ).rstrip("/")
 FIRECRAWL_API_KEY = os.environ.get("FIRECRAWL_API_KEY", "").strip()
 
+# Optional list of comma-separated domains allowed (e.g., "example.com,nassaqapp.com")
+# If empty, all domains are allowed.
+ALLOWED_DOMAINS = [
+    d.strip().lower() for d in os.environ.get("ALLOWED_DOMAINS", "").split(",") if d.strip()
+]
+
+
+def is_domain_allowed(url_or_domain: str) -> bool:
+    """Check if the given URL belongs to the allowed domains list."""
+    if not ALLOWED_DOMAINS:
+        return True
+    from urllib.parse import urlparse
+
+    raw = url_or_domain if "://" in url_or_domain else f"https://{url_or_domain}"
+    parsed = urlparse(raw)
+    host = (parsed.netloc or "").lower().split(":")[0]
+    return any(host == allowed or host.endswith("." + allowed) for allowed in ALLOWED_DOMAINS)
+
 
 def send_response(req_id: Any, result: Any) -> None:
     """Send JSON-RPC 2.0 response via newline-delimited JSON."""
@@ -39,6 +57,13 @@ def _make_request(endpoint: str, payload: Dict[str, Any], timeout: int = 15) -> 
 
 def scrape_url(url: str, max_chars: int = 1500) -> Tuple[str, str]:
     """Scrape a URL and return a markdown excerpt and spoken summary."""
+    if not is_domain_allowed(url):
+        allowed_str = ", ".join(ALLOWED_DOMAINS)
+        return (
+            f"Access restricted: Scraping is only allowed for domain(s): {allowed_str}",
+            f"Sorry, I am only authorized to access content from {allowed_str}.",
+        )
+
     if not url.startswith("http://") and not url.startswith("https://"):
         url = f"https://{url}"
 
@@ -81,6 +106,10 @@ def scrape_url(url: str, max_chars: int = 1500) -> Tuple[str, str]:
 
 def search_web(query: str, limit: int = 3) -> Tuple[str, str]:
     """Search web using Firecrawl search API and return top results."""
+    # Scope search strictly to allowed domain if configured
+    if ALLOWED_DOMAINS and "site:" not in query.lower():
+        query = f"site:{ALLOWED_DOMAINS[0]} {query}"
+
     payload = {
         "query": query,
         "limit": limit,
@@ -97,6 +126,10 @@ def search_web(query: str, limit: int = 3) -> Tuple[str, str]:
     results = data.get("data", [])
     if not results and isinstance(data, list):
         results = data
+
+    # Filter results by allowed domains if configured
+    if ALLOWED_DOMAINS:
+        results = [r for r in results if is_domain_allowed(r.get("url", ""))]
 
     if not results:
         msg = f"No search results found for: {query}"
