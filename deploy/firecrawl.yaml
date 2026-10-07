@@ -1,0 +1,302 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: firecrawl-config
+  namespace: voice-ai
+data:
+  HOST: "0.0.0.0"
+  PORT: "3002"
+  REDIS_URL: "redis://firecrawl-redis:6379"
+  REDIS_RATE_LIMIT_URL: "redis://firecrawl-redis:6379"
+  PLAYWRIGHT_MICROSERVICE_URL: "http://firecrawl-playwright:3000"
+  USE_DB_AUTHENTICATION: "false"
+  ENV: "production"
+  LOGGING_LEVEL: "INFO"
+  IS_KUBERNETES: "true"
+  NUQ_DATABASE_URL: "postgresql://postgres:password@firecrawl-postgres:5432/postgres"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: firecrawl-secret
+  namespace: voice-ai
+type: Opaque
+stringData:
+  OPENAI_API_KEY: ""
+  SLACK_WEBHOOK_URL: ""
+  LLAMAPARSE_API_KEY: ""
+  BULL_AUTH_KEY: ""
+  TEST_API_KEY: ""
+  REDIS_PASSWORD: ""
+---
+# 1. Redis Service & Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: firecrawl-redis
+  namespace: voice-ai
+  labels:
+    app: firecrawl-redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: firecrawl-redis
+  template:
+    metadata:
+      labels:
+        app: firecrawl-redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:alpine
+          ports:
+            - containerPort: 6379
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: firecrawl-redis
+  namespace: voice-ai
+spec:
+  selector:
+    app: firecrawl-redis
+  ports:
+    - protocol: TCP
+      port: 6379
+      targetPort: 6379
+---
+# 2. NUQ Postgres Service & Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: firecrawl-postgres
+  namespace: voice-ai
+  labels:
+    app: firecrawl-postgres
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: firecrawl-postgres
+  template:
+    metadata:
+      labels:
+        app: firecrawl-postgres
+    spec:
+      containers:
+        - name: postgres
+          image: ghcr.io/firecrawl/nuq-postgres:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POSTGRES_USER
+              value: "postgres"
+            - name: POSTGRES_PASSWORD
+              value: "password"
+            - name: POSTGRES_DB
+              value: "postgres"
+          ports:
+            - containerPort: 5432
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "1Gi"
+              cpu: "500m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: firecrawl-postgres
+  namespace: voice-ai
+spec:
+  selector:
+    app: firecrawl-postgres
+  ports:
+    - protocol: TCP
+      port: 5432
+      targetPort: 5432
+---
+# 3. Playwright Service & Deployment
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: firecrawl-playwright-config
+  namespace: voice-ai
+data:
+  PORT: "3000"
+  ALLOW_LOCAL_WEBHOOKS: "false"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: firecrawl-playwright
+  namespace: voice-ai
+  labels:
+    app: firecrawl-playwright
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: firecrawl-playwright
+  template:
+    metadata:
+      labels:
+        app: firecrawl-playwright
+    spec:
+      containers:
+        - name: playwright
+          image: ghcr.io/firecrawl/playwright-service:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3000
+          envFrom:
+            - configMapRef:
+                name: firecrawl-playwright-config
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "2Gi"
+              cpu: "1000m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: firecrawl-playwright
+  namespace: voice-ai
+spec:
+  selector:
+    app: firecrawl-playwright
+  ports:
+    - protocol: TCP
+      port: 3000
+      targetPort: 3000
+---
+# 4. Firecrawl API Service & Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: firecrawl-api
+  namespace: voice-ai
+  labels:
+    app: firecrawl-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: firecrawl-api
+  template:
+    metadata:
+      labels:
+        app: firecrawl-api
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: api
+          image: ghcr.io/firecrawl/firecrawl:latest
+          imagePullPolicy: IfNotPresent
+          command: ["node"]
+          args: ["--max-old-space-size=4096", "dist/src/index.js"]
+          ports:
+            - containerPort: 3002
+          env:
+            - name: FLY_PROCESS_GROUP
+              value: "app"
+            - name: PORT
+              value: "3002"
+          envFrom:
+            - configMapRef:
+                name: firecrawl-config
+            - secretRef:
+                name: firecrawl-secret
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "500m"
+            limits:
+              memory: "3Gi"
+              cpu: "1500m"
+          readinessProbe:
+            httpGet:
+              path: /v0/health/readiness
+              port: 3002
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /v0/health/liveness
+              port: 3002
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: firecrawl-service
+  namespace: voice-ai
+  labels:
+    app: firecrawl-api
+spec:
+  selector:
+    app: firecrawl-api
+  ports:
+    - protocol: TCP
+      port: 3002
+      targetPort: 3002
+---
+# 5. Firecrawl Worker Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: firecrawl-worker
+  namespace: voice-ai
+  labels:
+    app: firecrawl-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: firecrawl-worker
+  template:
+    metadata:
+      labels:
+        app: firecrawl-worker
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: worker
+          image: ghcr.io/firecrawl/firecrawl:latest
+          imagePullPolicy: IfNotPresent
+          command: ["node"]
+          args: ["--max-old-space-size=2048", "dist/src/services/queue-worker.js"]
+          env:
+            - name: FLY_PROCESS_GROUP
+              value: "worker"
+            - name: PORT
+              value: "3005"
+          envFrom:
+            - configMapRef:
+                name: firecrawl-config
+            - secretRef:
+                name: firecrawl-secret
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "2Gi"
+              cpu: "1000m"

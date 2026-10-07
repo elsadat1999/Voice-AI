@@ -959,8 +959,28 @@ tools:
   google_calendar:
     enabled: false
 mcp:
-  enabled: false
+  enabled: true
   servers:
+    firecrawl:
+      transport: stdio
+      command:
+        - python3
+        - '-m'
+        - src.mcp_servers.firecrawl_mcp_server
+      env:
+        FIRECRAWL_API_URL: "http://firecrawl-service:3002"
+        FIRECRAWL_API_KEY: ""
+      defaults:
+        timeout_ms: 20000
+        slow_response_threshold_ms: 2500
+        slow_response_message: "دعني أتحقق من ذلك على الإنترنت، لحظة واحدة..."
+      tools:
+        - name: scrape_url
+          expose_as: mcp_firecrawl_scrape
+          speech_field: spoken
+        - name: search_web
+          expose_as: mcp_firecrawl_search
+          speech_field: spoken
     weather:
       transport: stdio
       command:
