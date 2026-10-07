@@ -973,7 +973,7 @@ mcp:
       defaults:
         timeout_ms: 15000
         slow_response_threshold_ms: 1000
-        slow_response_message: "أبشر ثواني بس أشوف لك في المتجر..."
+        slow_response_message: "ثواني بشوف لك إيش موجود...|خلّك معي لحظات أشوف لك المتوفر...|أبشر من عيوني، ثواني وأتأكد لك إيش عندنا...|سمّ طال عمرك، ثواني أشوف لك التفاصيل..."
       tools:
         - name: scrape_url
           expose_as: mcp_firecrawl_scrape

@@ -90,7 +90,13 @@ class MCPTool(Tool):
 
     @property
     def slow_response_message(self) -> str:
-        return self._behavior.slow_response_message or ""
+        msg = self._behavior.slow_response_message or ""
+        if "|" in msg:
+            import random
+            choices = [m.strip() for m in msg.split("|") if m.strip()]
+            if choices:
+                return random.choice(choices)
+        return msg
 
     async def execute(self, parameters: Dict[str, Any], context: ToolExecutionContext) -> Dict[str, Any]:
         call_id = getattr(context, "call_id", None)
