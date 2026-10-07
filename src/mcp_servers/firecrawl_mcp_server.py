@@ -71,15 +71,17 @@ def clean_markdown_for_voice(text: str) -> str:
         return ""
     # 1. Strip markdown images: ![alt](url)
     text = re.sub(r'!\[.*?\]\(.*?\)', '', text)
-    # 2. Strip raw image/media URLs inside parens
-    text = re.sub(r'\(https?://[^\s)]+\.(?:jpg|jpeg|png|webp|svg|gif)[^\s)]*\)', '', text, flags=re.IGNORECASE)
+    # 2. Strip empty link brackets or image remnants: [](url)
+    text = re.sub(r'\[\s*\]\([^\)]+\)', '', text)
     # 3. Simplify markdown links [Text](url) to just Text
     text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
-    # 4. Remove empty brackets
+    # 4. Strip raw URLs inside parens
+    text = re.sub(r'\(https?://[^\s)]+\)', '', text)
+    # 5. Remove empty brackets
     text = re.sub(r'\[\s*\]|\(\s*\)', '', text)
-    # 5. Remove headers symbols (###)
+    # 6. Remove headers symbols (###)
     text = re.sub(r'#{1,6}\s*', '', text)
-    # 6. Normalize whitespace
+    # 7. Normalize whitespace
     return " ".join(text.split())
 
 
