@@ -970,6 +970,7 @@ mcp:
       env:
         FIRECRAWL_API_URL: "http://firecrawl-service:3002"
         FIRECRAWL_API_KEY: ""
+        ALLOWED_DOMAINS: "reefi.me"
       defaults:
         timeout_ms: 15000
         slow_response_threshold_ms: 1000

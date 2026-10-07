@@ -5,15 +5,17 @@ import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
-from typing import Any, Dict, Optional, Tuple
+import xml.etree.ElementTree as ET
+from typing import Any, Dict, List, Optional, Tuple
 
 FIRECRAWL_API_URL = os.environ.get(
     "FIRECRAWL_API_URL", "http://firecrawl-service.voice-ai.svc.cluster.local:3002"
 ).rstrip("/")
 FIRECRAWL_API_KEY = os.environ.get("FIRECRAWL_API_KEY", "").strip()
 
-# Optional list of comma-separated domains allowed (e.g., "example.com,nassaqapp.com")
+# Optional list of comma-separated domains allowed (defaults to reefi.me)
 def _normalize_domain(raw_val: str) -> str:
     raw_val = raw_val.strip().lower()
     if "://" in raw_val:
@@ -22,9 +24,12 @@ def _normalize_domain(raw_val: str) -> str:
     return raw_val.split("/")[0].split(":")[0]
 
 
+raw_allowed = os.environ.get("ALLOWED_DOMAINS", "reefi.me").strip()
 ALLOWED_DOMAINS = [
-    _normalize_domain(d) for d in os.environ.get("ALLOWED_DOMAINS", "").split(",") if d.strip()
+    _normalize_domain(d) for d in raw_allowed.split(",") if d.strip()
 ]
+if not ALLOWED_DOMAINS:
+    ALLOWED_DOMAINS = ["reefi.me"]
 
 
 def is_domain_allowed(url_or_domain: str) -> bool:
@@ -108,7 +113,7 @@ def _make_request(endpoint: str, payload: Dict[str, Any], timeout: int = 10) -> 
         return json.loads(resp.read().decode("utf-8"))
 
 
-def scrape_url(url: str, max_chars: int = 1200) -> Tuple[str, str]:
+def scrape_url(url: str, max_chars: int = 4000) -> Tuple[str, str]:
     """Scrape a URL and return a clean markdown excerpt and spoken summary with caching."""
     if not is_domain_allowed(url):
         allowed_str = ", ".join(ALLOWED_DOMAINS)
@@ -164,25 +169,91 @@ def scrape_url(url: str, max_chars: int = 1200) -> Tuple[str, str]:
     if len(cleaned_text) > max_chars:
         excerpt += "..."
 
-    spoken = f"From {title or url}: {excerpt[:250]}" if title else f"{excerpt[:250]}"
+    spoken = f"{title}: {excerpt[:350]}" if title else f"{excerpt[:350]}"
     res = (excerpt, spoken)
     put_in_cache(cache_key, res)
     return res
 
 
-def search_web(query: str, limit: int = 3) -> Tuple[str, str]:
-    """Search web using Firecrawl search API and return top results with caching."""
-    # Scope search strictly to allowed domain if configured
-    if ALLOWED_DOMAINS and "site:" not in query.lower():
-        query = f"site:{ALLOWED_DOMAINS[0]} {query}"
+# In-memory product directory for instant search and full specifications
+_PRODUCT_INDEX: List[Tuple[str, str]] = []
 
+
+def _load_product_index() -> None:
+    """Load all product URLs from reefi.me sitemap into memory for sub-millisecond search."""
+    global _PRODUCT_INDEX
+    try:
+        url = "https://reefi.me/sitemap_products.xml"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            root = ET.fromstring(resp.read())
+            prods = []
+            for elem in root.iter():
+                if elem.tag.endswith("loc") and elem.text and "/products/" in elem.text:
+                    u = elem.text.strip()
+                    slug = urllib.parse.unquote(u.split("/products/")[-1]).replace("-", " ")
+                    prods.append((slug, u))
+            if prods:
+                _PRODUCT_INDEX = prods
+    except Exception:
+        pass
+
+
+def find_best_product_url(query: str) -> Optional[Tuple[str, str]]:
+    """Match a product name or keywords against the in-memory product index."""
+    if not _PRODUCT_INDEX:
+        _load_product_index()
+    if not _PRODUCT_INDEX:
+        return None
+
+    q = re.sub(r"[^\w\s]", "", query).lower()
+    stop_words = {
+        "في", "من", "عن", "على", "كم", "وش", "ايش", "ما", "هو", "هي",
+        "مواصفات", "مميزات", "سعر", "اسعار", "تفاصيل", "طقم", "هل", "عندكم"
+    }
+    words = [w for w in q.split() if len(w) > 1 and w not in stop_words]
+    if not words:
+        words = [w for w in q.split() if len(w) > 1]
+    if not words:
+        return None
+
+    best_match = None
+    best_score = 0
+    for title, u in _PRODUCT_INDEX:
+        score = sum(1 for w in words if w in title.lower())
+        if score > best_score:
+            best_score = score
+            best_match = (title, u)
+
+    return best_match if best_score > 0 else None
+
+
+def search_web(query: str, limit: int = 3) -> Tuple[str, str]:
+    """Search products or content on reefi.me and return detailed specifications."""
     cache_key = f"search:{query}:{limit}"
     cached = get_from_cache(cache_key)
     if cached:
         return cached
 
+    # 1. Match against in-memory product catalog first for instant rich specifications
+    matched = find_best_product_url(query)
+    if matched:
+        prod_title, prod_url = matched
+        # Scrape full product specifications directly
+        excerpt, spoken_summary = scrape_url(prod_url, max_chars=4000)
+        full_text = f"المنتج: {prod_title}\nالرابط: {prod_url}\n\nالمواصفات والأسعار والمميزات:\n{excerpt}"
+        spoken = f"منتج {prod_title}: {spoken_summary[:300]}"
+        res = (full_text, spoken)
+        put_in_cache(cache_key, res)
+        return res
+
+    # 2. Fallback to Firecrawl search API scoped to allowed domain
+    search_q = query
+    if ALLOWED_DOMAINS and "site:" not in search_q.lower():
+        search_q = f"site:{ALLOWED_DOMAINS[0]} {search_q}"
+
     payload = {
-        "query": query,
+        "query": search_q,
         "limit": limit,
     }
 
@@ -198,13 +269,24 @@ def search_web(query: str, limit: int = 3) -> Tuple[str, str]:
     if not results and isinstance(data, list):
         results = data
 
-    # Filter results by allowed domains if configured
+    # Filter results by allowed domains
     if ALLOWED_DOMAINS:
         results = [r for r in results if is_domain_allowed(r.get("url", ""))]
 
     if not results:
-        msg = f"No search results found for: {query}"
+        msg = f"لم يتم العثور على نتائج لـ: {query}"
         res = (msg, msg)
+        put_in_cache(cache_key, res)
+        return res
+
+    # If top result is a product page, enrich it with full scrape content
+    top_url = results[0].get("url", "")
+    if "/products/" in top_url:
+        top_excerpt, _ = scrape_url(top_url, max_chars=4000)
+        top_title = results[0].get("title", "")
+        full_text = f"المنتج: {top_title}\nالرابط: {top_url}\n\nالمواصفات الكاملة والمميزات:\n{top_excerpt}"
+        spoken = f"بيانات {top_title}: {top_excerpt[:250]}"
+        res = (full_text, spoken)
         put_in_cache(cache_key, res)
         return res
 
@@ -214,21 +296,22 @@ def search_web(query: str, limit: int = 3) -> Tuple[str, str]:
         title = item.get("title", "No Title")
         url = item.get("url", "")
         desc = item.get("description", "") or item.get("markdown", "")
-        desc_snippet = clean_markdown_for_voice(desc)[:200]
+        desc_snippet = clean_markdown_for_voice(desc)[:300]
         formatted_items.append(f"{idx}. {title} ({url})\n   {desc_snippet}")
         if idx <= 2:
-            spoken_items.append(f"{title}: {desc_snippet[:80]}")
+            spoken_items.append(f"{title}: {desc_snippet[:100]}")
 
     full_text = "\n\n".join(formatted_items)
-    spoken = "Found the following: " + "; ".join(spoken_items)
+    spoken = "النتائج المتاحة: " + "; ".join(spoken_items)
     res = (full_text, spoken)
     put_in_cache(cache_key, res)
     return res
 
 
 def _warmup_cache_background() -> None:
-    """Pre-warm cache in background on startup so the first call is instantaneous."""
+    """Pre-warm cache and load product index in background on startup."""
     time.sleep(1)
+    _load_product_index()
     if ALLOWED_DOMAINS:
         target = f"https://{ALLOWED_DOMAINS[0]}"
         try:
