@@ -971,9 +971,9 @@ mcp:
         FIRECRAWL_API_URL: "http://firecrawl-service:3002"
         FIRECRAWL_API_KEY: ""
       defaults:
-        timeout_ms: 20000
-        slow_response_threshold_ms: 2500
-        slow_response_message: "دعني أتحقق من ذلك على الإنترنت، لحظة واحدة..."
+        timeout_ms: 15000
+        slow_response_threshold_ms: 1000
+        slow_response_message: "أبشر ثواني بس أشوف لك في المتجر..."
       tools:
         - name: scrape_url
           expose_as: mcp_firecrawl_scrape

@@ -14,9 +14,16 @@ FIRECRAWL_API_URL = os.environ.get(
 FIRECRAWL_API_KEY = os.environ.get("FIRECRAWL_API_KEY", "").strip()
 
 # Optional list of comma-separated domains allowed (e.g., "example.com,nassaqapp.com")
-# If empty, all domains are allowed.
+def _normalize_domain(raw_val: str) -> str:
+    raw_val = raw_val.strip().lower()
+    if "://" in raw_val:
+        from urllib.parse import urlparse
+        return (urlparse(raw_val).netloc or "").split(":")[0]
+    return raw_val.split("/")[0].split(":")[0]
+
+
 ALLOWED_DOMAINS = [
-    d.strip().lower() for d in os.environ.get("ALLOWED_DOMAINS", "").split(",") if d.strip()
+    _normalize_domain(d) for d in os.environ.get("ALLOWED_DOMAINS", "").split(",") if d.strip()
 ]
 
 
@@ -32,6 +39,50 @@ def is_domain_allowed(url_or_domain: str) -> bool:
     return any(host == allowed or host.endswith("." + allowed) for allowed in ALLOWED_DOMAINS)
 
 
+import re
+import threading
+import time
+
+# In-memory cache for ultra-low latency: (timestamp, (content, spoken))
+_CACHE: Dict[str, Tuple[float, Tuple[str, str]]] = {}
+CACHE_TTL_SECONDS = 600  # 10 minutes TTL
+
+
+def get_from_cache(key: str) -> Optional[Tuple[str, str]]:
+    """Retrieve result from in-memory cache if not expired."""
+    item = _CACHE.get(key)
+    if not item:
+        return None
+    cached_time, val = item
+    if (time.time() - cached_time) < CACHE_TTL_SECONDS:
+        return val
+    _CACHE.pop(key, None)
+    return None
+
+
+def put_in_cache(key: str, val: Tuple[str, str]) -> None:
+    """Store result in in-memory cache."""
+    _CACHE[key] = (time.time(), val)
+
+
+def clean_markdown_for_voice(text: str) -> str:
+    """Strip images, raw media links, and markdown clutter to drastically reduce tokens and speed up LLM generation."""
+    if not text:
+        return ""
+    # 1. Strip markdown images: ![alt](url)
+    text = re.sub(r'!\[.*?\]\(.*?\)', '', text)
+    # 2. Strip raw image/media URLs inside parens
+    text = re.sub(r'\(https?://[^\s)]+\.(?:jpg|jpeg|png|webp|svg|gif)[^\s)]*\)', '', text, flags=re.IGNORECASE)
+    # 3. Simplify markdown links [Text](url) to just Text
+    text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
+    # 4. Remove empty brackets
+    text = re.sub(r'\[\s*\]|\(\s*\)', '', text)
+    # 5. Remove headers symbols (###)
+    text = re.sub(r'#{1,6}\s*', '', text)
+    # 6. Normalize whitespace
+    return " ".join(text.split())
+
+
 def send_response(req_id: Any, result: Any) -> None:
     """Send JSON-RPC 2.0 response via newline-delimited JSON."""
     msg = {"jsonrpc": "2.0", "id": req_id, "result": result}
@@ -40,7 +91,7 @@ def send_response(req_id: Any, result: Any) -> None:
     sys.stdout.buffer.flush()
 
 
-def _make_request(endpoint: str, payload: Dict[str, Any], timeout: int = 15) -> Dict[str, Any]:
+def _make_request(endpoint: str, payload: Dict[str, Any], timeout: int = 10) -> Dict[str, Any]:
     url = f"{FIRECRAWL_API_URL}{endpoint}"
     data = json.dumps(payload).encode("utf-8")
     headers = {
@@ -55,8 +106,8 @@ def _make_request(endpoint: str, payload: Dict[str, Any], timeout: int = 15) -> 
         return json.loads(resp.read().decode("utf-8"))
 
 
-def scrape_url(url: str, max_chars: int = 1500) -> Tuple[str, str]:
-    """Scrape a URL and return a markdown excerpt and spoken summary."""
+def scrape_url(url: str, max_chars: int = 1200) -> Tuple[str, str]:
+    """Scrape a URL and return a clean markdown excerpt and spoken summary with caching."""
     if not is_domain_allowed(url):
         allowed_str = ", ".join(ALLOWED_DOMAINS)
         return (
@@ -67,10 +118,19 @@ def scrape_url(url: str, max_chars: int = 1500) -> Tuple[str, str]:
     if not url.startswith("http://") and not url.startswith("https://"):
         url = f"https://{url}"
 
+    # Check local cache first for sub-millisecond response!
+    cache_key = f"scrape:{url}"
+    cached = get_from_cache(cache_key)
+    if cached:
+        return cached
+
     payload = {
         "url": url,
         "formats": ["markdown"],
         "onlyMainContent": True,
+        "maxAge": 3600000,  # Utilize Firecrawl 1-hour internal cache for 5x speed
+        "waitFor": 0,       # No artificial delay
+        "timeout": 8000,    # 8 seconds fast timeout
     }
 
     try:
@@ -92,23 +152,32 @@ def scrape_url(url: str, max_chars: int = 1500) -> Tuple[str, str]:
     title = metadata.get("title", "") or scrape_data.get("title", "")
 
     if not markdown:
-        return "No text content found on the page.", "The webpage had no readable content."
+        res = ("No text content found on the page.", "The webpage had no readable content.")
+        put_in_cache(cache_key, res)
+        return res
 
-    # Trim markdown for voice latency and LLM token limits
-    cleaned_text = " ".join(markdown.split())
+    # Clean markdown thoroughly for minimal token overhead and fast TTS
+    cleaned_text = clean_markdown_for_voice(markdown)
     excerpt = cleaned_text[:max_chars]
     if len(cleaned_text) > max_chars:
         excerpt += "..."
 
-    spoken = f"From {title or url}: {excerpt[:300]}" if title else f"{excerpt[:300]}"
-    return excerpt, spoken
+    spoken = f"From {title or url}: {excerpt[:250]}" if title else f"{excerpt[:250]}"
+    res = (excerpt, spoken)
+    put_in_cache(cache_key, res)
+    return res
 
 
 def search_web(query: str, limit: int = 3) -> Tuple[str, str]:
-    """Search web using Firecrawl search API and return top results."""
+    """Search web using Firecrawl search API and return top results with caching."""
     # Scope search strictly to allowed domain if configured
     if ALLOWED_DOMAINS and "site:" not in query.lower():
         query = f"site:{ALLOWED_DOMAINS[0]} {query}"
+
+    cache_key = f"search:{query}:{limit}"
+    cached = get_from_cache(cache_key)
+    if cached:
+        return cached
 
     payload = {
         "query": query,
@@ -133,7 +202,9 @@ def search_web(query: str, limit: int = 3) -> Tuple[str, str]:
 
     if not results:
         msg = f"No search results found for: {query}"
-        return msg, msg
+        res = (msg, msg)
+        put_in_cache(cache_key, res)
+        return res
 
     formatted_items = []
     spoken_items = []
@@ -141,14 +212,31 @@ def search_web(query: str, limit: int = 3) -> Tuple[str, str]:
         title = item.get("title", "No Title")
         url = item.get("url", "")
         desc = item.get("description", "") or item.get("markdown", "")
-        desc_snippet = " ".join(desc.split())[:250]
+        desc_snippet = clean_markdown_for_voice(desc)[:200]
         formatted_items.append(f"{idx}. {title} ({url})\n   {desc_snippet}")
         if idx <= 2:
-            spoken_items.append(f"{title}: {desc_snippet[:100]}")
+            spoken_items.append(f"{title}: {desc_snippet[:80]}")
 
     full_text = "\n\n".join(formatted_items)
     spoken = "Found the following: " + "; ".join(spoken_items)
-    return full_text, spoken
+    res = (full_text, spoken)
+    put_in_cache(cache_key, res)
+    return res
+
+
+def _warmup_cache_background() -> None:
+    """Pre-warm cache in background on startup so the first call is instantaneous."""
+    time.sleep(1)
+    if ALLOWED_DOMAINS:
+        target = f"https://{ALLOWED_DOMAINS[0]}"
+        try:
+            scrape_url(target)
+        except Exception:
+            pass
+
+
+# Launch background cache warming
+threading.Thread(target=_warmup_cache_background, daemon=True).start()
 
 
 def main() -> None:
