@@ -299,10 +299,10 @@ providers:
     type: full
     # Server-side VAD tuning (realtimeInputConfig.automaticActivityDetection)
     # Controls how Google detects speech start/end in the audio stream.
-    vad_start_of_speech_sensitivity: START_SENSITIVITY_HIGH
+    vad_start_of_speech_sensitivity: START_SENSITIVITY_LOW
     vad_end_of_speech_sensitivity: END_SENSITIVITY_HIGH
     vad_prefix_padding_ms: 20
-    vad_silence_duration_ms: 500
+    vad_silence_duration_ms: 300
   local:
     # Local AI Server WebSocket URL. Bridge network uses container name.
     base_url: ${LOCAL_WS_URL:-ws://127.0.0.1:8765}

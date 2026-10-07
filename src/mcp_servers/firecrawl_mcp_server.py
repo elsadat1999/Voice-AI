@@ -312,10 +312,22 @@ def _warmup_cache_background() -> None:
     """Pre-warm cache and load product index in background on startup."""
     time.sleep(1)
     _load_product_index()
-    if ALLOWED_DOMAINS:
-        target = f"https://{ALLOWED_DOMAINS[0]}"
+    popular_urls = [
+        "https://reefi.me",
+        "https://reefi.me/categories/1675703/خصومات-حقيقية",
+        "https://reefi.me/categories/1045941/مودرن",
+        "https://reefi.me/categories/1048987/جميع-الارواب",
+        "https://reefi.me/categories/1136238/مرتبة-اوى",
+        "https://reefi.me/products/مرتبة-اوى-المطورة",
+        "https://reefi.me/products/Awa-Mattress",
+        "https://reefi.me/products/Modern-bathrobe-petrol-blue",
+        "https://reefi.me/products/روب-مودرن-بقبعة-بنفسجي",
+        "https://reefi.me/products/طقم-مفرش-الهناء",
+        "https://reefi.me/products/بكج-منشفة-كبيرة-وافل",
+    ]
+    for target in popular_urls:
         try:
-            scrape_url(target)
+            scrape_url(target, max_chars=4000)
         except Exception:
             pass
 

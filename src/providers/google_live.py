@@ -1333,6 +1333,8 @@ class GoogleLiveProvider(AIProviderInterface):
                 "turnComplete": True
             }
         }
+        self._greeting_started_at = time.monotonic()
+        self._greeting_in_progress = True
         await self._send_message(greeting_msg)
         
         logger.info(
@@ -1387,6 +1389,14 @@ class GoogleLiveProvider(AIProviderInterface):
         """
         if not self.websocket or not self._setup_complete or self._closing:
             return
+
+        # Suppress upstream microphone audio during the initial greeting protection window (3.5s)
+        # to prevent telephony line hiss from falsely interrupting the agent's opening greeting.
+        if getattr(self, "_greeting_in_progress", False):
+            if (time.monotonic() - getattr(self, "_greeting_started_at", 0.0)) < 3.5:
+                return
+            else:
+                self._greeting_in_progress = False
 
         try:
             # Infer format from chunk size if not specified
@@ -1723,6 +1733,12 @@ class GoogleLiveProvider(AIProviderInterface):
         # so this rarely fires. Local VAD fallback is the primary barge-in mechanism.
         # When it does fire, emit ProviderBargeIn so the engine flushes playback.
         if content.get("interrupted") is True:
+            if getattr(self, "_greeting_in_progress", False) and (time.monotonic() - getattr(self, "_greeting_started_at", 0.0)) < 3.5:
+                logger.info(
+                    "Ignoring false server-side interruption during protected greeting window",
+                    call_id=self._call_id,
+                )
+                return
             if self.long_audio_playback_enabled:
                 for completed in self._generated_audio_turns:
                     if completed["response_id"] == self._audio_response_id:
@@ -2251,8 +2267,9 @@ class GoogleLiveProvider(AIProviderInterface):
             self._output_resampler_logged = False
 
         # Mark greeting as complete after first turn
-        if not self._greeting_completed:
+        if not self._greeting_completed or getattr(self, "_greeting_in_progress", False):
             self._greeting_completed = True
+            self._greeting_in_progress = False
             logger.info(
                 "Google Live greeting completed",
                 call_id=self._call_id,
