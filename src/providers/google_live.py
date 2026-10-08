@@ -1641,8 +1641,8 @@ class GoogleLiveProvider(AIProviderInterface):
     @property
     def long_audio_playback_enabled(self) -> bool:
         return bool(
-            self.config.long_audio_playback_enabled
-            and not getattr(self, "_vertex_active", self.config.use_vertex_ai)
+            getattr(self.config, "long_audio_playback_enabled", False)
+            and not getattr(self, "_vertex_active", getattr(self.config, "use_vertex_ai", False))
         )
 
     def _reset_interrupted_farewell_watchdog(self):

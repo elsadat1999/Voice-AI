@@ -1495,7 +1495,7 @@ class Engine:
         encoding = self._canonicalize_encoding(fmt.get("playback_encoding") or fmt.get("encoding"))
         rate = int(fmt.get("playback_sample_rate") or fmt.get("sample_rate") or session.transport_profile.wire_sample_rate)
         bytes_per_sample = 1 if encoding in ("ulaw", "mulaw", "alaw", "g711_alaw") else 2
-        budget_sec = provider.config.long_audio_backlog_sec
+        budget_sec = getattr(provider.config, "long_audio_backlog_sec", 120.0)
         queue = AudioBacklogQueue(int(rate * bytes_per_sample * budget_sec))
         logger.info("Google Developer audio backlog enabled", call_id=call_id,
                     budget_sec=budget_sec, max_bytes=queue.max_bytes,
@@ -1655,7 +1655,7 @@ class Engine:
         current_task = asyncio.current_task()
         session = await self.session_store.get_by_call_id(call_id)
         google_provider = self._google_long_audio_provider(session) if session else None
-        timeout_sec = google_provider.config.long_audio_backlog_sec + 30.0 if google_provider else 30.0
+        timeout_sec = getattr(google_provider.config, "long_audio_backlog_sec", 120.0) + 30.0 if google_provider else 30.0
         try:
             drained = await self._wait_for_call_audio_drain(
                 call_id,
@@ -15767,7 +15767,7 @@ class Engine:
             if not audio_already_drained:
                 google_provider = self._google_long_audio_provider(session)
                 if google_provider:
-                    drain_timeout_sec = max(drain_timeout_sec, google_provider.config.long_audio_backlog_sec + 30.0)
+                    drain_timeout_sec = max(drain_timeout_sec, getattr(google_provider.config, "long_audio_backlog_sec", 120.0) + 30.0)
                 if drain_timeout_cap_sec is not None:
                     drain_timeout_sec = min(drain_timeout_sec, max(0.0, drain_timeout_cap_sec))
                 drained = await self._wait_for_call_audio_drain(
