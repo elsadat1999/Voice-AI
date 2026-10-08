@@ -9,13 +9,14 @@ asterisk:
 audio_transport: audiosocket
 audiosocket:
   format: slin
-  host: 127.0.0.1
+  host: 0.0.0.0
+  advertise_host: ai-engine-service
   port: 8090
 barge_in:
   enabled: true
   initial_protection_ms: 200
   min_ms: 250
-  energy_threshold: 1000
+  energy_threshold: 1200
   cooldown_ms: 500
   pipeline_min_ms: 120
   pipeline_energy_threshold: 300
@@ -52,7 +53,7 @@ provider_failure_prompt: sorry-youre-having-problems
 # provider_failure_redirect_extension: s
 # provider_failure_redirect_priority: 1
 contexts: {}
-default_provider: local_hybrid
+default_provider: google_live
 downstream_mode: stream
 external_media:
   codec: ulaw
@@ -200,7 +201,7 @@ profiles:
       encoding: ulaw
       sample_rate_hz: 8000
   telephony_enhanced_8k:
-    output_resampler: bandlimited
+    output_resampler: linear
     chunk_ms: auto
     idle_cutoff_ms: 800
     internal_rate_hz: 8000
@@ -965,8 +966,7 @@ mcp:
       transport: stdio
       command:
         - python3
-        - '-m'
-        - src.mcp_servers.firecrawl_mcp_server
+        - /app/data/firecrawl_mcp_server.py
       env:
         FIRECRAWL_API_URL: "http://firecrawl-service:3002"
         FIRECRAWL_API_KEY: ""
@@ -1023,11 +1023,11 @@ no_input:
   enabled: true
   inbound_enabled: true
   outbound_enabled: false
-  initial_timeout_sec: 30
-  grace_timeout_sec: 15
+  initial_timeout_sec: 45
+  grace_timeout_sec: 20
   max_check_ins: 1
-  check_in_message: "Are you still there?"
-  final_message: "I still can't hear you, so I'll end the call now. Goodbye."
+  check_in_message: "معي يا طيب؟ تسمعني؟"
+  final_message: "يبدو أن الخط مو واضح أو انقطع الصوت، بتواصل معك بوقت ثاني إن شاء الله. مع السلامة!"
 vad:
   enhanced_enabled: true
   fallback_buffer_size: 128000

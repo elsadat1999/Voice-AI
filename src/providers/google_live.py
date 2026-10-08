@@ -226,6 +226,7 @@ class GoogleLiveProvider(AIProviderInterface):
         self._tool_call_lock = asyncio.Lock()
         self._tool_teardown_lock = asyncio.Lock()
         self._send_lock = asyncio.Lock()
+        self._tool_response_pending: bool = False
         self._gating_manager = gating_manager
 
         self._call_id: Optional[str] = None
@@ -1387,7 +1388,9 @@ class GoogleLiveProvider(AIProviderInterface):
             sample_rate: Sample rate of input audio (default from config)
             encoding: Audio encoding (ulaw/linear16/pcm16)
         """
-        if not self.websocket or not self._setup_complete or self._closing:
+        # Gate audio frames while waiting for toolResponse to prevent Google Live
+        # WebSocket close 1007: "The audio content type (CONTENT_TYPE_AUDIO) is not supported for this model configuration"
+        if not self.websocket or not self._setup_complete or self._closing or self._tool_response_pending:
             return
 
         try:
@@ -2337,6 +2340,7 @@ class GoogleLiveProvider(AIProviderInterface):
             )
             return
 
+        self._tool_response_pending = True
         try:
             # Extract function call details (camelCase per official API)
             function_calls = tool_call.get("functionCalls", [])
@@ -2592,6 +2596,8 @@ class GoogleLiveProvider(AIProviderInterface):
                     result={"status": "error", "message": str(e)},
                     duration_ms=(time.time() - tool_started_at) * 1000,
                 )
+        finally:
+            self._tool_response_pending = False
 
     async def _handle_tool_call_cancellation(self, data: Dict[str, Any]) -> None:
         """Handle toolCallCancellation message (server canceled one or more pending tool calls)."""

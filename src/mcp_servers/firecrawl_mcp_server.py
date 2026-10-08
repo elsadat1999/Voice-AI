@@ -113,6 +113,95 @@ def _make_request(endpoint: str, payload: Dict[str, Any], timeout: int = 10) -> 
         return json.loads(resp.read().decode("utf-8"))
 
 
+import sqlite3
+
+def _get_db_path() -> Optional[str]:
+    candidates = [
+        os.environ.get("REEFI_DB_PATH", ""),
+        "/app/data/products.db",
+        "/data/products.db",
+        os.path.expanduser("~/.gemini/antigravity-ide/brain/a63699dd-a0d8-45c2-92f8-5447bbe7d030/scratch/products.db"),
+        "data/products.db",
+    ]
+    for p in candidates:
+        if p and os.path.exists(p):
+            return p
+    return None
+
+
+def get_product_from_db(url: str) -> Optional[Dict[str, Any]]:
+    """Fetch product details directly from local SQLite database in < 1ms."""
+    db_path = _get_db_path()
+    if not db_path:
+        return None
+    try:
+        conn = sqlite3.connect(db_path, timeout=1.0)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        clean_url = url.split("?")[0].rstrip("/")
+        c.execute("SELECT * FROM products WHERE url = ? OR url = ? LIMIT 1", (url, clean_url))
+        row = c.fetchone()
+        conn.close()
+        return dict(row) if row else None
+    except Exception:
+        return None
+
+
+def search_products_in_db(query: str, limit: int = 4) -> List[Dict[str, Any]]:
+    """Full-text search in local SQLite products catalog in < 5ms."""
+    db_path = _get_db_path()
+    if not db_path:
+        return []
+    try:
+        conn = sqlite3.connect(db_path, timeout=1.0)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        clean_q = re.sub(r'[^\w\s]', ' ', query).strip()
+        stop_words = {"في", "من", "عن", "على", "كم", "وش", "ايش", "ما", "هو", "هي", "مواصفات", "مميزات", "سعر", "اسعار", "تفاصيل", "هل", "عندكم", "ممكن"}
+        words = [w for w in clean_q.split() if len(w) > 1 and w not in stop_words]
+        if not words:
+            words = [w for w in clean_q.split() if len(w) > 1]
+        if not words:
+            conn.close()
+            return []
+
+        fts_q = " OR ".join([f'"{w}"*' for w in words])
+        results = []
+        try:
+            c.execute(
+                """
+                SELECT p.id, p.name, p.price, p.old_price, p.discount, p.category, p.description, p.url
+                FROM products_fts f
+                JOIN products p ON f.rowid = p.id
+                WHERE products_fts MATCH ?
+                ORDER BY rank
+                LIMIT ?;
+                """,
+                (fts_q, limit),
+            )
+            results = [dict(r) for r in c.fetchall()]
+        except Exception:
+            results = []
+
+        if not results:
+            like_terms = [f"%{w}%" for w in words]
+            where_clauses = " OR ".join(["name LIKE ? OR category LIKE ? OR description LIKE ?" for _ in like_terms])
+            params = []
+            for t in like_terms:
+                params.extend([t, t, t])
+            params.append(limit)
+            c.execute(
+                f"SELECT id, name, price, old_price, discount, category, description, url FROM products WHERE {where_clauses} LIMIT ?;",
+                params,
+            )
+            results = [dict(r) for r in c.fetchall()]
+
+        conn.close()
+        return results
+    except Exception:
+        return []
+
+
 def scrape_url(url: str, max_chars: int = 4000) -> Tuple[str, str]:
     """Scrape a URL and return a clean markdown excerpt and spoken summary with caching."""
     if not is_domain_allowed(url):
@@ -130,6 +219,23 @@ def scrape_url(url: str, max_chars: int = 4000) -> Tuple[str, str]:
     cached = get_from_cache(cache_key)
     if cached:
         return cached
+
+    # Check local SQLite DB first (instant sub-millisecond retrieval)
+    prod = get_product_from_db(url)
+    if prod:
+        discount_text = f" (وفر {prod['discount']})" if prod.get('discount') else ""
+        old_price_text = f" بدلاً من {prod['old_price']}" if prod.get('old_price') and prod['old_price'] != prod['price'] else ""
+        full_text = (
+            f"المنتج: {prod['name']}\n"
+            f"السعر الحالي: {prod['price']}{old_price_text}{discount_text}\n"
+            f"الفئة: {prod['category']}\n"
+            f"المواصفات والمميزات:\n{prod['description']}\n"
+            f"الرابط: {prod['url']}"
+        )
+        spoken = f"{prod['name']} بسعر {prod['price']}{discount_text}. {prod['description'][:150]}"
+        res = (full_text, spoken)
+        put_in_cache(cache_key, res)
+        return res
 
     payload = {
         "url": url,
@@ -235,11 +341,30 @@ def search_web(query: str, limit: int = 3) -> Tuple[str, str]:
     if cached:
         return cached
 
-    # 1. Match against in-memory product catalog first for instant rich specifications
+    # 1. Search local SQLite DB first (instant sub-millisecond retrieval with FTS5)
+    hits = search_products_in_db(query, limit=limit)
+    if hits:
+        formatted_items = []
+        spoken_items = []
+        for idx, p in enumerate(hits, 1):
+            price_info = f"السعر: {p['price']}"
+            if p.get('old_price') and p['old_price'] != p['price']:
+                price_info += f" (قبل الخصم: {p['old_price']})"
+            if p.get('discount'):
+                price_info += f" - وفر {p['discount']}"
+            formatted_items.append(f"{idx}. {p['name']} ({price_info})\n   المميزات: {p['description'][:200]}\n   الرابط: {p['url']}")
+            if idx <= 2:
+                spoken_items.append(f"{p['name']} بسعر {p['price']}")
+        full_text = "\n\n".join(formatted_items)
+        spoken = "من أفضل الخيارات المتوفرة: " + "، و ".join(spoken_items)
+        res = (full_text, spoken)
+        put_in_cache(cache_key, res)
+        return res
+
+    # 2. Match against in-memory product catalog second
     matched = find_best_product_url(query)
     if matched:
         prod_title, prod_url = matched
-        # Scrape full product specifications directly
         excerpt, spoken_summary = scrape_url(prod_url, max_chars=4000)
         full_text = f"المنتج: {prod_title}\nالرابط: {prod_url}\n\nالمواصفات والأسعار والمميزات:\n{excerpt}"
         spoken = f"منتج {prod_title}: {spoken_summary[:300]}"
@@ -247,7 +372,7 @@ def search_web(query: str, limit: int = 3) -> Tuple[str, str]:
         put_in_cache(cache_key, res)
         return res
 
-    # 2. Fallback to Firecrawl search API scoped to allowed domain
+    # 3. Fallback to Firecrawl search API scoped to allowed domain
     search_q = query
     if ALLOWED_DOMAINS and "site:" not in search_q.lower():
         search_q = f"site:{ALLOWED_DOMAINS[0]} {search_q}"
