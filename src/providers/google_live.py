@@ -1390,14 +1390,6 @@ class GoogleLiveProvider(AIProviderInterface):
         if not self.websocket or not self._setup_complete or self._closing:
             return
 
-        # Suppress upstream microphone audio during the initial greeting protection window (3.5s)
-        # to prevent telephony line hiss from falsely interrupting the agent's opening greeting.
-        if getattr(self, "_greeting_in_progress", False):
-            if (time.monotonic() - getattr(self, "_greeting_started_at", 0.0)) < 3.5:
-                return
-            else:
-                self._greeting_in_progress = False
-
         try:
             # Infer format from chunk size if not specified
             if encoding == "ulaw" or (sample_rate == 8000 and len(audio_chunk) == 160):
