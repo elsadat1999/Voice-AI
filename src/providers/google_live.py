@@ -1077,6 +1077,16 @@ class GoogleLiveProvider(AIProviderInterface):
             "topK": self.config.llm_top_k,
         }
 
+        # Telephony latency optimization: disable Gemini reasoning/thinking tokens
+        # By default, Gemini 2.5 Flash produces English thought tokens before generating audio,
+        # adding 6-10s of dead air on live phone calls. Setting thinkingBudget=0 forces immediate audio output.
+        thinking_budget = getattr(self.config, "thinking_budget", 0)
+        if thinking_budget is not None and not is_gemini_3_8:
+            generation_config["thinkingConfig"] = {
+                "thinkingBudget": thinking_budget
+            }
+
+
         # Detailed debug logging for speech configuration
         speech_cfg = generation_config.get("speechConfig", {})
         voice_cfg = speech_cfg.get("voiceConfig", {}).get("prebuiltVoiceConfig", {})
