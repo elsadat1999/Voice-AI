@@ -333,3 +333,6 @@ secrets/**
 # Frontend source components are not runtime log artifacts.
 !admin_ui/frontend/src/components/logs/
 !admin_ui/frontend/src/components/logs/*.tsx
+
+# Independent repository for customer admin panel
+customer_admin_panel/

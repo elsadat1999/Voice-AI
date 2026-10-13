@@ -283,6 +283,8 @@ providers:
     llm_temperature: 0.4
     llm_top_k: 20
     llm_top_p: 0.9
+    thinking_budget: 0
+
     # Google Live: marker-driven hangup disabled — using tool-driven hangup (hangup_call) instead.
     # Tool-driven hangup is more reliable with the CALL ENDING PROTOCOL prompt.
     hangup_markers_enabled: false
@@ -962,25 +964,24 @@ tools:
 mcp:
   enabled: true
   servers:
-    firecrawl:
+    catalog:
       transport: stdio
       command:
         - python3
-        - /app/data/firecrawl_mcp_server.py
+        - /app/data/catalog_mcp_server.py
       env:
-        FIRECRAWL_API_URL: "http://firecrawl-service:3002"
-        FIRECRAWL_API_KEY: ""
-        ALLOWED_DOMAINS: "reefi.me"
+        CATALOG_DB_PATH: "/app/data/products.db"
+        REEFI_DB_PATH: "/app/data/products.db"
       defaults:
-        timeout_ms: 15000
+        timeout_ms: 3000
         slow_response_threshold_ms: 1000
         slow_response_message: "ثواني بشوف لك إيش موجود...|خلّك معي لحظات أشوف لك المتوفر...|أبشر من عيوني، ثواني وأتأكد لك إيش عندنا...|سمّ طال عمرك، ثواني أشوف لك التفاصيل..."
       tools:
-        - name: scrape_url
-          expose_as: mcp_firecrawl_scrape
+        - name: search_products
+          expose_as: mcp_catalog_search
           speech_field: spoken
-        - name: search_web
-          expose_as: mcp_firecrawl_search
+        - name: get_product_details
+          expose_as: mcp_product_details
           speech_field: spoken
     weather:
       transport: stdio

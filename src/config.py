@@ -544,6 +544,8 @@ class GoogleProviderConfig(BaseModel):
     llm_max_output_tokens: int = Field(default=8192, ge=1, le=8192)  # Max output tokens (Gemini supports up to 8192)
     llm_top_p: float = Field(default=0.95, ge=0.0, le=1.0)  # Nucleus sampling parameter
     llm_top_k: int = Field(default=40, ge=1, le=100)  # Top-k sampling parameter
+    thinking_budget: Optional[int] = Field(default=0, ge=-1, le=65536)  # Thinking token budget (0 = disabled for telephony latency)
+
 
     # Google Live VAD / turn-taking tuning (MED-P3). Previously read via getattr with
     # these same defaults but absent from the model, so they were untunable; declare
