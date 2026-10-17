@@ -398,7 +398,7 @@ async def test_terminal_transfer_is_deferred_until_the_real_turn_boundary():
     p = provider()
     e, s = bare_engine(p)
     await e.session_store.upsert_call(s)
-    s.pending_deferred_transfer = {'action_id': 'transfer-test'}
+    s.pending_deferred_transfer = {'id': 'transfer-test'}
     e._commit_pending_deferred_transfer_for_call = AsyncMock()
     e._note_provider_output_end = AsyncMock()
     e._farewell_done_events = {'farewell_done_long-test': asyncio.Event()}
@@ -408,7 +408,9 @@ async def test_terminal_transfer_is_deferred_until_the_real_turn_boundary():
     assert not e._farewell_done_events['farewell_done_long-test'].is_set()
     await e.on_provider_event(completion(turn=True))
     await asyncio.gather(*list(e._call_bg_tasks[s.call_id]))
-    e._commit_pending_deferred_transfer_for_call.assert_awaited_once_with(s.call_id, s)
+    e._commit_pending_deferred_transfer_for_call.assert_awaited_once_with(
+        s.call_id, s, expected_action_id='transfer-test',
+    )
     assert e._farewell_done_events['farewell_done_long-test'].is_set()
     e._terminate_call_after_audio.assert_not_awaited()
 

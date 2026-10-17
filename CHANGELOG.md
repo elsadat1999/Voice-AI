@@ -7,7 +7,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.6.4] - 2026-10-16
+
+Release scope: merged PRs [#739](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/pull/739),
+[#735](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/pull/735),
+and [#740](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/pull/740),
+plus release documentation and contributor attribution. Open Dependabot and
+unrelated feature PRs remain excluded. No database migration or provider,
+transport, model, or saved Agent default changes.
+See [migration notes](docs/MIGRATION.md#v763-to-v764) and the
+[validation matrix](docs/baselines/golden/v7.6.4-validation-matrix.md).
+
+Contributors: [@theluckystrike](https://github.com/theluckystrike) (original
+farewell fix), [Kevin Rossen](https://github.com/kevinrossen) (HTTP-template security report and original renderer
+patch, preserved as co-author), [@MVECoder](https://github.com/MVECoder)
+(farewell report and production investigation), and
+[@hkjarral](https://github.com/hkjarral) (implementation, review, validation and
+release maintenance). See [CONTRIBUTORS.md](CONTRIBUTORS.md).
+
 ### Changed
+
+- **Contributor attribution:** link Kevin Rossen's verified GitHub profile and avatar; clarify Ivan Garcia's submitting-account provenance and NC's original environment-parser contribution without assigning unverified personal profiles.
+
+- **Release dependency maintenance:** update Admin FastAPI to 0.143.0 and Pydantic to 2.14.0, frontend Vite/Prettier patches, and the workflow-helper setup-node action to v7. Retain the existing Node/ESLint toolchain and all held runtime/model/NumPy/Piper versions. Custom FastAPI automatic OpenTelemetry exporter setup now requires explicit opt-in; see the migration guide.
+
+### Fixed
+
+- **Farewell fallback and deferred transfer recovery** ([#675](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues/675)):
+  evaluate Google farewell markers against the completed turn, match Google/Grok
+  markers at word boundaries, and suppress heuristic arming during deferred
+  transfers. Give transfers priority over `HangupReady` and retire superseded
+  hangup state so timeout recovery keeps the caller connected and later hangups
+  still work. Cancel failed transfer commits without replaying them on later
+  completion events, and tolerate provider reset-hook failures. Clarify the remaining heuristic false-positive risk in Admin UI
+  help and the Google setup guide. Original fix contributed by
+  [@theluckystrike](https://github.com/theluckystrike); reported by
+  [@MVECoder](https://github.com/MVECoder).
+
+### Security
+
+- Harden HTTP-tool templates across pre-call, in-call, and post-call execution:
+  resolve placeholders once, protect call/enrichment context from model argument
+  overrides, encode URL/header substitutions, and validate JSON bodies before
+  sending. Explicit plain-text and form bodies remain supported; see the
+  [template compatibility rules](docs/TOOL_CALLING_GUIDE.md#http-template-safety-and-compatibility).
+  Thanks to Kevin Rossen for the report and original single-pass renderer patch.
+
+## [7.6.3] - 2026-10-11
+
+Release scope: #689, #690, #692, #679, #597, #694, #695, #696, #702, #706,
+#707, #708, #709, #710 and #729, plus the reviewed README/release preparation
+and fork-review workflow fix. Open Dependabot and unrelated feature PRs remain
+excluded. No database migration or provider/transport/model-default change.
+See [migration notes](docs/MIGRATION.md#v762-to-v763) and the
+[validation matrix](docs/baselines/golden/v7.6.3-validation-matrix.md).
+
+Contributors: [@pi0n00r](https://github.com/pi0n00r) (Local AI, Whisper, DTMF,
+MCP), [@cswilsnetex](https://github.com/cswilsnetex) (Google transfer handoff),
+[@hkjarral](https://github.com/hkjarral) (implementation, review, maintenance
+and release work), NC (Local AI co-author), and
+[@MVECoder](https://github.com/MVECoder) (startup-recovery report,
+investigation and production evidence). Commit authorship and existing credits
+are preserved; see [CONTRIBUTORS.md](CONTRIBUTORS.md).
+
+### Changed
+
+- **Compatible dependency maintenance:** refresh Admin backend dependencies and Calendar client floors, aligning the shared HTTPX test pin; update compatible Admin frontend packages and React Testing Library. Retain the existing Node/ESLint toolchain and defer incompatible plugin, runtime, model, NumPy, and Piper upgrades. Earlier Codex action pin updates are superseded by the separately reviewed fork-safe workflow.
+
+- **Project overview and release documentation:** shorten the README to one setup
+  path, concise capabilities and canonical documentation links. Preserve demo
+  endpoints, Core's MIT/independence boundary and Operator's early-access preview.
+  Refresh upgrade/recovery references and contributor badges, including verified
+  co-author and investigation credit.
+
+- **Dependabot maintenance:** cover Admin frontend/backend and Local AI manifests with weekly compatible version/security groups; keep model-stack, NumPy, Piper and major migrations individual, and reduce version-update PR limits without suppressing security fixes.
 
 - Reworked `AVA.mdc` as the shared AI-assistant entry point for project questions,
   development, deployment, call troubleshooting, and contribution. Linked root
@@ -17,16 +90,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Streamable HTTP MCP backend:** explicit YAML endpoint and environment-referenced authentication headers use the official Python MCP SDK for protocol negotiation, session headers, JSON/SSE responses and paginated tool discovery. Existing stdio and Agent filtering remain intact. A timed-out tool call is not automatically replayed; its effect may require server-side reconciliation. Live in-call allowed/denied acceptance is complete; Admin UI creation/editing remains follow-up #703.
+- **Opt-in cloud provider startup connection recovery** ([#676](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues/676)): Google Live/Vertex, OpenAI Realtime, Grok, Deepgram Agent, and ElevenLabs Agent can retry transient initial connection failures with configurable opening and total connection deadlines. Provider forms expose the controls under Expert settings. Upgrades retain a 10-second opening timeout, zero retries, and no added aggregate deadline; setup, mid-call recovery, keepalive, terminal failure routing, and Local behavior are unchanged. See [connection recovery and real-call verification](docs/Provider-Connection-Recovery.md). Reported and supported with production evidence by [@MVECoder](https://github.com/MVECoder).
+
 - **Google Developer long-response option:** **Providers → Google Live → API Mode → Enable long-response playback** enables a bounded audio backlog for that provider instance. It defaults off on new and existing installations, requires saving and restarting the AI Engine, and is hidden in Vertex mode. The saved preference is ignored on actual Vertex connections; other providers and modular pipelines do not use it. See the [Google setup guide](docs/Provider-Google-Setup.md#long-response-playback-developer-api-opt-in) for configuration and upgrade instructions.
 
 ### Fixed
+
+- **Admin frontend security follow-up:** adopt React Router 7.18.4 and patched DOMPurify, selector-parser, and brace-expansion transitive versions, including nested parser copies used by Tailwind typography. Keep call-detail closure and URL removal in the same transition so Router 7 cannot reopen a dismissed deep link.
+
+- **Admin frontend dependencies:** update Axios, js-yaml, Nano ID, source-map-js, Vitest, and Browserslist metadata; reconcile the overlapping browser-mapping updates without discarding either update.
+- **Admin HTTP redirect credentials:** update aiohttp to 3.14.5 so cross-origin redirects strip every duplicate Authorization, Cookie, and Proxy-Authorization header. Regression tests retain same-origin credentials and ordinary request headers.
+
+- **Replacement transfer handoff:** bind deferred completion callbacks to their original transfer before scheduling or waiting on the per-call lock. A queued completion from a cancelled/replaced transfer no longer starts committing the replacement or suppresses its unfinished handoff audio. Original repeat suppression contributed by [@cswilsnetex](https://github.com/cswilsnetex) in [#702](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/pull/702).
+
+- Preserve expanded YAML compatibility when raw flow-style environment references cannot be parsed for MCP header restoration; credentialed HTTP servers fail closed without exposing expanded header values.
+- **Streamable HTTP MCP diagnostics:** suppress SDK/HTTP wire traces that can
+  include session headers or endpoint URLs, and keep remote RPC error text out
+  of application traceback logs. Tool-outcome classification and no-replay
+  behavior are unchanged.
+- **Whisper idle finalization:** finalize buffered speech after per-session silence without requiring another audio frame, while preserving newer speech that arrives during a slow decode or backend-lock wait. Repeated words in distinct speech segments remain separate turns; duplicate finalization of one segment stays suppressed.
+- **DTMF log privacy:** omit raw ARI/AudioSocket digits and payload-bearing exception bodies from structured logs while preserving native digit delivery to attended-transfer and AudioSocket handlers. Nested DTMF fields are fully redacted rather than retaining a prefix.
+- **Local AI provider test environment expansion:** shared YAML and Admin test paths now parse braced environment references in linear time, including empty `:-` and `:=` defaults, without stalling on malformed operator-supplied values. Existing authenticated WebSocket test ordering and modular capability checks remain unchanged.
 
 - **Google Developer long-response playback (opt-in):** prevents the original source queue from dropping small audio chunks when generation runs ahead of telephony playback. Enabled calls wait for playback drain, cancel queued speech on interruption, and reject stale farewell completion. Abnormal disconnects allow accepted audio up to eight seconds to drain before cleanup, respecting caller teardown and transfer ownership. Disconnect drain runs in a cleanup-cancelled call task, with a bounded transfer wait, so provider event dispatch remains responsive; completion backlog overflow immediately rejects new tool work. This cannot prevent upstream Google errors or recover audio that was never received.
 - **Google AudioSocket interruption detection:** silence-gated Google calls inspect normalized caller audio before upstream silence substitution, so local barge-in can detect speech during playback. This correction applies to Developer API and Vertex independently of the long-response option; native Gemini 3.8 full-duplex interruption keeps its provider-driven path. Other providers' detector inputs are unchanged.
 
 - **Authoritative modular provider validation** ([#688](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues/688)): Admin UI connection and credential checks preserve configured OpenAI-compatible, Telnyx and MiniMax destinations, ports and paths instead of silently substituting public endpoints. Explicit types and speech roles take precedence over provider-name heuristics. Provider-scoped credentials and custom no-auth endpoints are supported consistently; unsafe targets, redirects and malformed model lists fail explicitly. Speech probes clearly report reachability-only validation. Logs contain bounded, credential-free diagnostics.
 - **Provider test results** ([#688](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues/688)): The editor displays detailed results for unsaved settings, clears obsolete results after edits, and ignores late responses after edits, closing or reopening. Concurrent provider tests retain independent loading states and results. Failure details remain readable in both light and dark themes.
+- **Deferred transfer handoff line no longer replayed during the commit** ([#701](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues/701)): Google Live can answer a `blind_transfer` tool response with a second model turn that repeats the handoff line. Once the handoff audio completes and the deferred transfer starts committing, the engine now drops new provider audio for that call while the pending transfer is the one being committed, so the repeat is not played and does not delay the transfer. The drain-timeout apology still plays because the pending transfer is cleared before it is requested, and a transfer that replaces the one being committed keeps its own handoff audio. Local handoff audio and pipeline transfer prompts are unaffected. In the opt-in Developer long-response mode the commit starts only after playback finishes, so a repeat queued before then can still be heard. The provider still generates the repeat, so Google Live call history can show the line twice.
 - **Provider validation review fixes** ([#689](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/pull/689)): Legacy untyped `groq_llm` tests default to Groq when no endpoint is configured; an explicitly typed OpenAI-compatible `groq_llm` requires an explicit URL in both validation APIs to prevent ambiguous credential routing. API-key references use linear parsing and consistent defaults for saved and unsaved checks, and diagnostic fields remove line breaks at the logging boundary.
+
+### Security
+
+- Isolate opt-in Codex reviews of public fork PRs: a secret-free label request
+  hands off to default-branch code, verifies maintainer permission and exact
+  base/head revisions, and separates read-only model analysis from comment
+  publication. No fork checkout or model execution tools receive credentials.
+  Oversized, incomplete, private, unauthorized and stale reviews fail closed.
 
 ## [7.6.2] - 2026-10-02
 
@@ -135,6 +236,7 @@ provider/transport/model-default change is introduced by this release.
 
 ### Fixed
 
+- **Local AI provider connection tests honor authenticated and modular deployments:** the Admin UI now performs the configured WebSocket authentication handshake before requesting status and evaluates only each provider's declared STT, LLM, or TTS capabilities, so intentionally unloaded components no longer make an otherwise healthy modular provider appear unavailable.
 - **`check_extension_status` now preserves full provider-compatible availability data** ([#577](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues/577)): the tool now returns a stable `message` and retains key availability fields (`extension`, `device_state_name`, `device_state`, `available`, `availability_source`, `endpoint_state`, `tech`) through JSON sanitization for all tool adapters, while still filtering internal debug fields. It also cross-checks active ARI channels when device state reports `NOT_INUSE` but endpoint/channel activity is present, preventing false "available" signals during live transfers.
 - **`check_extension_status` guardrail no longer bypassed by an unmapped `device_state_id`** ([#577](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues/577)): previously, a `device_state_id` parameter without a `/` (e.g. `Custom:HACK`) fell back to the `extension` parameter and could bypass `restrict_to_configured_extensions`. Such a parameter must now resolve to a configured extension or exactly match one of that extension's own configured `device_states`.
 

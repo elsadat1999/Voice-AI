@@ -16,7 +16,7 @@ You do not need to understand the whole codebase or already know Git to get help
 Try: “Read AVA.mdc. I want to [understand / build / fix / investigate] ___. Help me
 through the relevant steps and explain unfamiliar terms.”
 
-> Reviewed against the v7.6.2 release and subsequent `main` guidance on 2026-10-06.
+> Reviewed for v7.6.4 preparation against `main` cutoff `ec48e661` on 2026-10-16.
 > Check the actual checkout and deployed revision before relying on any behavior.
 
 ## Assistant: Establish Context First
@@ -101,6 +101,16 @@ every service. Host `./data/` mounts at `/app/data/`; defaults include
   active calls. Agent permissions can narrow global resources, never widen them.
   Explicit post-call summary-provider selection must not fall back to another
   provider; its isolated summary job must not inherit the live Agent persona.
+  MCP stdio remains supported. Streamable HTTP uses explicit engine YAML and
+  the official SDK; live in-call allowed/denied acceptance is complete. Admin
+  UI editing remains follow-up #703, and connection changes require an engine
+  restart. The private pre/post test fixture was corrected and those unchanged
+  handlers verified synthetically; live pre/post execution is not claimed.
+- **HTTP templates:** runtime pre/in/post-call requests use single-pass rendering,
+  context-specific encoding, and validated JSON. Model arguments cannot shadow
+  call/enrichment context, including empty fields. See the
+  [template compatibility rules](docs/TOOL_CALLING_GUIDE.md#http-template-safety-and-compatibility)
+  before adapting existing JSON, raw-text, or URL templates.
 - **Sensitive state:** preserve telephony ownership, consent/DNC, callbacks,
   dispositions, and transfer boundaries. Outbound `AAVA_CUSTOM_VARS_JSON` must be
   bounded and confirmed before AMD/provider startup; invalid authoritative state
@@ -179,7 +189,9 @@ evidence, and remaining work so another assistant can continue.
    tests, sanitized call evidence, and explicit limitations. Complete the coherent
    slice and its documentation first. A draft can request missing live validation.
 6. **Finish reviews:** freeze the head, mark ready for final CI, request one
-   `@coderabbitai full review`; use opt-in Codex review when useful. Do not push
+   `@coderabbitai full review`; use opt-in Codex review when useful. Its trusted
+   default-branch workflow reads public PR diffs without execution tools; a
+   diff-only result does not replace caller/lifecycle review. Do not push
    while final reviews are pending. Triage current findings together and make a
    cohesive fix batch. Rerun affected validation after fixes; avoid review loops.
 7. **Report merge readiness:** identify the exact final SHA, required CI/security

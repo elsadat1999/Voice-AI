@@ -392,6 +392,30 @@ The fallback watchdog protects against stuck calls:
 - `hangup_fallback_no_audio_timeout_sec`: fail-safe when no farewell audio arrives at all.
 - `hangup_fallback_turn_complete_timeout_sec`: grace window to wait for `turnComplete` before fallback.
 
+### Marker-based hangup heuristics
+
+`hangup_markers_enabled` defaults to `false` and should remain off in production;
+prefer the explicit `hangup_call` tool. When enabled, Google evaluates the completed
+turn's caller and assistant text, using whole-word/phrase boundaries. A greeting
+such as "thank you for calling" does not remain a farewell for later turns.
+Weak caller markers require an assistant farewell; configured explicit end-call
+markers can still end a call without one. Phrases such as "all set", "that's it",
+or "bye" are ambiguous even with word boundaries, so false positives remain possible.
+
+Google and Grok do not arm marker fallback while a deferred transfer is pending.
+A `HangupReady` event gives a pending transfer priority. Before committing, the
+engine clears superseded hangup timers/state so a transfer drain timeout can
+return the caller to the AI, play its apology, and accept a later legitimate
+hangup. Failed commits cancel their exact pending action and recover without
+automatic replay on later completion events; a replacement action survives an
+older action's failure. Grok also uses whole-word/phrase boundaries for its
+farewell fallback.
+
+Before enabling heuristics, validate a greeting followed by continued conversation,
+a genuine farewell, a successful transfer, and a transfer drain timeout followed
+by more conversation and a later hangup. Keep call IDs and the tested revision
+with the validation evidence.
+
 ## Features
 
 ### 1. Barge-In (Interruption)
@@ -563,3 +587,8 @@ Stasis(asterisk-ai-voice-agent)
 
 - **Issues**: https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues
 - **Docs**: https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/tree/main/docs
+
+
+## Optional startup connection recovery
+
+This full-agent provider supports bounded retries before session setup. Upgrades preserve a 10-second opening timeout and zero retries. Enable recovery per provider under **Startup connection recovery (Expert)** in the Admin UI, then restart AI Engine. Setup, keepalive, and mid-call behavior remain separate. See [connection recovery configuration and real-call tests](Provider-Connection-Recovery.md) for deadlines, rollback, and qualification steps.

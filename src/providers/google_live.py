@@ -31,6 +31,7 @@ from typing import AbstractSet, Any, Dict, Optional, List, Tuple
 from collections import deque
 
 import websockets
+from .connection_recovery import connect_with_recovery
 from websockets.asyncio.client import ClientConnection
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
@@ -53,7 +54,7 @@ from ..audio import (
     resolve_output_resampler_policy,
 )
 from ..config import GoogleProviderConfig
-from src.tools.telephony.hangup_policy import normalize_hangup_policy
+from src.tools.telephony.hangup_policy import normalize_hangup_policy, text_contains_marker_word
 from src.tools.adapters.sanitize import sanitize_tool_result_for_json_string
 
 # Tool calling support
@@ -503,7 +504,7 @@ class GoogleLiveProvider(AIProviderInterface):
             return None
         markers = (self._hangup_policy.get("markers") or {}).get("end_call", [])
         for m in markers:
-            if m in t:
+            if text_contains_marker_word(t, [m]):
                 return m
         return None
 
@@ -515,9 +516,30 @@ class GoogleLiveProvider(AIProviderInterface):
             return None
         markers = (self._hangup_policy.get("markers") or {}).get("assistant_farewell", [])
         for m in markers:
-            if m in t:
+            if text_contains_marker_word(t, [m]):
                 return m
         return None
+
+    def release_terminal_output_protection(self) -> None:
+        """Discard a hangup superseded by transfer, allowing later farewells."""
+        task = self._hangup_fallback_task
+        self._hangup_fallback_task = None
+        if task and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+        self._hangup_after_response = False
+        self._hangup_fallback_armed = False
+        self._hangup_fallback_emitted = False
+        self._hangup_fallback_armed_at = None
+        self._hangup_fallback_audio_started = False
+        self._hangup_fallback_turn_complete_seen = False
+        self._hangup_fallback_wait_logged = False
+        self._hangup_ready_emitted = False
+        self._assistant_farewell_intent = None
+        self._user_end_intent = None
+        self._force_farewell_text = ""
+        self._force_farewell_sent = False
+        self._post_hangup_output_detected = False
+        self._terminal_audio_cutoff_after_tool = False
 
     def _should_wait_for_turn_complete_before_fallback(self, now: float, armed_at: float) -> bool:
         if self._hangup_fallback_turn_complete_seen:
@@ -851,6 +873,10 @@ class GoogleLiveProvider(AIProviderInterface):
                 call_id=call_id,
             )
 
+        connection_loop = asyncio.get_running_loop()
+        connection_started = connection_loop.time()
+        connection_budget = self.config.connect_total_timeout_sec
+
         # Build WebSocket URL and headers — Vertex AI vs Developer API (AAVA-191)
         use_vertex = getattr(self.config, 'use_vertex_ai', False)
         ws_url: str
@@ -887,11 +913,24 @@ class GoogleLiveProvider(AIProviderInterface):
                 else:
                     credentials, _ = google.auth.default(scopes=scopes)
                 auth_req = google.auth.transport.requests.Request()
+                if connection_budget is not None:
+                    from functools import partial
+                    # The worker must use the same clock/epoch as the outer
+                    # connection deadline, including on alternative event loops.
+                    remaining = connection_budget - (connection_loop.time() - connection_started)
+                    if remaining <= 0:
+                        raise TimeoutError("Provider connection budget exhausted")
+                    auth_req = partial(auth_req, timeout=remaining)
                 credentials.refresh(auth_req)
                 return credentials.token
 
             try:
-                bearer_token = await asyncio.get_event_loop().run_in_executor(None, _get_vertex_token)
+                token_future = connection_loop.run_in_executor(None, _get_vertex_token)
+                if connection_budget is None:
+                    bearer_token = await token_future
+                else:
+                    remaining = connection_budget - (connection_loop.time() - connection_started)
+                    bearer_token = await asyncio.wait_for(token_future, timeout=max(0, remaining))
             except Exception as vertex_err:
                 # ADC failed — fall back to Developer API if an API key exists
                 _fallback_key = (getattr(self.config, 'api_key', None) or "").strip()
@@ -947,15 +986,20 @@ class GoogleLiveProvider(AIProviderInterface):
 
         try:
             # Establish WebSocket connection
-            self.websocket = await websockets.connect(
-                ws_url,
-                additional_headers=ws_extra_headers,
-                subprotocols=["gemini-live"],
-                max_size=10 * 1024 * 1024,  # 10MB max message size
-                # Disable library-level ping frames. We implement our own keepalive behavior
-                # in `_keepalive_loop()` and have seen 1008 closes correlated with ping activity.
-                ping_interval=None,
-                ping_timeout=None,
+            self.websocket = await connect_with_recovery(
+                lambda timeout: websockets.connect(
+                    ws_url,
+                    open_timeout=timeout,
+                    additional_headers=ws_extra_headers,
+                    subprotocols=["gemini-live"],
+                    max_size=10 * 1024 * 1024,  # 10MB max message size
+                    # Disable library-level ping frames. We implement our own keepalive behavior
+                    # in `_keepalive_loop()` and have seen 1008 closes correlated with ping activity.
+                    ping_interval=None,
+                    ping_timeout=None,
+                ),
+                self.config, provider=self.provider_event_name(), call_id=call_id,
+                started_at=connection_started,
             )
 
             _GOOGLE_LIVE_SESSIONS.inc()
@@ -1803,6 +1847,11 @@ class GoogleLiveProvider(AIProviderInterface):
                 # Measures: last user speech → first AI audio response
                 self._turn_start_time = time.time()
                 self._turn_first_audio_received = False
+                # A new user turn invalidates any farewell the assistant spoke in an earlier
+                # turn. Without this, a greeting like "thank you for calling" latches
+                # _assistant_farewell_intent for the whole call and every later weak user
+                # end marker (e.g. "goodbye") arms cleanup_after_tts, ending real calls.
+                self._assistant_farewell_intent = None
                 self._input_transcription_buffer, self._last_input_transcription_fragment = _merge_transcription_fragment(
                     self._input_transcription_buffer, text, self._last_input_transcription_fragment
                 )
@@ -1951,10 +2000,10 @@ class GoogleLiveProvider(AIProviderInterface):
         if self._hangup_fallback_armed:
             return
 
-        user_reason = self._detect_user_end_intent(user_text) or self._user_end_intent
+        user_reason = self._detect_user_end_intent(user_text)
         if not user_reason:
             return
-        assistant_reason = self._detect_assistant_farewell(assistant_text) or self._assistant_farewell_intent
+        assistant_reason = self._detect_assistant_farewell(assistant_text)
 
         # "No transcript" and explicit hangup intents are strong indicators that the call is ending,
         # even if output transcription is missing or the model doesn't include a canonical farewell.
@@ -1980,6 +2029,8 @@ class GoogleLiveProvider(AIProviderInterface):
         try:
             session = await session_store.get_by_call_id(self._call_id)
             if not session:
+                return
+            if isinstance(getattr(session, "pending_deferred_transfer", None), dict):
                 return
             if getattr(session, "cleanup_after_tts", False):
                 return
