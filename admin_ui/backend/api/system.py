@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException
 import asyncio
 import docker
-from typing import List, Optional
+from typing import Any, List, Optional
 from pydantic import BaseModel
 import psutil
 import os
@@ -260,8 +260,245 @@ def _safe_container_image_name(container) -> str:
     return "unknown (image unavailable)"
 
 
+def _is_kubernetes_environment() -> bool:
+    """Return True if running inside a Kubernetes pod."""
+    return (
+        os.path.exists("/var/run/secrets/kubernetes.io/serviceaccount/token")
+        or bool(os.getenv("KUBERNETES_SERVICE_HOST"))
+    )
+
+
+def _get_k8s_service_account_info() -> tuple[str, str, str, str]:
+    """Retrieve in-cluster Kubernetes ServiceAccount token, namespace, ca_cert, and API URL."""
+    sa_dir = "/var/run/secrets/kubernetes.io/serviceaccount"
+    token = ""
+    namespace = os.getenv("POD_NAMESPACE", "voice-ai")
+    ca_cert = f"{sa_dir}/ca.crt" if os.path.exists(f"{sa_dir}/ca.crt") else ""
+
+    if os.path.exists(f"{sa_dir}/token"):
+        try:
+            with open(f"{sa_dir}/token", "r") as f:
+                token = f.read().strip()
+        except Exception:
+            pass
+
+    if os.path.exists(f"{sa_dir}/namespace"):
+        try:
+            with open(f"{sa_dir}/namespace", "r") as f:
+                namespace = f.read().strip()
+        except Exception:
+            pass
+
+    host = os.environ.get("KUBERNETES_SERVICE_HOST", "kubernetes.default.svc")
+    port = os.environ.get("KUBERNETES_SERVICE_PORT", "443")
+    api_url = f"https://{host}:{port}"
+    return token, namespace, ca_cert, api_url
+
+
+def _collect_kubernetes_pods() -> List[dict]:
+    """Collect pods from Kubernetes API when running inside a cluster."""
+    import requests
+    from datetime import datetime, timezone
+
+    token, namespace, ca_cert, api_url = _get_k8s_service_account_info()
+    if not token:
+        return []
+
+    url = f"{api_url}/api/v1/namespaces/{namespace}/pods"
+    headers = {"Authorization": f"Bearer {token}"}
+    verify = ca_cert if (ca_cert and os.path.exists(ca_cert)) else False
+
+    try:
+        res = requests.get(url, headers=headers, verify=verify, timeout=5.0)
+        if res.status_code != 200:
+            return []
+        data = res.json()
+    except Exception as e:
+        logger.debug("Failed to list pods from Kubernetes API: %s", e)
+        return []
+
+    result = []
+    for p in data.get("items", []):
+        name = p.get("metadata", {}).get("name", "")
+        phase = p.get("status", {}).get("phase", "Unknown")
+        start_time = p.get("status", {}).get("startTime")
+        uptime = None
+        if start_time:
+            try:
+                dt = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+                delta = datetime.now(timezone.utc) - dt
+                days = delta.days
+                hours, remainder = divmod(delta.seconds, 3600)
+                minutes, _ = divmod(remainder, 60)
+                if days > 0:
+                    uptime = f"{days}d {hours}h {minutes}m"
+                elif hours > 0:
+                    uptime = f"{hours}h {minutes}m"
+                else:
+                    uptime = f"{minutes}m"
+            except Exception:
+                pass
+        containers = p.get("spec", {}).get("containers", [])
+        image = containers[0].get("image", "") if containers else ""
+        ports = []
+        for c in containers:
+            for prt in c.get("ports", []):
+                cp = prt.get("containerPort")
+                proto = prt.get("protocol", "tcp").lower()
+                ports.append(f"{cp}/{proto}")
+
+        result.append({
+            "id": p.get("metadata", {}).get("uid", "")[:12],
+            "name": name,
+            "image": image,
+            "status": phase.lower(),
+            "state": phase,
+            "uptime": uptime,
+            "started_at": start_time,
+            "ports": ports,
+            "mounts": [],
+        })
+    return result
+
+
+async def _restart_kubernetes_deployment(service_name: str) -> dict:
+    """Trigger a rolling restart of a Kubernetes deployment via Kubernetes API."""
+    import httpx
+    from datetime import datetime, timezone
+
+    name_map = {
+        "ai_engine": "ai-engine",
+        "ai-engine": "ai-engine",
+        "admin_ui": "admin-ui",
+        "admin-ui": "admin-ui",
+        "local_ai_server": "local-ai-server",
+        "local-ai-server": "local-ai-server",
+        "asterisk": "asterisk-pbx",
+        "asterisk_pbx": "asterisk-pbx",
+        "asterisk-pbx": "asterisk-pbx",
+        "voice_customer_admin": "voice-customer-admin",
+        "voice-customer-admin": "voice-customer-admin",
+    }
+    deployment_name = name_map.get(service_name, service_name.replace("_", "-"))
+
+    token, namespace, ca_cert, api_url = _get_k8s_service_account_info()
+    if not token:
+        raise HTTPException(status_code=500, detail="Kubernetes ServiceAccount token not found")
+
+    url = f"{api_url}/apis/apps/v1/namespaces/{namespace}/deployments/{deployment_name}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/strategic-merge-patch+json",
+    }
+    patch_body = {
+        "spec": {
+            "template": {
+                "metadata": {
+                    "annotations": {
+                        "kubectl.kubernetes.io/restartedAt": datetime.now(timezone.utc).isoformat()
+                    }
+                }
+            }
+        }
+    }
+
+    verify = ca_cert if (ca_cert and os.path.exists(ca_cert)) else False
+    try:
+        async with httpx.AsyncClient(verify=verify, timeout=15.0) as client:
+            resp = await client.patch(url, headers=headers, json=patch_body)
+    except Exception as e:
+        logger.error("Failed to patch Kubernetes deployment %s: %s", deployment_name, e)
+        raise HTTPException(status_code=500, detail=f"Failed to communicate with Kubernetes API: {e}")
+
+    if resp.status_code in (200, 201):
+        logger.info("Successfully initiated Kubernetes rollout restart for deployment %s", deployment_name)
+        return {
+            "status": "success",
+            "method": "kubernetes",
+            "output": f"Deployment {deployment_name} restarted successfully",
+            "note": "Kubernetes rolling restart triggered.",
+        }
+    elif resp.status_code == 404:
+        raise HTTPException(status_code=404, detail=f"Kubernetes deployment '{deployment_name}' not found in namespace '{namespace}'")
+    else:
+        logger.error("Kubernetes API returned error %s: %s", resp.status_code, resp.text)
+        raise HTTPException(status_code=resp.status_code, detail=f"Kubernetes restart failed: {resp.text[:200]}")
+
+
+async def _stop_kubernetes_deployments(action: Optional[Any] = None) -> dict:
+    """Scale down Kubernetes deployments when running in a cluster."""
+    import httpx
+    token, namespace, ca_cert, api_url = _get_k8s_service_account_info()
+    if not token:
+        raise HTTPException(status_code=500, detail="Kubernetes ServiceAccount token not found")
+    name_map = {
+        "ai_engine": "ai-engine",
+        "ai-engine": "ai-engine",
+        "admin_ui": "admin-ui",
+        "admin-ui": "admin-ui",
+        "local_ai_server": "local-ai-server",
+        "local-ai-server": "local-ai-server",
+        "asterisk": "asterisk-pbx",
+        "asterisk_pbx": "asterisk-pbx",
+        "asterisk-pbx": "asterisk-pbx",
+    }
+    targets = action.containers if (action and action.containers) else ["ai_engine"]
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/strategic-merge-patch+json",
+    }
+    patch_body = {"spec": {"replicas": 0}}
+    verify = ca_cert if (ca_cert and os.path.exists(ca_cert)) else False
+    async with httpx.AsyncClient(verify=verify, timeout=15.0) as client:
+        for t in targets:
+            dname = name_map.get(t, t.replace("_", "-"))
+            url = f"{api_url}/apis/apps/v1/namespaces/{namespace}/deployments/{dname}"
+            try:
+                await client.patch(url, headers=headers, json=patch_body)
+            except Exception as e:
+                logger.error("Failed to scale down k8s deployment %s: %s", dname, e)
+    return {"success": True, "output": f"Scaled down {targets}"}
+
+
+async def _restart_all_kubernetes_deployments() -> dict:
+    """Restart core Kubernetes deployments when running in a cluster."""
+    import httpx
+    from datetime import datetime, timezone
+    token, namespace, ca_cert, api_url = _get_k8s_service_account_info()
+    if not token:
+        raise HTTPException(status_code=500, detail="Kubernetes ServiceAccount token not found")
+    verify = ca_cert if (ca_cert and os.path.exists(ca_cert)) else False
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/strategic-merge-patch+json",
+    }
+    patch_body = {
+        "spec": {
+            "template": {
+                "metadata": {
+                    "annotations": {
+                        "kubectl.kubernetes.io/restartedAt": datetime.now(timezone.utc).isoformat()
+                    }
+                }
+            }
+        }
+    }
+    deployments = ["ai-engine", "admin-ui"]
+    async with httpx.AsyncClient(verify=verify, timeout=15.0) as client:
+        for dname in deployments:
+            url = f"{api_url}/apis/apps/v1/namespaces/{namespace}/deployments/{dname}"
+            try:
+                await client.patch(url, headers=headers, json=patch_body)
+            except Exception as e:
+                logger.error("Failed to restart k8s deployment %s: %s", dname, e)
+    return {"success": True, "output": "All core Kubernetes deployments restarted successfully"}
+
+
 def _collect_containers() -> List[dict]:
-    """Synchronous Docker SDK calls. Blocking — must run off the event loop."""
+    """Synchronous Docker SDK calls or Kubernetes API calls. Blocking — must run off the event loop."""
+    if _is_kubernetes_environment():
+        return _collect_kubernetes_pods()
+
     from datetime import datetime, timezone
 
     client = docker.from_env()
@@ -370,6 +607,9 @@ async def start_container(container_id: str):
         "local-ai-server": "local_ai_server",
     }
     
+    if _is_kubernetes_environment():
+        return await _restart_kubernetes_deployment(container_id)
+
     service_name = service_map.get(container_id)
     
     # If not in map, it might be an ID or a raw name.
@@ -683,7 +923,7 @@ def _validate_websocket_restart_environment(*, recreate: bool) -> None:
         return
     key = config.auth.password_env
     source = "the project .env file" if recreate else "the existing AI Engine container"
-    if recreate:
+    if recreate or _is_kubernetes_environment():
         present = bool(_dotenv_value(key))
     else:
         client = None
@@ -780,6 +1020,9 @@ async def restart_container(container_id: str, force: bool = False, recreate: bo
                 "active_calls": call_status["active_calls"],
                 "action_required": "Set force=true to restart anyway, or wait for calls to complete",
             }
+
+    if _is_kubernetes_environment():
+        return await _restart_kubernetes_deployment(container_name)
 
     # NOTE: docker restart does NOT reload env_file changes.
     # Restart is still useful for recovering from crashes and non-env changes.
@@ -3470,6 +3713,9 @@ async def start_containers(action: ContainerAction = None):
 @router.post("/containers/stop")
 async def stop_containers(action: ContainerAction = None):
     """Stop containers."""
+    if _is_kubernetes_environment():
+        return await _stop_kubernetes_deployments(action)
+
     import subprocess
     project_root = os.getenv("PROJECT_ROOT", "/app/project")
     
@@ -3490,6 +3736,9 @@ async def stop_containers(action: ContainerAction = None):
 @router.post("/containers/restart-all")
 async def restart_all_containers():
     """Restart all containers."""
+    if _is_kubernetes_environment():
+        return await _restart_all_kubernetes_deployments()
+
     import subprocess
     project_root = os.getenv("PROJECT_ROOT", "/app/project")
 
