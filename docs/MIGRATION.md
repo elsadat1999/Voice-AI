@@ -1,6 +1,194 @@
 # Migration Guide
 
-This guide covers upgrading between major versions of Asterisk AI Voice Agent.
+This guide covers upgrading between releases of Asterisk AI Voice Agent.
+
+## v7.6.3 to v7.6.4
+
+v7.6.4 contains HTTP-tool template hardening, farewell/transfer recovery fixes,
+and compatible Admin dependency updates. No database migration or change to
+saved Agents, providers, models, transports or Audio Profile defaults is required.
+
+Drain calls and preserve configuration, SQLite data, credentials, calendar OAuth
+caches and local Compose overlays using the
+[upgrade guide](INSTALLATION.md#upgrade-to-v764-existing-checkout). Rebuild/recreate
+`ai_engine` and `admin_ui` together, then hard-refresh the browser. Local AI code
+and its dependency profile are unchanged from v7.6.3; retain existing Local AI
+services and model volumes. Earlier upgrades must follow the intervening sections.
+
+### HTTP tool templates
+
+Before upgrading, review pre-call lookups, in-call HTTP tools and post-call
+webhooks against the [template compatibility rules](TOOL_CALLING_GUIDE.md#http-template-safety-and-compatibility):
+
+- Substitutions run once, only against the operator-authored template. Inserted
+  caller/model data and enrichment cannot introduce further placeholders.
+- Built-in call context and enrichment remain protected from model-argument
+  overrides, including when a protected field is empty. Use declared tool
+  parameters for independent model inputs rather than shadowing context names.
+- Absent Content-Type means JSON. Quote text placeholders inside JSON strings;
+  unquoted placeholders must resolve to one valid JSON value. Invalid JSON is
+  rejected before sending. Existing serialized transcript/summary placeholders
+  remain supported.
+- Raw text requires explicit `Content-Type: text/plain`. Form bodies retain
+  field encoding. XML, multipart and other unsupported body formats fail closed.
+- Keep the URL origin in operator configuration or an environment reference.
+  Per-call values supply encoded URL components, not a whole URL or multiple path
+  segments. Dot path segments are rejected. Do not pre-encode `query_params`.
+- The Admin HTTP **Test** preview uses a separate implementation. A successful
+  preview does not establish compatibility with the engine's runtime renderer.
+
+### Farewell and transfer recovery
+
+Google fallback uses the completed turn, while Google/Grok marker matching uses
+word/phrase boundaries. A pending deferred transfer takes priority over
+`HangupReady`; superseded hangup timers and provider farewell state are retired.
+Drain timeout recovery can play its apology and continue the conversation.
+Failed commits cancel their exact action without automatic replay; replacements
+survive older failures, and later independent hangups remain possible.
+
+Google marker heuristics remain off by default. Existing opt-in settings are
+preserved; ambiguous phrases such as "all set" can still cause false positives.
+See the [Google farewell guidance](Provider-Google-Setup.md#marker-based-hangup-heuristics).
+
+### Admin dependencies and custom telemetry
+
+The Admin backend updates FastAPI to 0.143.0 and Pydantic to 2.14.0; the
+supported container Python version remains 3.11. No database migration or
+provider, transport, model, or saved Agent default changes are introduced by
+these dependency updates. Rebuild the Admin image and hard-refresh its frontend
+after upgrading.
+
+FastAPI 0.143 makes automatic OpenTelemetry exporter configuration opt-in.
+The standard AVA deployment does not configure these exporters and requires no
+change. If a custom Admin deployment relies on FastAPI automatically consuming
+`OTEL_*` variables, install the matching `fastapi[opentelemetry]==0.143.0`
+extra (or equivalent SDK and OTLP exporter packages) in your custom Admin image,
+and pass `FASTAPI_OTEL_AUTO_CONFIGURE=true` to that container. The standard image
+does not include this extra. Otherwise, keep configuring providers/exporters
+yourself. See the
+[upstream release notes](https://github.com/fastapi/fastapi/releases/tag/0.143.0).
+
+### Rollback
+
+Drain calls, restore v7.6.3 code/images and pre-upgrade configuration, and retain
+Agent databases, model volumes, credentials and OAuth caches. No database
+downgrade is required. Code rollback cannot undo remote HTTP effects, bookings
+or completed transfers; reconcile ambiguous outcomes before retrying.
+Rolling back also removes HTTP template hardening: restrict or disable affected
+HTTP tools until a fixed release is restored. Remove custom FastAPI telemetry
+changes only if the older image/configuration does not support them.
+
+The [v7.6.4 validation matrix](baselines/golden/v7.6.4-validation-matrix.md)
+records the included PR evidence and the remaining final-candidate acceptance
+and publication gates. Previous-release waivers are not new acceptance evidence.
+
+## v7.6.2 to v7.6.3
+
+v7.6.3 is an in-place reliability, security, and operator-documentation release.
+It does not migrate databases, reassign Agents, or change saved provider,
+transport, Audio Profile, or Google model selections.
+
+Drain calls and back up configuration, SQLite stores, calendar OAuth caches,
+provider secrets and local Compose overlays using the
+[upgrade guide](INSTALLATION.md#upgrade-to-v763-existing-checkout). Then:
+
+1. Rebuild/recreate `ai_engine` and `admin_ui`. Rebuild/recreate
+   `local_ai_server` **if your deployment uses it**: Whisper idle-finalization
+   code changed. Preserve your CPU/GPU build profile and model volumes; do not
+   start the optional local service on a cloud-only installation.
+2. Cloud startup connection recovery is opt-in. Existing installations retain
+   a 10-second opening timeout, zero retries and no aggregate deadline.
+   Expert controls affect initial connection only, not established-call
+   recovery or terminal failure routing. See [connection recovery](Provider-Connection-Recovery.md).
+3. Google Developer long-response playback defaults off, requires a saved
+   provider setting and engine restart, and is ignored on Vertex connections.
+   It cannot recover audio never received from Google. See the
+   [Google guide](Provider-Google-Setup.md#long-response-playback-developer-api-opt-in).
+4. Provider tests now honor explicit endpoints, roles and provider-scoped
+   credentials. Fix invalid/custom endpoint configuration instead of relying
+   on an implicit fallback to a public service. Speech probes may establish
+   reachability only, not transcription or synthesis quality.
+5. Streamable HTTP MCP is configured in YAML with environment-referenced auth
+   headers; the Admin UI editor still supports stdio only. Restart the engine
+   outside calls after connection changes. Ambiguous remote tool outcomes are
+   not replayed automatically; reconcile side effects on the remote service
+   before retrying. See [MCP integration](MCP_INTEGRATION.md).
+6. Admin dependency/security updates include React Router 7. Hard-refresh the
+   rebuilt UI and confirm Call History deep-link opening/closing. DTMF remains
+   delivered to native handlers but no longer appears as raw digits in logs.
+   Google deferred-transfer repeat suppression does not remove a duplicate
+   transcript or prevent a repeat queued before an opt-in playback drain.
+
+Rollback requires no database downgrade. Drain calls, restore the v7.6.2
+code/images and pre-upgrade configuration, and remove any newly adopted HTTP MCP
+or optional provider settings not supported by the older code. Preserve model
+volumes, Agent data, calendar identities and OAuth caches. External tool effects,
+appointments and invitations are not undone by a code rollback.
+
+The [v7.6.3 validation matrix](baselines/golden/v7.6.3-validation-matrix.md)
+separates merged-feature evidence from pending exact-candidate tag acceptance.
+Previous-release acceptance is not silently carried forward as a new pass.
+
+## v7.6.1 to v7.6.2
+
+v7.6.2 is an in-place feature and reliability release. It adds opt-in Gemini 3.8
+Live, Microsoft Calendar invitations and same-call booking changes, shared Call
+History filters, and Admin UI accessibility/readability improvements. There is
+no database migration, dependency update, or change to saved Agent assignments,
+selected providers, transport, Audio Profiles, or shipped Google Live model
+defaults in this release.
+
+Before upgrading, drain active calls and back up operator configuration, SQLite
+data and calendar token caches using the [installation guide](INSTALLATION.md#upgrade-to-v762-existing-checkout).
+Then:
+
+1. Rebuild/recreate `ai_engine` and `admin_ui` together. The bundled
+   `local_ai_server` is unchanged; do not start/recreate it solely for this
+   release. Do not interrupt an active calendar booking conversation.
+2. Preserve Microsoft account identities, OAuth caches, saved calendar IDs and
+   Agent tool scopes. Verification reads the saved calendar directly and never
+   chooses another/default calendar. A legacy `account_identity_mismatch`
+   requires an operator to confirm the intended account and correct its
+   configured identity to the cached MSAL username, not select a different user
+   or reconnect as a workaround. Expired/revoked authorization still requires
+   reconnecting.
+3. Microsoft invitations remain disabled until explicitly enabled. Working
+   hours guide suggestions; enforcing hours/days/horizon is a separate opt-in.
+   Existing appointment-only create arguments remain supported. Review any
+   integrations using arbitrary-ID deletion or private event bodies: mutations
+   now require consent and tracked current-call ownership, and generic event
+   reads omit invitation bodies. Later-call/untracked mutations require staff.
+   Saved Agent prompts are not rewritten; calendar runtime guidance applies to
+   full-agent and modular/hybrid providers. See the
+   [calendar guide](Microsoft-calendar-tool.md#upgrading-existing-installations).
+4. Gemini 3.8 Live is opt-in and Audio Only, with model-aware Vertex regions.
+   Existing model defaults remain unchanged. Attached calls qualify the scoped
+   Vertex `us-central1` paths, not every region, Developer API workload or
+   provider/transport combination. Review the
+   [Google](Provider-Google-Setup.md) and [Vertex](Provider-Vertex-Setup.md) guides
+   before changing a production model.
+5. Call History list, statistics and CSV/JSON exports now share all active
+   filters. Multiple outcomes and **Only / Hide**, tool usage and duration
+   filters are available; hiding outcomes retains calls with no outcome. A
+   single `outcome` parameter remains compatible. No historical data is rewritten.
+6. `farewell_hangup_delay_sec` is deprecated and ignored. Existing YAML values
+   and the tools API remain accepted; its UI controls and shipped value are
+   removed. Hangup still drains caller-facing audio, including the modular
+   pipeline farewell fallback; Local AI's separate farewell controls remain.
+
+Rollback requires no database downgrade. Drain calls and restore the v7.6.1
+images/code and pre-update configuration backup, especially after adopting
+Gemini 3.8-specific settings. Microsoft calendar IDs/caches need no conversion.
+Existing Graph events and invitations remain: never delete appointments as
+rollback cleanup. Same-call booking ownership is bounded/in-memory and cannot
+survive a restart or code rollback; staff must handle untracked changes.
+Invitation request success still does not establish delivery or acceptance, and
+availability checks are not distributed exclusive reservations.
+
+The maintainer confirmed the [#686 acceptance plan](Microsoft-calendar-tool.md#acceptance-plan-and-rollout)
+was tested and validated for this release on 2026-10-02. See the
+[v7.6.2 matrix](baselines/golden/v7.6.2-validation-matrix.md) for evidence and
+qualification boundaries; this confirmation is not a blanket provider sweep.
 
 ## v7.6.0 to v7.6.1
 
@@ -284,7 +472,7 @@ does not alter historical Call History records.
 ## v7.4.1 to v7.5.0
 
 Released 2026-07-22. Follow the
-[v7.5.0 upgrade procedure](INSTALLATION.md#upgrade-to-v750-existing-checkout),
+[current upgrade procedure](INSTALLATION.md),
 including the local-change decision, Compose validation, backup, and post-update checks.
 
 ### Audio transport and profiles
@@ -349,7 +537,7 @@ v7.4 removes Contexts as a product and runtime model. Agents in
 
 ### Before upgrading
 
-1. Follow the [current upgrade procedure](INSTALLATION.md#upgrade-to-v754-existing-checkout),
+1. Follow the [current upgrade procedure](INSTALLATION.md),
    including the documented older-installation updater recovery path.
 2. Back up `data/operator/agents.db`, `data/call_history.db`, `.env`, operator YAML,
    `config/users.json`, and any legacy `config/contexts/` files.

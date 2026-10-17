@@ -35,6 +35,7 @@ except ImportError:
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest, Histogram, Counter, Gauge
 
 from .ari_client import ARIClient
+from .core.audio_backlog import AudioBacklogQueue
 from aiohttp import web
 from pydantic import ValidationError
 
@@ -660,6 +661,9 @@ class Engine:
         self._agent_output_active_calls: Set[str] = set()
         self._provider_output_drain_tasks: Dict[str, asyncio.Task] = {}
         self._deferred_transfer_commit_locks: Dict[str, asyncio.Lock] = {}
+        # Deferred transfer commits in flight, per call: one marker per commit
+        # attempt, stamped with the action id it is committing once known.
+        self._deferred_transfer_committing: Dict[str, List[Dict[str, Any]]] = {}
         # All terminal paths converge on one idempotent drain-and-hangup owner.
         self._terminal_hangup_locks: Dict[str, asyncio.Lock] = {}
         self._terminal_hangup_started: Set[str] = set()
@@ -1476,6 +1480,78 @@ class Engine:
         if operation and operation.get("output_id") == output_id:
             operations.pop(call_id, None)
 
+    def _google_long_audio_provider(self, session):
+        provider = getattr(self, "_call_providers", {}).get(session.call_id)
+        if (
+            self._get_provider_kind(getattr(session, "provider_name", None)) == "google_live"
+            and isinstance(provider, GoogleLiveProvider)
+            and provider.long_audio_playback_enabled
+        ):
+            return provider
+        return None
+
+    def _new_provider_audio_queue(self, call_id, session):
+        provider = self._google_long_audio_provider(session)
+        if provider is None:
+            return asyncio.Queue(maxsize=256)
+        fmt = self._provider_stream_formats.get(call_id, {})
+        encoding = self._canonicalize_encoding(fmt.get("playback_encoding") or fmt.get("encoding"))
+        rate = int(fmt.get("playback_sample_rate") or fmt.get("sample_rate") or session.transport_profile.wire_sample_rate)
+        bytes_per_sample = 1 if encoding in ("ulaw", "mulaw", "alaw", "g711_alaw") else 2
+        budget_sec = provider.config.long_audio_backlog_sec
+        queue = AudioBacklogQueue(int(rate * bytes_per_sample * budget_sec))
+        logger.info("Google Developer audio backlog enabled", call_id=call_id,
+                    budget_sec=budget_sec, max_bytes=queue.max_bytes,
+                    sample_rate=rate, encoding=encoding)
+        return queue
+
+    def _close_google_audio_backlog(self, call_id, *, remove=False):
+        queue = getattr(self, "_provider_stream_queues", {}).get(call_id)
+        if isinstance(queue, AudioBacklogQueue):
+            queue.close()
+            if remove:
+                self._provider_stream_queues.pop(call_id, None)
+
+    async def _fail_google_audio_playback(self, call_id, reason):
+        self._close_google_audio_backlog(call_id)
+        await self.streaming_playback_manager.stop_streaming_playback(call_id)
+        await self._terminate_call_after_audio(call_id, reason=reason, audio_already_drained=True)
+
+    def _google_audio_backlog_overflow(self, call_id, session):
+        provider = self._google_long_audio_provider(session)
+        if provider is None or provider._long_audio_failed:
+            return
+        provider._long_audio_failed = True
+        queue = self._provider_stream_queues.get(call_id)
+        logger.error("Google audio backlog exceeded; terminating test call", call_id=call_id,
+                     pending_bytes=getattr(queue, "pending_bytes", 0),
+                     max_bytes=getattr(queue, "max_bytes", 0))
+        self._close_google_audio_backlog(call_id)
+        self._fire_and_forget_for_call(call_id,
+            self._fail_google_audio_playback(call_id, "google_audio_backlog_overflow"),
+            name=f"google-audio-overflow-{call_id}")
+
+    async def _complete_google_audio_terminal_actions(self, call_id):
+        session = await self.session_store.get_by_call_id(call_id)
+        if not session or bool(getattr(session, "cleanup_in_progress", False)):
+            return
+        farewell = getattr(self, "_farewell_done_events", {}).get(f"farewell_done_{call_id}")
+        if farewell is not None:
+            farewell.set()
+        if isinstance(getattr(session, "pending_deferred_transfer", None), dict):
+            self._fire_and_forget_for_call(
+                call_id, self._commit_pending_deferred_transfer_for_call(
+                    call_id, session,
+                    expected_action_id=session.pending_deferred_transfer.get("id"),
+                ),
+                name=f"deferred-transfer-commit-{call_id}",
+            )
+        elif getattr(session, "cleanup_after_tts", False):
+            await self._terminate_call_after_audio(
+                call_id, reason="cleanup_after_tts", call_outcome="agent_hangup",
+                drain_timeout_sec=150.0,
+            )
+
     async def _note_provider_output_start(self, call_id: str) -> None:
         """Observe real caller-facing provider audio without changing AEC gating."""
         operations = getattr(self, "_provider_output_operations", {})
@@ -1583,10 +1659,13 @@ class Engine:
     ) -> None:
         """Clear provider-output state only after queued caller audio is emitted."""
         current_task = asyncio.current_task()
+        session = await self.session_store.get_by_call_id(call_id)
+        google_provider = self._google_long_audio_provider(session) if session else None
+        timeout_sec = google_provider.config.long_audio_backlog_sec + 30.0 if google_provider else 30.0
         try:
             drained = await self._wait_for_call_audio_drain(
                 call_id,
-                timeout_sec=30.0,
+                timeout_sec=timeout_sec,
                 quiet_sec=self._terminal_transport_quiet_sec(),
                 reason="provider_output",
             )
@@ -1599,7 +1678,21 @@ class Engine:
         drain_tasks = getattr(self, "_provider_output_drain_tasks", {})
         if drain_tasks.get(call_id) is not current_task:
             return
-        drain_tasks.pop(call_id, None)
+        if not google_provider:
+            drain_tasks.pop(call_id, None)
+        if google_provider:
+            session = await self.session_store.get_by_call_id(call_id)
+            if drain_tasks.get(call_id) is not current_task:
+                return
+            if not session or bool(getattr(session, "cleanup_in_progress", False)):
+                drain_tasks.pop(call_id, None)
+                return  # Teardown is cancellation, not a playback timeout.
+        if google_provider and not drained:
+            drain_tasks.pop(call_id, None)
+            google_provider._long_audio_failed = True
+            logger.error("Google audio playback failed to drain", call_id=call_id)
+            await self._fail_google_audio_playback(call_id, "google_audio_drain_timeout")
+            return
         getattr(self, "_agent_output_active_calls", set()).discard(call_id)
 
         session = await self.session_store.get_by_call_id(call_id)
@@ -1633,6 +1726,8 @@ class Engine:
             reset_timer=reset_timer,
             preserve_policy_state=preserve_policy_state,
         )
+        if google_provider and drain_tasks.get(call_id) is current_task:
+            drain_tasks.pop(call_id, None)
 
     async def _clear_tts_gating_after_provider_drain(
         self,
@@ -3672,7 +3767,6 @@ class Engine:
             attempt_id=attempt_id,
             amd_status=amd_status,
             amd_cause=amd_cause,
-            consent_dtmf=consent_dtmf or None,
             consent_result=consent_result or None,
         )
 
@@ -9624,7 +9718,6 @@ class Engine:
             logger.info(
                 "Channel DTMF received",
                 channel_id=channel_id,
-                digit=digit,
             )
 
             if not channel_id or not digit:
@@ -9644,8 +9737,8 @@ class Engine:
                     if session and session.current_action and session.current_action.get("type") == "attended_transfer":
                         session.current_action["decision_digit"] = str(digit)
                         await self._save_session(session)
-                except Exception:
-                    logger.debug("Failed to persist attended transfer DTMF digit", call_id=call_id, exc_info=True)
+                except Exception as exc:
+                    logger.debug("Failed to persist attended transfer DTMF digit", call_id=call_id, error_type=type(exc).__name__)
 
             waiter = self._attended_transfer_dtmf_waiters.get(channel_id)
             if waiter and not waiter.done():
@@ -9654,7 +9747,7 @@ class Engine:
                 except Exception:
                     pass
         except Exception as exc:
-            logger.error("Error handling ChannelDtmfReceived", error=str(exc), exc_info=True)
+            logger.error("Error handling ChannelDtmfReceived", error_type=type(exc).__name__)
 
     async def _handle_channel_varset(self, event: dict):
         """Monitor ChannelVarset events for debugging configuration state."""
@@ -10224,6 +10317,7 @@ class Engine:
                 logger.debug("Pipeline cleanup failed", call_id=call_id, exc_info=True)
 
             # Stop any active streaming playback.
+            self._close_google_audio_backlog(call_id, remove=True)
             try:
                 await self.streaming_playback_manager.stop_streaming_playback(call_id)
             except Exception:
@@ -11340,7 +11434,24 @@ class Engine:
                 # Other native full-agent providers remain unchanged.
                 full_duplex_barge_in = self._google_live_full_duplex_barge_in(provider_name, provider)
                 needs_gating = self._get_provider_kind(provider_name) == "google_live" and not full_duplex_barge_in
-                
+                # Keep normalized caller PCM for Google's local detector while
+                # upstream receives silence. Other providers and ungated frames
+                # retain their existing post-squelch detector input.
+                pcm_for_barge_in = (
+                    pcm_bytes if needs_gating and not session.audio_capture_enabled else None
+                )
+                if pcm_for_barge_in:
+                    try:
+                        import audioop as caller_audioop
+
+                        # Residual DC bias is not caller speech. Condition only
+                        # this detector copy, without changing provider payloads.
+                        dc_offset = caller_audioop.avg(pcm_for_barge_in, 2)
+                        if dc_offset:
+                            pcm_for_barge_in = caller_audioop.bias(pcm_for_barge_in, 2, -dc_offset)
+                    except (caller_audioop.error, ValueError):
+                        logger.debug("Google fallback PCM conditioning failed", call_id=caller_channel_id)
+
                 if needs_gating and not session.audio_capture_enabled:
                     # Send silence instead of blocking so Google Live's continuous
                     # input timing and VAD state remain stable.
@@ -11522,7 +11633,7 @@ class Engine:
                     try:
                         await self._maybe_provider_barge_in_fallback(
                             session,
-                            pcm16=pcm_bytes,
+                            pcm16=pcm_for_barge_in if pcm_for_barge_in is not None else pcm_bytes,
                             pcm_rate_hz=pcm_rate,
                             audiosocket_wire=audio_bytes,
                             source="audiosocket",
@@ -12415,6 +12526,11 @@ class Engine:
                 vad_speech = bool(getattr(vad_result, "is_speech", False))
                 webrtc_positive = bool(getattr(vad_result, "webrtc_result", False))
 
+            google_short_speech = bool(
+                self._google_long_audio_provider(session)
+                and not self._google_live_full_duplex_barge_in(provider_name, provider)
+            )
+            speech_window = session.vad_state.setdefault("google_short_speech", {}) if google_short_speech else None
             threshold = int(getattr(cfg, "energy_threshold", 1000))
             criteria_met = 0
             if vad_speech:
@@ -12432,6 +12548,14 @@ class Engine:
             # In provider-fallback mode, require energy above threshold to avoid false positives on near-silence
             # (webrtc-vad can occasionally fire "speech" on low-energy telephony noise).
             if energy < threshold:
+                if speech_window is not None:
+                    gap_ms = int(speech_window.get("gap_ms", 0)) + frame_ms
+                    speech_window["gap_ms"] = gap_ms
+                    # Permit at most two 20-ms inter-syllable gaps. Larger
+                    # pauses, stale windows and noise reset the candidate.
+                    if gap_ms <= 40 and now - float(speech_window.get("started_at", 0)) <= 0.2:
+                        return
+                    speech_window.clear()
                 session.barge_in_candidate_ms = 0
                 return
 
@@ -12447,6 +12571,15 @@ class Engine:
                 or vad_result is None
                 or criteria_met >= 2
             )
+            if speech_window is not None:
+                if now - float(speech_window.get("started_at", 0)) > 0.2:
+                    session.barge_in_candidate_ms = 0
+                    speech_window.clear()
+                if not speech_window:
+                    speech_window["started_at"] = now
+                speech_window["gap_ms"] = 0
+                if not qualifies:
+                    speech_window.clear()
             if qualifies:
                 if int(getattr(session, "barge_in_candidate_ms", 0) or 0) == 0:
                     session.barge_start_ts = now
@@ -12472,6 +12605,10 @@ class Engine:
             in_cooldown = (now - last_barge_in_ts) * 1000 < cooldown_ms if last_barge_in_ts else False
 
             min_ms = self._provider_fallback_min_ms(cfg, provider_name)
+            if google_short_speech:
+                # Scoped to the Developer long-response opt-in. Preserve the
+                # configured energy/VAD votes and all existing protections.
+                min_ms = min(min_ms, 120)
             if local_energy_authoritative:
                 # Local full-agent speech consists of short telephony syllable
                 # bursts separated by natural sub-threshold gaps.  Reuse the
@@ -12495,6 +12632,8 @@ class Engine:
             except Exception:
                 pass
 
+            if speech_window is not None:
+                speech_window.clear()
             await self._apply_barge_in_action(
                 call_id,
                 source="local_vad_fallback",
@@ -12667,6 +12806,7 @@ class Engine:
                     )
 
             # Stop/flush streaming playback first (prevents tail audio).
+            self._close_google_audio_backlog(call_id)
             # Mark end_reason so cleanup skips remainder flush (avoids oversized RTP packets).
             playback_position_ms = 0
             try:
@@ -12686,6 +12826,11 @@ class Engine:
                 self._provider_stream_queues.pop(call_id, None)
                 self._provider_stream_formats.pop(call_id, None)
                 self._provider_coalesce_buf.pop(call_id, None)
+                if self._google_long_audio_provider(session):
+                    self._segment_tts_active.discard(call_id)
+                    await self._note_provider_output_end(
+                        call_id, session, clear_tts_gating_after_drain=True,
+                    )
             except Exception:
                 logger.debug("Failed to clear provider stream buffers during barge-in", call_id=call_id, exc_info=True)
 
@@ -12980,9 +13125,9 @@ class Engine:
         """Handle DTMF received over AudioSocket (informational)."""
         try:
             caller_channel_id = self.conn_to_channel.get(conn_id)
-            logger.info("AudioSocket DTMF received", conn_id=conn_id, caller_channel_id=caller_channel_id, digit=digit)
+            logger.info("AudioSocket DTMF received", conn_id=conn_id, caller_channel_id=caller_channel_id)
         except Exception as exc:
-            logger.error("Error handling AudioSocket DTMF", conn_id=conn_id, error=str(exc), exc_info=True)
+            logger.error("Error handling AudioSocket DTMF", conn_id=conn_id, error_type=type(exc).__name__)
 
     def _externalmedia_continuous_input_mode(
         self,
@@ -13950,6 +14095,10 @@ class Engine:
             if not session:
                 logger.warning("Provider event for unknown call", event_type=etype, call_id=call_id)
                 return
+            if bool(getattr(session, "cleanup_in_progress", False)) and (
+                "audio_response_id" in event or etype == "GoogleAudioGenerationComplete"
+            ):
+                return
 
             # Normalize provider-native caller activity before any barge-in guards.
             # A speech-start event is useful to the inactivity watchdog even when
@@ -14094,11 +14243,26 @@ class Engine:
                     reason=reason,
                 )
                 await self._stop_connection_audio(session, reason="provider-disconnected")
-                try:
-                    session.provider_session_active = False
-                    await self._save_session(session)
-                except Exception:
-                    logger.debug("Failed to mark provider_session_active=false", call_id=call_id, exc_info=True)
+                google_disconnect_drain = bool(self._google_long_audio_provider(session))
+                if not google_disconnect_drain:
+                    try:
+                        session.provider_session_active = False
+                        await self._save_session(session)
+                    except Exception:
+                        logger.debug("Failed to mark provider_session_active=false", call_id=call_id, exc_info=True)
+
+                if google_disconnect_drain:
+                    # Do not block the provider's serial event dispatcher during
+                    # playback drain or an attended transfer's routing decision.
+                    task_name = f"google-disconnect-{call_id}"
+                    if not any(
+                        not task.done() and task.get_name() == task_name
+                        for task in self._call_bg_tasks.get(call_id, set())
+                    ):
+                        self._fire_and_forget_for_call(
+                            call_id, self._finish_google_provider_disconnect(call_id), name=task_name,
+                        )
+                    return
 
                 # Optional: play configured fallback media (same knob as hangup_call fallback).
                 try:
@@ -14134,6 +14298,23 @@ class Engine:
             if etype == "AgentAudio":
                 chunk: bytes = event.get("data") or b""
                 if not chunk:
+                    return
+                if self._provider_audio_blocked_by_transfer_commit(call_id, session):
+                    # The handoff line has finished and the transfer is
+                    # draining. New provider speech here is a follow-up turn
+                    # (Google Live answers its own tool response with a repeat
+                    # of the handoff line), so it must not reach the caller.
+                    dropped = session.vad_state.setdefault(
+                        "transfer_commit_dropped", {"chunks": 0, "bytes": 0}
+                    )
+                    dropped["chunks"] += 1
+                    dropped["bytes"] += len(chunk)
+                    if dropped["chunks"] == 1:
+                        logger.info(
+                            "Dropped provider audio: deferred transfer is committing",
+                            call_id=call_id,
+                            provider=getattr(session, "provider_name", None),
+                        )
                     return
                 source_mode = str(event.get("source_mode") or "").strip().lower()
                 local_farewell_pending = getattr(self, "_local_tts_farewell_pending", set())
@@ -14211,6 +14392,14 @@ class Engine:
                 await self._stop_connection_audio(session, reason="first-provider-audio")
                 # This is real audio that will enter the caller-facing playback
                 # path.  Track it independently from echo/AEC gating state.
+                google_audio_provider = self._google_long_audio_provider(session)
+                if google_audio_provider:
+                    if google_audio_provider._long_audio_failed:
+                        return
+                    response_id = int(event.get("audio_response_id") or 0)
+                    if response_id < google_audio_provider._playback_response_id:
+                        return
+                    google_audio_provider._playback_response_id = response_id
                 await self._note_provider_output_start(call_id)
                 encoding = event.get("encoding")
                 if isinstance(encoding, bytes):
@@ -14418,7 +14607,7 @@ class Engine:
                         return
                     # Start streaming now with coalesced buffer
                     try:
-                        q = asyncio.Queue(maxsize=256)
+                        q = self._new_provider_audio_queue(call_id, session)
                         self._provider_stream_queues[call_id] = q
                         playback_type = "greeting" if getattr(session, "conversation_state", "") == "greeting" else "streaming-response"
                         fmt_info = self._provider_stream_formats.get(call_id, {})
@@ -14504,6 +14693,7 @@ class Engine:
                                 pass
                         except asyncio.QueueFull:
                             logger.debug("Coalesced enqueue dropped (queue full)", call_id=call_id)
+                            self._google_audio_backlog_overflow(call_id, session)
                         self._provider_coalesce_buf.pop(call_id, None)
                         return
                     except Exception:
@@ -14514,7 +14704,7 @@ class Engine:
                     # Normal path: ensure stream and enqueue
                     if q is None:
                         # No existing queue - create new one
-                        q = asyncio.Queue(maxsize=256)
+                        q = self._new_provider_audio_queue(call_id, session)
                         self._provider_stream_queues[call_id] = q
                         try:
                             playback_type = "greeting" if getattr(session, "conversation_state", "") == "greeting" else "streaming-response"
@@ -14626,12 +14816,39 @@ class Engine:
                             self._enqueued_bytes[call_id] = int(self._enqueued_bytes.get(call_id, 0)) + len(out_chunk)
                     except asyncio.QueueFull:
                         logger.debug("Provider streaming queue full; dropping chunk", call_id=call_id)
-            elif etype == "AgentAudioDone":
+                        self._google_audio_backlog_overflow(call_id, session)
+            elif etype in ("AgentAudioDone", "GoogleAudioGenerationComplete"):
+                generation_only = etype == "GoogleAudioGenerationComplete"
+                google_audio_provider = self._google_long_audio_provider(session)
+                media_already_complete = False
+                if google_audio_provider:
+                    response_id = int(event.get("audio_response_id") or 0)
+                    if google_audio_provider._long_audio_failed:
+                        return
+                    if generation_only and not response_id:
+                        return
+                    if response_id and response_id != google_audio_provider._playback_response_id:
+                        return  # Delayed completion of an older/cancelled response.
+                    media_already_complete = bool(
+                        response_id and response_id == google_audio_provider._playback_completed_response_id
+                    )
+                    if generation_only and media_already_complete:
+                        return
+                    if response_id:
+                        google_audio_provider._playback_completed_response_id = response_id
+                elif generation_only:
+                    return  # Experimental events cannot affect other providers.
+                if media_already_complete:
+                    # The generation boundary already handled playback. Only
+                    # the real turn boundary may advance terminal intent.
+                    if event.get("streaming_done"):
+                        await self._complete_google_audio_terminal_actions(call_id)
+                    return
                 # Provider generation has ended. The downstream transport may
                 # still hold seconds of audio, so lifecycle completion and drain
                 # completion remain separate signals.
                 defer_gating_until_drain = bool(
-                    event.get("defer_tts_gating_until_drain", False)
+                    generation_only or event.get("defer_tts_gating_until_drain", False)
                     or getattr(self.config, "audio_transport", None) == "websocket"
                 )
                 # If we were suppressing output due to barge-in, end suppression at a segment boundary.
@@ -14735,15 +14952,16 @@ class Engine:
                 # Publish generation completion only after the stream boundary
                 # or sentinel is in place. The lifecycle observer then keeps raw
                 # VAD/watchdog output state active until those buffers drain.
-                await self._note_provider_output_end(
-                    call_id,
-                    session,
-                    clear_tts_gating_after_drain=defer_gating_until_drain,
-                )
+                if google_audio_provider is None:
+                    await self._note_provider_output_end(
+                        call_id,
+                        session,
+                        clear_tts_gating_after_drain=defer_gating_until_drain,
+                    )
 
                 # Signal farewell done event if we're waiting for hangup
                 farewell_key = f"farewell_done_{call_id}"
-                if hasattr(self, '_farewell_done_events') and farewell_key in self._farewell_done_events:
+                if not generation_only and hasattr(self, '_farewell_done_events') and farewell_key in self._farewell_done_events:
                     self._farewell_done_events[farewell_key].set()
                     logger.info("✅ Farewell audio done - signaling hangup", call_id=call_id)
                 
@@ -14816,7 +15034,7 @@ class Engine:
                     elif buf:
                         # Stream coalesced buffer now as a short segment
                         try:
-                            q2 = asyncio.Queue(maxsize=256)
+                            q2 = self._new_provider_audio_queue(call_id, session)
                             self._provider_stream_queues[call_id] = q2
                             playback_type = "streaming-response"
                             fmt_info = self._provider_stream_formats.get(call_id, {})
@@ -14857,9 +15075,17 @@ class Engine:
                                 q2.put_nowait(None)
                             except asyncio.QueueFull:
                                 logger.debug("Coalesced enqueue dropped at end (queue full)", call_id=call_id)
+                                self._google_audio_backlog_overflow(call_id, session)
                         except Exception:
                             logger.error("Coalesced streaming failed at segment end", call_id=call_id, exc_info=True)
                 
+                if google_audio_provider is not None:
+                    await self._note_provider_output_end(
+                        call_id, session, clear_tts_gating_after_drain=True,
+                    )
+                if generation_only:
+                    return
+
                 # Check if hangup was requested after TTS completion
                 # Only check when streaming_done is True (complete response ended, not just segment boundary)
                 streaming_done = event.get("streaming_done", False)
@@ -14877,6 +15103,7 @@ class Engine:
                                 self._commit_pending_deferred_transfer_for_call(
                                     call_id,
                                     session,
+                                    expected_action_id=session.pending_deferred_transfer.get("id"),
                                 ),
                                 name=f"deferred-transfer-commit-{call_id}",
                             )
@@ -14912,7 +15139,27 @@ class Engine:
                     reason=reason,
                     had_audio=had_audio
                 )
-                
+
+                # A blind transfer may have been deferred while the farewell response was
+                # finishing. Hung up first, the channel is released and the deferred commit
+                # would 404 with "Channel not found". Commit it before any hangup, mirroring
+                # the AgentAudioDone branch.
+                try:
+                    session = await self.session_store.get_by_call_id(call_id)
+                    if session and isinstance(getattr(session, "pending_deferred_transfer", None), dict):
+                        self._fire_and_forget_for_call(
+                            call_id,
+                            self._commit_pending_deferred_transfer_for_call(
+                                call_id,
+                                session,
+                                expected_action_id=session.pending_deferred_transfer.get("id"),
+                            ),
+                            name=f"deferred-transfer-commit-hangup-ready-{call_id}",
+                        )
+                        return
+                except Exception:
+                    logger.debug("Error checking pending deferred transfer on HangupReady", call_id=call_id, exc_info=True)
+
                 # If no farewell audio was produced (common when the model emits hangup_call but never
                 # follows up with an assistant turn), play a minimal server-side goodbye prompt so the
                 # call doesn't end abruptly.
@@ -15322,6 +15569,9 @@ class Engine:
             spm = getattr(self, "streaming_playback_manager", None)
             stream_info = (getattr(spm, "active_streams", {}) or {}).get(call_id) if spm else None
             if stream_info:
+                source_queue = stream_info.get("audio_source_queue")
+                if isinstance(source_queue, AudioBacklogQueue):
+                    pending_provider_chunks = max(pending_provider_chunks, source_queue.qsize())
                 pending_stream_bytes = int(stream_info.get("buffered_bytes", 0) or 0)
                 emit_ts = stream_info.get("last_real_emit_ts")
                 if emit_ts is not None:
@@ -15395,7 +15645,9 @@ class Engine:
         frame remainder, so terminal actions must wait for those buffers and a
         short post-emit quiet window.
         """
-        timeout_sec = max(0.0, min(float(timeout_sec), 120.0))
+        session = await self.session_store.get_by_call_id(call_id)
+        timeout_cap = 150.0 if session and self._google_long_audio_provider(session) else 120.0
+        timeout_sec = max(0.0, min(float(timeout_sec), timeout_cap))
         quiet_sec = max(0.0, min(float(quiet_sec), 5.0))
         if timeout_sec <= 0.0:
             return True
@@ -15456,6 +15708,59 @@ class Engine:
         )
         return False
 
+    def _google_disconnect_transfer_wait_sec(self) -> float:
+        """Bound transfer observation using configured phase budgets plus grace."""
+        tools = getattr(self.config, "tools", {}) or {}
+        cfg = tools.get("attended_transfer", {}) if isinstance(tools, dict) else {}
+        if not isinstance(cfg, dict):
+            cfg = {}
+
+        def seconds(key: str, default: float) -> float:
+            try:
+                value = float(cfg.get(key, default) or default)
+                return value if math.isfinite(value) and value >= 0 else default
+            except (TypeError, ValueError):
+                return default
+
+        # Three TTS/playback phases and a possible recovery prompt each allow
+        # synthesis plus up to four times the TTS timeout for file playback.
+        # Cap observation at ten minutes even for unreasonable YAML budgets.
+        accept_key = "accept_timeout_seconds" if "accept_timeout_seconds" in cfg else "agent_accept_timeout_seconds"
+        return min(600.0, (
+            seconds("dial_timeout_seconds", 30) + seconds("caller_screening_max_seconds", 6)
+            + seconds("ai_briefing_timeout_seconds", 2) + seconds(accept_key, 15)
+            + 20 * seconds("tts_timeout_seconds", 8) + 10
+        ))
+
+    async def _finish_google_provider_disconnect(self, call_id: str) -> None:
+        """Drain failed Google playback without taking routing from a transfer."""
+        deadline = time.monotonic() + self._google_disconnect_transfer_wait_sec()
+        while True:
+            session = await self.session_store.get_by_call_id(call_id)
+            if not session or session.cleanup_in_progress or self._session_was_transferred(session):
+                return
+            if self._session_has_pending_attended_transfer(session):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    # The transfer owner must decide routing; a stalled action
+                    # cannot hold this observer or the event dispatcher forever.
+                    logger.warning("Google disconnect transfer wait timed out; preserving transfer ownership", call_id=call_id)
+                    return
+                await asyncio.sleep(min(0.1, remaining))
+                continue
+            # Accepted audio remains valid after socket close. Keep the drain
+            # short, even when the configured long-response backlog is large.
+            await self._terminate_call_after_audio(
+                call_id, reason="google_provider_disconnected", drain_timeout_cap_sec=8.0,
+            )
+            session = await self.session_store.get_by_call_id(call_id)
+            if session and self._session_has_pending_attended_transfer(session):
+                continue
+            if session and not session.cleanup_in_progress:
+                session.provider_session_active = False
+                await self._save_session(session)
+            return
+
     async def _terminate_call_after_audio(
         self,
         call_id: str,
@@ -15464,6 +15769,7 @@ class Engine:
         call_outcome: Optional[str] = None,
         audio_already_drained: bool = False,
         drain_timeout_sec: float = 30.0,
+        drain_timeout_cap_sec: Optional[float] = None,
     ) -> bool:
         """Idempotently drain caller-facing audio and hang up the caller leg.
 
@@ -15488,7 +15794,9 @@ class Engine:
             session = await self.session_store.get_by_call_id(call_id)
             if not session or bool(getattr(session, "cleanup_in_progress", False)):
                 return False
-            if self._session_was_transferred(session) or self._session_has_pending_attended_transfer(session):
+            if (self._session_was_transferred(session)
+                    or self._session_has_pending_attended_transfer(session)
+                    or isinstance(getattr(session, "pending_deferred_transfer", None), dict)):
                 logger.info("Terminal hangup skipped during transfer", call_id=call_id, reason=reason)
                 return False
 
@@ -15501,6 +15809,11 @@ class Engine:
 
             drained = True
             if not audio_already_drained:
+                google_provider = self._google_long_audio_provider(session)
+                if google_provider:
+                    drain_timeout_sec = max(drain_timeout_sec, google_provider.config.long_audio_backlog_sec + 30.0)
+                if drain_timeout_cap_sec is not None:
+                    drain_timeout_sec = min(drain_timeout_sec, max(0.0, drain_timeout_cap_sec))
                 drained = await self._wait_for_call_audio_drain(
                     call_id,
                     timeout_sec=drain_timeout_sec,
@@ -15508,8 +15821,21 @@ class Engine:
                     reason=reason,
                 )
 
+            # A transfer may have taken ownership and recovered while this
+            # older hangup was draining. Its pending action can already be gone.
+            if call_id not in started:
+                return False
             session = await self.session_store.get_by_call_id(call_id)
             if not session or self._session_was_transferred(session):
+                return False
+            if isinstance(getattr(session, "pending_deferred_transfer", None), dict):
+                started.discard(call_id)
+                return False
+            if drain_timeout_cap_sec is not None and (
+                bool(getattr(session, "cleanup_in_progress", False))
+                or self._session_has_pending_attended_transfer(session)
+            ):
+                started.discard(call_id)
                 return False
             if call_outcome:
                 session.call_outcome = call_outcome
@@ -15985,6 +16311,21 @@ class Engine:
                 )
             except Exception:
                 logger.debug("Pipeline tool injection failed", call_id=call_id, exc_info=True)
+
+            # Use the same immutable configuration/allowlist as schema and execution.
+            # Existing saved Agent prompts retain their text; current tool policy is appended.
+            from src.tools.runtime_guidance import build_in_call_tool_runtime_guidance
+            runtime_guidance = build_in_call_tool_runtime_guidance(
+                self._tool_config_for_session(session),
+                ["microsoft_calendar"]
+                if "microsoft_calendar" in (llm_options.get("tools") or [])
+                else [],
+            )
+            if runtime_guidance:
+                llm_options = dict(llm_options)
+                base_prompt = str(llm_options.get("system_prompt") or "").strip()
+                if runtime_guidance not in base_prompt:
+                    llm_options["system_prompt"] = f"{base_prompt}\n\n{runtime_guidance}".strip()
 
             # Outbound lead context injection (structured JSON, not template substitution).
             try:
@@ -17389,7 +17730,9 @@ class Engine:
                                             except Exception:
                                                 logger.error("Deferred transfer TTS failed; committing transfer anyway", call_id=call_id, exc_info=True)
 
-                                        await self._commit_pending_deferred_transfer_for_call(call_id, session)
+                                        await self._commit_pending_deferred_transfer_for_call(
+                                            call_id, session, expected_action_id=deferred_action.get("id"),
+                                        )
                                         return
 
                                     # Handle Hangup (AAVA-85 Fix)
@@ -17699,7 +18042,9 @@ class Engine:
                                                                                 )
                                                                     except Exception:
                                                                         logger.error("Follow-up deferred transfer TTS failed; committing transfer anyway", call_id=call_id, exc_info=True)
-                                                                await self._commit_pending_deferred_transfer_for_call(call_id, session)
+                                                                await self._commit_pending_deferred_transfer_for_call(
+                                                                    call_id, session, expected_action_id=next_deferred_action.get("id"),
+                                                                )
                                                                 return
                                                             if next_result.get("will_hangup"):
                                                                 farewell = next_result.get("message", "Goodbye!")
@@ -21518,10 +21863,74 @@ class Engine:
         
         return result
 
+    def _provider_audio_blocked_by_transfer_commit(
+        self,
+        call_id: str,
+        session: Optional["CallSession"],
+    ) -> bool:
+        """Return True while provider audio must not play because a transfer commits.
+
+        Audio is blocked only while the call's pending action is the one a
+        commit in flight is committing. The drain-timeout recovery clears the
+        pending action before it asks the provider for an apology, so the
+        apology plays; an action that replaced the one being committed (for
+        example after cancel_transfer, or a different transfer tool) keeps its
+        own handoff audio until its own commit starts.
+        """
+        pending = getattr(session, "pending_deferred_transfer", None)
+        if not isinstance(pending, dict):
+            return False
+        action_id = pending.get("id")
+        if action_id is None:
+            return False
+        markers = (getattr(self, "_deferred_transfer_committing", None) or {}).get(call_id) or ()
+        return any(marker.get("action_id") == action_id for marker in markers)
+
     async def _commit_pending_deferred_transfer_for_call(
         self,
         call_id: str,
         session: Optional["CallSession"] = None,
+        *,
+        expected_action_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        # Bind direct callers before waiting on the lock. Background callers
+        # snapshot the ID when scheduling, before this coroutine can be delayed.
+        if expected_action_id is None:
+            if session is None:
+                session = await self.session_store.get_by_call_id(call_id)
+            action = getattr(session, "pending_deferred_transfer", None)
+            expected_action_id = action.get("id") if isinstance(action, dict) else None
+        if expected_action_id is None:
+            return None
+        # Register this attempt for the whole commit, including the audio
+        # drain wait, so on_provider_event drops provider speech that starts
+        # after the handoff line. The inner routine stamps the action id once
+        # it has read it under the per-call lock; an unstamped marker blocks
+        # nothing. Removed in finally so a failed commit cannot mute the call.
+        committing = getattr(self, "_deferred_transfer_committing", None)
+        if committing is None:
+            committing = {}
+            self._deferred_transfer_committing = committing
+        marker: Dict[str, Any] = {"action_id": None}
+        committing.setdefault(call_id, []).append(marker)
+        try:
+            return await self._commit_pending_deferred_transfer_for_call_inner(
+                call_id, session, commit_marker=marker, expected_action_id=expected_action_id,
+            )
+        finally:
+            markers = committing.get(call_id) or []
+            if marker in markers:
+                markers.remove(marker)
+            if not markers:
+                committing.pop(call_id, None)
+
+    async def _commit_pending_deferred_transfer_for_call_inner(
+        self,
+        call_id: str,
+        session: Optional["CallSession"] = None,
+        *,
+        commit_marker: Optional[Dict[str, Any]] = None,
+        expected_action_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         from src.tools.context import ToolExecutionContext
         from src.tools.telephony.deferred_transfer import commit_pending_deferred_transfer
@@ -21546,6 +21955,37 @@ class Engine:
             ):
                 return None
             action_id = action.get("id")
+            if action_id != expected_action_id:
+                logger.info(
+                    "Deferred transfer completion skipped because pending action changed",
+                    call_id=call_id,
+                    expected_action_id=expected_action_id,
+                    latest_action_id=action_id,
+                )
+                return None
+            if commit_marker is not None:
+                commit_marker["action_id"] = action_id
+
+            # Transfer owns the call now. Retire both engine and provider hangup
+            # state before any handoff/recovery audio can complete. In particular,
+            # a drain-timeout apology must not inherit cleanup_after_tts.
+            session.cleanup_after_tts = False
+            getattr(self, "_terminal_hangup_started", set()).discard(call_id)
+            await self._save_session(session)
+            fallback = getattr(self, "_terminal_fallback_tasks", {}).pop(call_id, None)
+            if fallback and not fallback.done() and fallback is not asyncio.current_task():
+                fallback.cancel()
+            provider = getattr(self, "_call_providers", {}).get(call_id)
+            release = getattr(provider, "release_terminal_output_protection", None)
+            if callable(release):
+                try:
+                    release()
+                except Exception:
+                    logger.warning(
+                        "Failed to release provider terminal output protection for transfer",
+                        call_id=call_id,
+                        exc_info=True,
+                    )
 
             local_handoff_played = await self._play_deferred_transfer_local_handoff(call_id, session)
             if not local_handoff_played:
@@ -21600,6 +22040,13 @@ class Engine:
                     status=result.get("status"),
                     message=result.get("message"),
                 )
+            if not isinstance(result, dict) or result.get("status") != "success":
+                # Do not replay a potentially side-effectful commit on the next
+                # provider completion, or leave hangup blocked indefinitely.
+                recovered = await self._recover_failed_deferred_transfer(
+                    call_id, action_id=action_id, commit_failed=True,
+                )
+                return recovered if recovered is not None else result
             return result
 
     async def _abort_deferred_transfer_after_drain_timeout(
@@ -21608,16 +22055,33 @@ class Engine:
         *,
         action_id: Any,
     ) -> Optional[Dict[str, Any]]:
-        """Cancel the exact pending transfer and return the caller to the AI."""
+        return await self._recover_failed_deferred_transfer(call_id, action_id=action_id)
+
+    async def _recover_failed_deferred_transfer(
+        self,
+        call_id: str,
+        *,
+        action_id: Any,
+        commit_failed: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Cancel the exact failed action and return the caller to the AI."""
+        error_code = "deferred_transfer_commit_failed" if commit_failed else "deferred_audio_drain_timeout"
+        message = (
+            "Deferred transfer cancelled because the transfer commit failed."
+            if commit_failed else
+            "Deferred transfer cancelled because caller-facing audio did not drain before the safety timeout."
+        )
         session = await self.session_store.get_by_call_id(call_id)
         action = getattr(session, "pending_deferred_transfer", None) if session else None
         if (
             not session
+            or getattr(session, "cleanup_in_progress", False)
+            or getattr(session, "cleanup_completed", False)
             or not isinstance(action, dict)
             or action.get("id") != action_id
         ):
             logger.info(
-                "Deferred transfer timeout ignored because pending action changed",
+                "Deferred transfer recovery skipped because call state changed",
                 call_id=call_id,
                 action_id=action_id,
                 latest_action_id=action.get("id") if isinstance(action, dict) else None,
@@ -21653,7 +22117,9 @@ class Engine:
         if clear_predial_current_action:
             session.current_action = None
 
-        await self._record_deferred_transfer_timeout_tool_result(session, action)
+        await self._record_deferred_transfer_timeout_tool_result(
+            session, action, error_code=error_code, message=message,
+        )
 
         # Clear the action before any network or playback awaits. A provider
         # OutputDone event emitted by the apology must not retry the transfer.
@@ -21674,7 +22140,7 @@ class Engine:
                 )
             except Exception:
                 logger.warning(
-                    "Failed to hang up deferred transfer predial leg after drain timeout",
+                    "Failed to hang up deferred transfer predial leg during failure recovery",
                     call_id=call_id,
                     action_id=action_id,
                     predial_channel_id=predial_channel_id,
@@ -21698,7 +22164,7 @@ class Engine:
                 )
             except Exception:
                 logger.debug(
-                    "Failed to stop predial MOH after deferred transfer timeout",
+                    "Failed to stop predial MOH during deferred transfer recovery",
                     call_id=call_id,
                     exc_info=True,
                 )
@@ -21712,7 +22178,7 @@ class Engine:
                 await provider.notify_barge_in(call_id, rollback_assistant=True)
         except Exception:
             logger.debug(
-                "Failed to cancel provider output after deferred transfer timeout",
+                "Failed to cancel provider output during deferred transfer recovery",
                 call_id=call_id,
                 exc_info=True,
             )
@@ -21721,10 +22187,13 @@ class Engine:
         transfer_cfg = tools_cfg.get("transfer", {}) if isinstance(tools_cfg, dict) else {}
         if not isinstance(transfer_cfg, dict):
             transfer_cfg = {}
-        apology = str(
-            transfer_cfg.get("deferred_audio_drain_timeout_message")
-            or "I'm sorry, I couldn't complete that transfer without interrupting you. How else can I help?"
-        ).strip()
+        apology = (
+            "I'm sorry, I couldn't complete that transfer. How else can I help?"
+            if commit_failed else str(
+                transfer_cfg.get("deferred_audio_drain_timeout_message")
+                or "I'm sorry, I couldn't complete that transfer without interrupting you. How else can I help?"
+            ).strip()
+        )
 
         stream_stopped = await self._stop_deferred_transfer_stream_before_recovery(
             call_id
@@ -21743,6 +22212,7 @@ class Engine:
                 action_id=action_id,
                 predial_channel_id=predial_channel_id,
                 apology=apology,
+                recovery_kind="deferred_transfer_commit_failed" if commit_failed else "deferred_transfer_timeout",
             )
             logger.warning(
                 "Deferred transfer recovery deferred until caller-facing output cleanup is confirmed",
@@ -21753,8 +22223,8 @@ class Engine:
             )
             return {
                 "status": "failed",
-                "message": "Deferred transfer cancelled because caller-facing audio did not drain before the safety timeout.",
-                "error_code": "deferred_audio_drain_timeout",
+                "message": message,
+                "error_code": error_code,
                 "transfer_cancelled": True,
                 "apology_spoken": False,
                 "recovery_pending": True,
@@ -21765,11 +22235,12 @@ class Engine:
             action_id=action_id,
             predial_channel_id=predial_channel_id,
             apology=apology,
+            recovery_kind="deferred_transfer_commit_failed" if commit_failed else "deferred_transfer_timeout",
         )
         return {
             "status": "failed",
-            "message": "Deferred transfer cancelled because caller-facing audio did not drain before the safety timeout.",
-            "error_code": "deferred_audio_drain_timeout",
+            "message": message,
+            "error_code": error_code,
             "transfer_cancelled": True,
             "apology_spoken": bool(apology_spoken),
         }
@@ -21778,12 +22249,15 @@ class Engine:
         self,
         session: CallSession,
         action: Dict[str, Any],
+        *,
+        error_code: str = "deferred_audio_drain_timeout",
+        message: str = "Deferred transfer cancelled because caller-facing audio did not drain before the safety timeout.",
     ) -> None:
         """Append the terminal cancellation to the originating tool history."""
         origin = action.get("_tool_history_origin")
         if not isinstance(origin, dict):
             logger.warning(
-                "Deferred transfer timeout has no originating tool history record",
+                "Deferred transfer cancellation has no originating tool history record",
                 call_id=session.call_id,
                 action_id=action.get("id"),
             )
@@ -21810,9 +22284,9 @@ class Engine:
             parameters=dict(origin.get("params") or {}),
             result={
                 "status": "cancelled",
-                "action": "deferred_transfer_timeout",
-                "message": "Deferred transfer cancelled because caller-facing audio did not drain before the safety timeout.",
-                "error_code": "deferred_audio_drain_timeout",
+                "action": "deferred_transfer_commit_failed" if error_code == "deferred_transfer_commit_failed" else "deferred_transfer_timeout",
+                "message": message,
+                "error_code": error_code,
                 "transfer_cancelled": True,
                 "target": action.get("target"),
             },
@@ -21866,6 +22340,7 @@ class Engine:
         action_id: Any,
         predial_channel_id: str,
         apology: str,
+        recovery_kind: str = "deferred_transfer_timeout",
     ) -> bool:
         """Restore caller input and speak after output cleanup is confirmed."""
         current = await self.session_store.get_by_call_id(call_id)
@@ -21912,10 +22387,11 @@ class Engine:
         apology_spoken = await self._speak_no_input_announcement(
             call_id,
             apology,
-            "deferred_transfer_timeout",
+            recovery_kind,
         )
         logger.warning(
-            "Deferred transfer cancelled after caller-facing audio drain timeout",
+            "Deferred transfer cancelled; caller recovery completed",
+            recovery_kind=recovery_kind,
             call_id=call_id,
             action_id=action_id,
             predial_channel_id=predial_channel_id or None,
@@ -21930,6 +22406,7 @@ class Engine:
         action_id: Any,
         predial_channel_id: str,
         apology: str,
+        recovery_kind: str = "deferred_transfer_timeout",
     ) -> None:
         """Retain recovery ownership until output is absent or the call ends."""
         tasks = getattr(self, "_deferred_transfer_recovery_tasks", None)
@@ -21965,6 +22442,7 @@ class Engine:
                             action_id=action_id,
                             predial_channel_id=predial_channel_id,
                             apology=apology,
+                            recovery_kind=recovery_kind,
                         )
                         return
                     logger.warning(

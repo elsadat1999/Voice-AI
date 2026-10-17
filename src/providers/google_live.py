@@ -31,6 +31,7 @@ from typing import AbstractSet, Any, Dict, Optional, List, Tuple
 from collections import deque
 
 import websockets
+from .connection_recovery import connect_with_recovery
 from websockets.asyncio.client import ClientConnection
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
@@ -53,7 +54,7 @@ from ..audio import (
     resolve_output_resampler_policy,
 )
 from ..config import GoogleProviderConfig
-from src.tools.telephony.hangup_policy import normalize_hangup_policy
+from src.tools.telephony.hangup_policy import normalize_hangup_policy, text_contains_marker_word
 from src.tools.adapters.sanitize import sanitize_tool_result_for_json_string
 
 # Tool calling support
@@ -233,6 +234,15 @@ class GoogleLiveProvider(AIProviderInterface):
         self._setup_complete: bool = False
         self._greeting_completed: bool = False
         self._in_audio_burst: bool = False
+        self._audio_response_id = 0
+        self._last_audio_turn_completed_id = 0
+        self._generated_audio_turns = []
+        self._locally_interrupted_response_id = 0
+        self._long_audio_transport_failed = False
+        # Engine-owned playback correlation lives on this per-call instance.
+        self._playback_response_id = 0
+        self._playback_completed_response_id = 0
+        self._long_audio_failed = False
         self._setup_ack_event: Optional[asyncio.Event] = None  # ACK gate like Deepgram
         self._hangup_after_response: bool = False  # Flag to trigger hangup after next response
         self._farewell_in_progress: bool = False  # Track if farewell is being spoken
@@ -493,7 +503,7 @@ class GoogleLiveProvider(AIProviderInterface):
             return None
         markers = (self._hangup_policy.get("markers") or {}).get("end_call", [])
         for m in markers:
-            if m in t:
+            if text_contains_marker_word(t, [m]):
                 return m
         return None
 
@@ -505,9 +515,30 @@ class GoogleLiveProvider(AIProviderInterface):
             return None
         markers = (self._hangup_policy.get("markers") or {}).get("assistant_farewell", [])
         for m in markers:
-            if m in t:
+            if text_contains_marker_word(t, [m]):
                 return m
         return None
+
+    def release_terminal_output_protection(self) -> None:
+        """Discard a hangup superseded by transfer, allowing later farewells."""
+        task = self._hangup_fallback_task
+        self._hangup_fallback_task = None
+        if task and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+        self._hangup_after_response = False
+        self._hangup_fallback_armed = False
+        self._hangup_fallback_emitted = False
+        self._hangup_fallback_armed_at = None
+        self._hangup_fallback_audio_started = False
+        self._hangup_fallback_turn_complete_seen = False
+        self._hangup_fallback_wait_logged = False
+        self._hangup_ready_emitted = False
+        self._assistant_farewell_intent = None
+        self._user_end_intent = None
+        self._force_farewell_text = ""
+        self._force_farewell_sent = False
+        self._post_hangup_output_detected = False
+        self._terminal_audio_cutoff_after_tool = False
 
     def _should_wait_for_turn_complete_before_fallback(self, now: float, armed_at: float) -> bool:
         if self._hangup_fallback_turn_complete_seen:
@@ -640,8 +671,11 @@ class GoogleLiveProvider(AIProviderInterface):
                 # Audio has been idle long enough; treat as end-of-response.
                 had_audio = bool(self._hangup_fallback_audio_started)
                 if self._in_audio_burst:
-                    self._in_audio_burst = False
-                    if self.on_event:
+                    if self.long_audio_playback_enabled:
+                        await self._handle_audio_generation_complete()
+                    else:
+                        self._in_audio_burst = False
+                    if self.on_event and not self.long_audio_playback_enabled:
                         await self.on_event(
                             {
                                 "type": "AgentAudioDone",
@@ -838,6 +872,10 @@ class GoogleLiveProvider(AIProviderInterface):
                 call_id=call_id,
             )
 
+        connection_loop = asyncio.get_running_loop()
+        connection_started = connection_loop.time()
+        connection_budget = self.config.connect_total_timeout_sec
+
         # Build WebSocket URL and headers — Vertex AI vs Developer API (AAVA-191)
         use_vertex = getattr(self.config, 'use_vertex_ai', False)
         ws_url: str
@@ -874,11 +912,24 @@ class GoogleLiveProvider(AIProviderInterface):
                 else:
                     credentials, _ = google.auth.default(scopes=scopes)
                 auth_req = google.auth.transport.requests.Request()
+                if connection_budget is not None:
+                    from functools import partial
+                    # The worker must use the same clock/epoch as the outer
+                    # connection deadline, including on alternative event loops.
+                    remaining = connection_budget - (connection_loop.time() - connection_started)
+                    if remaining <= 0:
+                        raise TimeoutError("Provider connection budget exhausted")
+                    auth_req = partial(auth_req, timeout=remaining)
                 credentials.refresh(auth_req)
                 return credentials.token
 
             try:
-                bearer_token = await asyncio.get_event_loop().run_in_executor(None, _get_vertex_token)
+                token_future = connection_loop.run_in_executor(None, _get_vertex_token)
+                if connection_budget is None:
+                    bearer_token = await token_future
+                else:
+                    remaining = connection_budget - (connection_loop.time() - connection_started)
+                    bearer_token = await asyncio.wait_for(token_future, timeout=max(0, remaining))
             except Exception as vertex_err:
                 # ADC failed — fall back to Developer API if an API key exists
                 _fallback_key = (getattr(self.config, 'api_key', None) or "").strip()
@@ -934,15 +985,20 @@ class GoogleLiveProvider(AIProviderInterface):
 
         try:
             # Establish WebSocket connection
-            self.websocket = await websockets.connect(
-                ws_url,
-                additional_headers=ws_extra_headers,
-                subprotocols=["gemini-live"],
-                max_size=10 * 1024 * 1024,  # 10MB max message size
-                # Disable library-level ping frames. We implement our own keepalive behavior
-                # in `_keepalive_loop()` and have seen 1008 closes correlated with ping activity.
-                ping_interval=None,
-                ping_timeout=None,
+            self.websocket = await connect_with_recovery(
+                lambda timeout: websockets.connect(
+                    ws_url,
+                    open_timeout=timeout,
+                    additional_headers=ws_extra_headers,
+                    subprotocols=["gemini-live"],
+                    max_size=10 * 1024 * 1024,  # 10MB max message size
+                    # Disable library-level ping frames. We implement our own keepalive behavior
+                    # in `_keepalive_loop()` and have seen 1008 closes correlated with ping activity.
+                    ping_interval=None,
+                    ping_timeout=None,
+                ),
+                self.config, provider=self.provider_event_name(), call_id=call_id,
+                started_at=connection_started,
             )
 
             _GOOGLE_LIVE_SESSIONS.inc()
@@ -1462,6 +1518,8 @@ class GoogleLiveProvider(AIProviderInterface):
             # Enhanced logging for WebSocket close
             close_reason = e.reason if hasattr(e, 'reason') else "No reason provided"
             close_code = e.code if hasattr(e, 'code') else None
+            if self.long_audio_playback_enabled and close_code != 1000:
+                self._long_audio_transport_failed = True
             
             # Decode close code meaning
             close_code_meanings = {
@@ -1513,6 +1571,12 @@ class GoogleLiveProvider(AIProviderInterface):
                 )
             self._mark_ws_disconnected()
             try:
+                if self.long_audio_playback_enabled and close_code != 1000:
+                    # Seal the final partial response before notifying teardown.
+                    # This is generation completion only, never a tool boundary.
+                    await self._handle_audio_generation_complete()
+                    await self._emit_provider_disconnected(code=close_code, reason=close_reason)
+                    return
                 # If farewell audio is already buffered/playing (hangup_call was invoked),
                 # the WebSocket is no longer needed.  Let the engine's cleanup_after_tts
                 # flow finish playback and hang up gracefully.
@@ -1608,6 +1672,78 @@ class GoogleLiveProvider(AIProviderInterface):
             self._greeting_completed = True
             await self._send_greeting()
 
+    @property
+    def long_audio_playback_enabled(self) -> bool:
+        return bool(
+            self.config.long_audio_playback_enabled
+            and not getattr(self, "_vertex_active", self.config.use_vertex_ai)
+        )
+
+    def _reset_interrupted_farewell_watchdog(self):
+        if self.long_audio_playback_enabled and self._hangup_fallback_armed:
+            self._hangup_fallback_audio_started = False
+            self._hangup_fallback_turn_complete_seen = False
+            self._hangup_fallback_armed_at = time.monotonic()
+            self._last_audio_out_monotonic = None
+            self._hangup_fallback_wait_logged = False
+
+    async def handle_local_barge_in(self):
+        if not self.long_audio_playback_enabled or self.uses_full_duplex_barge_in():
+            return
+        # Acknowledgment can arrive after the local flush. An old protocol
+        # boundary must not commit terminal intent during that interval.
+        self._locally_interrupted_response_id = self._audio_response_id
+        for completed in self._generated_audio_turns:
+            if completed["response_id"] == self._audio_response_id:
+                completed["interrupted"] = True
+        self._reset_interrupted_farewell_watchdog()
+
+    async def _finalize_generated_audio_text(self):
+        """Persist generation text without advancing terminal tool actions."""
+        user_text = self._input_transcription_buffer
+        assistant_text = (self._output_transcription_buffer or self._model_text_buffer or "").strip()
+        if user_text:
+            self._last_final_user_text = user_text
+            await self._track_conversation_message("user", user_text)
+            self._input_transcription_buffer = ""
+            self._last_input_transcription_fragment = ""
+        if assistant_text:
+            self._last_final_assistant_text = assistant_text
+            await self._track_conversation_message("assistant", assistant_text)
+            self._output_transcription_buffer = ""
+            self._last_output_transcription_fragment = ""
+            self._model_text_buffer = ""
+        return (user_text or self._last_final_user_text, assistant_text)
+
+    async def _handle_audio_generation_complete(self):
+        if not self._in_audio_burst:
+            return  # Duplicate generationComplete or a tool-only turn.
+        if len(self._generated_audio_turns) >= 8:
+            # Revoke tool admission before the disconnect callback can yield.
+            self._long_audio_transport_failed = True
+            await self._emit_provider_disconnected(code=1011, reason="audio turn completion backlog exceeded")
+            return
+        user_text, assistant_text = await self._finalize_generated_audio_text()
+        self._generated_audio_turns.append({
+            "response_id": self._audio_response_id,
+            "assistant": self._turn_has_assistant_output,
+            "interrupted": self._locally_interrupted_response_id == self._audio_response_id,
+            "user_text": user_text,
+            "assistant_text": assistant_text,
+        })
+        self._in_audio_burst = False
+        self._turn_has_assistant_output = False
+        self._turn_start_time = None
+        self._turn_first_audio_received = False
+        self._output_resample_state = None
+        self._output_resampler_logged = False
+        if self.on_event:
+            await self.on_event({
+                "type": "GoogleAudioGenerationComplete",
+                "call_id": self._call_id,
+                "audio_response_id": self._audio_response_id,
+            })
+
     async def _handle_server_content(self, data: Dict[str, Any]) -> None:
         """Handle serverContent message (audio, text, etc.)."""
         content = data.get("serverContent", {})
@@ -1631,6 +1767,10 @@ class GoogleLiveProvider(AIProviderInterface):
         # so this rarely fires. Local VAD fallback is the primary barge-in mechanism.
         # When it does fire, emit ProviderBargeIn so the engine flushes playback.
         if content.get("interrupted") is True:
+            if self.long_audio_playback_enabled:
+                for completed in self._generated_audio_turns:
+                    if completed["response_id"] == self._audio_response_id:
+                        completed["interrupted"] = True
             logger.info(
                 "Google Live server-side interruption detected",
                 call_id=self._call_id,
@@ -1638,6 +1778,7 @@ class GoogleLiveProvider(AIProviderInterface):
             )
             if self._in_audio_burst:
                 self._in_audio_burst = False
+            self._reset_interrupted_farewell_watchdog()
             # The next provider audio belongs to a new response. Never carry
             # FIR history across the discarded response boundary.
             self._output_resample_state = None
@@ -1684,6 +1825,11 @@ class GoogleLiveProvider(AIProviderInterface):
                 # Measures: last user speech → first AI audio response
                 self._turn_start_time = time.time()
                 self._turn_first_audio_received = False
+                # A new user turn invalidates any farewell the assistant spoke in an earlier
+                # turn. Without this, a greeting like "thank you for calling" latches
+                # _assistant_farewell_intent for the whole call and every later weak user
+                # end marker (e.g. "goodbye") arms cleanup_after_tts, ending real calls.
+                self._assistant_farewell_intent = None
                 self._input_transcription_buffer, self._last_input_transcription_fragment = _merge_transcription_fragment(
                     self._input_transcription_buffer, text, self._last_input_transcription_fragment
                 )
@@ -1710,6 +1856,11 @@ class GoogleLiveProvider(AIProviderInterface):
             text = output_transcription.get("text", "")
             if text:
                 self._turn_has_assistant_output = True
+                if (self.long_audio_playback_enabled and self._hangup_fallback_armed
+                        and not self._hangup_fallback_audio_started):
+                    # Text can lead the replacement audio. Do not expire the
+                    # no-audio watchdog while that farewell is being generated.
+                    self._hangup_fallback_armed_at = time.monotonic()
                 if self._hangup_after_response and not self._force_farewell_sent:
                     self._post_hangup_output_detected = True
                 self._output_transcription_buffer, self._last_output_transcription_fragment = _merge_transcription_fragment(
@@ -1735,7 +1886,7 @@ class GoogleLiveProvider(AIProviderInterface):
         turn_complete = content.get("turnComplete", False)
 
         # Save final transcriptions when turn completes (per API recommendation)
-        if turn_complete:
+        if turn_complete and not self.long_audio_playback_enabled:
             self._hangup_fallback_turn_complete_seen = True
             # Save user speech if buffered
             if self._input_transcription_buffer:
@@ -1801,6 +1952,10 @@ class GoogleLiveProvider(AIProviderInterface):
                 # otherwise we can hang up mid-conversation (e.g., during transcript email capture).
                 self._model_text_buffer += text
 
+        # Audio in a multi-part envelope must be admitted before its boundary.
+        if self.long_audio_playback_enabled and content.get("generationComplete"):
+            await self._handle_audio_generation_complete()
+
         # Handle turn completion
         if turn_complete:
             await self._handle_turn_complete()
@@ -1823,10 +1978,10 @@ class GoogleLiveProvider(AIProviderInterface):
         if self._hangup_fallback_armed:
             return
 
-        user_reason = self._detect_user_end_intent(user_text) or self._user_end_intent
+        user_reason = self._detect_user_end_intent(user_text)
         if not user_reason:
             return
-        assistant_reason = self._detect_assistant_farewell(assistant_text) or self._assistant_farewell_intent
+        assistant_reason = self._detect_assistant_farewell(assistant_text)
 
         # "No transcript" and explicit hangup intents are strong indicators that the call is ending,
         # even if output transcription is missing or the model doesn't include a canonical farewell.
@@ -1852,6 +2007,8 @@ class GoogleLiveProvider(AIProviderInterface):
         try:
             session = await session_store.get_by_call_id(self._call_id)
             if not session:
+                return
+            if isinstance(getattr(session, "pending_deferred_transfer", None), dict):
                 return
             if getattr(session, "cleanup_after_tts", False):
                 return
@@ -2056,6 +2213,8 @@ class GoogleLiveProvider(AIProviderInterface):
             # Emit audio event (matching OpenAI Realtime pattern)
             if not self._in_audio_burst:
                 self._in_audio_burst = True
+                if self.long_audio_playback_enabled:
+                    self._audio_response_id += 1
             
             if self.on_event:
                 await self.on_event(
@@ -2065,6 +2224,7 @@ class GoogleLiveProvider(AIProviderInterface):
                         "call_id": self._call_id,
                         "encoding": target_encoding,  # Tell engine what format we're sending
                         "sample_rate": target_rate,  # Tell engine what rate we're sending
+                        **({"audio_response_id": self._audio_response_id} if self.long_audio_playback_enabled else {}),
                     }
                 )
 
@@ -2080,19 +2240,56 @@ class GoogleLiveProvider(AIProviderInterface):
         """Handle turn completion."""
         had_audio = self._in_audio_burst
         turn_was_assistant = self._turn_has_assistant_output
-        self._turn_has_assistant_output = False
+        response_id = self._audio_response_id
+        generation_already_complete = False
+        if self.long_audio_playback_enabled:
+            if (
+                not self._generated_audio_turns and self._in_audio_burst
+                and self._last_audio_turn_completed_id > 0
+                and self._audio_response_id > self._last_audio_turn_completed_id
+            ):
+                # A normal audio turn must have generationComplete before
+                # turnComplete. Ignore a repeated old boundary during new audio.
+                return
+            # Google sends ordered turn boundaries. Keep locally assigned IDs so
+            # a delayed boundary for A cannot finish the engine's playback of B.
+            if self._generated_audio_turns:
+                completed = self._generated_audio_turns.pop(0)
+                response_id = completed["response_id"]
+                had_audio = not completed.get("interrupted", False)
+                turn_was_assistant = completed["assistant"]
+                generation_already_complete = True
+                user_text, assistant_text = completed["user_text"], completed["assistant_text"]
+                self._last_audio_turn_completed_id = response_id
+                if response_id != self._audio_response_id:
+                    if self.on_event and had_audio:
+                        await self.on_event({
+                            "type": "AgentAudioDone", "call_id": self._call_id,
+                            "streaming_done": True, "audio_response_id": response_id,
+                        })
+                    return  # Old terminal intent must not act on a newer turn.
+            else:
+                user_text, assistant_text = await self._finalize_generated_audio_text()
+                if had_audio:
+                    self._last_audio_turn_completed_id = response_id
+            if assistant_text and had_audio:
+                await self._maybe_arm_cleanup_after_tts(user_text=user_text, assistant_text=assistant_text)
+        if response_id == self._audio_response_id:
+            self._turn_has_assistant_output = False
 
         # Note: Transcription is now saved in _handle_server_content when turnComplete=true
         # No need to flush here - it's already been handled
 
-        if self._in_audio_burst:
-            self._in_audio_burst = False
+        if had_audio:
+            if response_id == self._audio_response_id:
+                self._in_audio_burst = False
             if self.on_event:
                 await self.on_event(
                     {
                         "type": "AgentAudioDone",
                         "call_id": self._call_id,
                         "streaming_done": True,
+                        **({"audio_response_id": response_id, "media_already_complete": generation_already_complete} if self.long_audio_playback_enabled else {}),
                     }
                 )
             # If we armed cleanup_after_tts, the engine will handle hangup on AgentAudioDone.
@@ -2100,7 +2297,7 @@ class GoogleLiveProvider(AIProviderInterface):
             if self._hangup_fallback_armed:
                 self._hangup_fallback_emitted = True
 
-        if had_audio:
+        if had_audio and response_id == self._audio_response_id:
             self._output_resample_state = None
             self._output_resampler_logged = False
 
@@ -2166,7 +2363,7 @@ class GoogleLiveProvider(AIProviderInterface):
     async def _handle_tool_call(self, data: Dict[str, Any]) -> None:
         """Handle toolCall message."""
         owner_call_id = self._call_id
-        if self._closing or self._closed or not owner_call_id:
+        if self._closing or self._closed or self._long_audio_transport_failed or not owner_call_id:
             return
         tool_call = data.get("toolCall", {})
         func_name = None
@@ -2234,7 +2431,7 @@ class GoogleLiveProvider(AIProviderInterface):
                         "message": f"Tool '{func_name}' not allowed for this call",
                     }
                 else:
-                    if self._closing or self._closed or self._call_id != owner_call_id:
+                    if self._closing or self._closed or self._long_audio_transport_failed or self._call_id != owner_call_id:
                         return
                     # Protect only a tool that has entered actual execution.
                     # A task still checking allowlists is safe to cancel during
@@ -2261,7 +2458,7 @@ class GoogleLiveProvider(AIProviderInterface):
 
                 # An active call-state action may finish after WebSocket teardown.
                 # Keep its result in call history, but never reply into a stale session.
-                if self._closing or self._closed or self._call_id != owner_call_id:
+                if self._closing or self._closed or self._long_audio_transport_failed or self._call_id != owner_call_id:
                     return
 
                 # Check for hangup intent (like OpenAI Realtime pattern)

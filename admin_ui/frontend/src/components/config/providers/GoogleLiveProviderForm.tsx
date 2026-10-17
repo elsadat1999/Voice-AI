@@ -1,3 +1,4 @@
+import ConnectionRecoveryFields from './ConnectionRecoveryFields';
 import React, { useEffect, useState, useRef, useCallback } from 'react';
 import axios from 'axios';
 import { toast } from 'sonner';
@@ -324,6 +325,27 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                             </p>
                         </div>
                     </div>
+
+                    {!config.use_vertex_ai && (
+                        <div className="flex items-start gap-3 p-3 rounded-md border border-input bg-muted/30">
+                            <input
+                                type="checkbox"
+                                id="long_audio_playback_enabled"
+                                className="mt-1 rounded border-input"
+                                checked={config.long_audio_playback_enabled ?? false}
+                                onChange={(e) => handleChange('long_audio_playback_enabled', e.target.checked)}
+                            />
+                            <div>
+                                <label htmlFor="long_audio_playback_enabled" className="text-sm font-medium cursor-pointer">
+                                    Enable long-response playback
+                                </label>
+                                <p className="text-xs text-muted-foreground mt-0.5">
+                                    Opt in to improved playback and interruption handling for long answers on the Developer API.
+                                    Off by default. Save, then restart the AI Engine for the change to take effect.
+                                </p>
+                            </div>
+                        </div>
+                    )}
 
                     {/* Vertex AI project + location — shown when Vertex AI is ON */}
                     {config.use_vertex_ai && (
@@ -1246,7 +1268,9 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                                             <ul className="list-disc pl-4 mt-1 space-y-0.5">
                                                 <li>Recommended <strong>off</strong> for production — rely on the explicit <code>hangup_call</code> tool</li>
                                                 <li>Only enable while debugging cases where Gemini drops turnComplete after a farewell</li>
-                                                <li>Can produce false-positive hangups if the bot uses farewell wording mid-call</li>
+                                                <li>Phrases such as "all set", "that's it", or "bye" can still mean something other than ending a call</li>
+                                                <li>Uses the completed turn and whole-word markers; pending deferred transfers take priority</li>
+                                                <li>Can still produce false-positive hangups when the caller and bot use closing phrases mid-call</li>
                                             </ul>
                                         </>
                                     }
@@ -1457,6 +1481,7 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                 </div>
             </div>
 
+            <ConnectionRecoveryFields config={config} onChange={onChange} />
         </div>
     );
 };

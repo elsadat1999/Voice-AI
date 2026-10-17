@@ -14,6 +14,14 @@ CI is the hard gate for code quality (unit tests + lint/compile checks). Real-ca
 
 ## Manual Golden Baselines (Must Pass Before Tagging)
 
+For v7.6.4, use the [current validation matrix](baselines/golden/v7.6.4-validation-matrix.md).
+The release-preparation PR may become merge-ready before tag acceptance.
+Reuse the revision-pinned HTTP-tool, farewell/transfer and Admin dependency
+evidence with its documented limits. Keep final-candidate runtime/upgrade
+acceptance, main/security checks, supported-7.5 security-backport disposition
+and explicit merge/tag authorization separate; prior-release waivers do not
+establish a v7.6.4 pass.
+
 Run at least one successful call for each baseline you intend to claim as supported.
 
 **A call “passes” if:**
@@ -143,3 +151,6 @@ remains visible in the validation matrix rather than being rewritten as a pass.
 - [ ] README, CHANGELOG, migration notes, and the release validation matrix describe the same scope and compatibility boundaries
 - [ ] Provider, PBX, tool, and architecture examples use `AI_AGENT`; `AI_CONTEXT` remains only where deprecation/legacy behavior is being explained
 - [ ] `AVA.mdc` is reviewed for Agent-only routing, tool generations, provider roster, guardrails, and its verification stamp
+- [ ] Merged human contributors have matching README avatars/badges and `CONTRIBUTORS.md` credit; renamed profiles and historical omissions are reconciled without inventing identities
+- [ ] Release notes credit the shipped PR authors and preserve co-authors; historical credit corrections are not presented as new runtime features
+- [ ] GitHub-rendered README is visually checked for readable contributor badges and a Core-first Quick Start; homepage/demo and Operator preview boundaries are unchanged

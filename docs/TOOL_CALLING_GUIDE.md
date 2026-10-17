@@ -1,8 +1,8 @@
 # Tool Calling Guide
 
-**Version**: 4.2  
-**Status**: Production Ready  
-**Last Updated**: January 2026
+**Version**: 7.6.4<br>
+**Status**: Provider-specific qualification (see setup guides)<br>
+**Last Updated**: October 2026
 
 Complete guide to AI tool calling in Asterisk AI Voice Agent—enabling AI agents to perform actions like call transfers and email management.
 
@@ -14,6 +14,7 @@ Complete guide to AI tool calling in Asterisk AI Voice Agent—enabling AI agent
 - [Supported Providers](#supported-providers)
 - [Post-Call Reporting Contract](#post-call-reporting-contract)
 - [Available Tools](#available-tools)
+- [Calendar Booking Boundaries](#calendar-booking-boundaries)
 - [Pre-Call Tools (HTTP Lookups)](#pre-call-tools-http-lookups)
 - [In-Call HTTP Tools](#in-call-http-tools)
 - [Post-Call Tools (Webhooks)](#post-call-tools-webhooks)
@@ -52,12 +53,36 @@ Tool calling enables AI agents to perform real-world actions during conversation
 |----------|--------|-------|
 | **OpenAI Realtime** | ✅ Full Support | Production validated (Nov 9, 2025) |
 | **Deepgram Voice Agent** | ✅ Full Support | Production validated (Nov 9, 2025) |
-| **Google Gemini Live** | ✅ Full Support | Production validated (Nov 2025) |
+| **Google Gemini Live** | ✅ Full Support (provider-level) | General provider support; historical production validation dated Nov 2025. Gemini 3.8 live validation is limited to documented Vertex paths, not broader Developer API qualification. |
 | **xAI Grok Voice Agent** | ✅ Full Support (v6.5.2) | Custom function-tools identical to OpenAI Realtime schema. xAI-native tools (`web_search`, `x_search`, `file_search`, `mcp`) accepted via YAML `extra_tools` escape hatch — forwarded verbatim to the session. |
 | **ElevenLabs Agent** | ✅ Full Support | Full-agent provider |
 | **Modular Pipelines (local_hybrid)** | ✅ Full Support | Production validated (Nov 19, 2025) - AAVA-85 |
 
-All tools work identically across supported providers—no code changes needed when switching providers.
+The shared tool registry adapts tools to each provider, but schema, concurrency
+and model qualification differ. Gemini 3.8 keeps call-state actions blocking
+and permits only read-only extension checks to run non-blocking; its attached
+live validation is limited to the documented Vertex paths. See the
+[Google Live guide](Provider-Google-Setup.md) before changing a model.
+
+## Calendar Booking Boundaries
+
+- [Microsoft Calendar](Microsoft-calendar-tool.md) supports exact-interval
+  availability, caller-confirmed invitations and tracked same-call
+  reschedule/cancel. Invitations and working-hours/horizon enforcement are
+  opt-in; preserve existing OAuth caches, identities and saved calendar IDs on
+  upgrade. Consent and ownership checks apply to full-agent and modular/hybrid
+  paths without rewriting saved Agent prompts.
+- A created event is not proof of invitation delivery or attendee acceptance.
+  Creation retries reconcile stable transaction IDs; observed ETags guard
+  mutations. Later-call, untracked, externally edited or restart-lost bookings
+  require staff. Availability checks are not atomic/distributed reservations.
+- The maintainer confirmed #686's acceptance plan tested and validated for
+  v7.6.2. This is release-scoped evidence, not authorization to send invitations
+  or edit a production calendar. Follow the guide's per-installation rollout
+  and rollback boundaries.
+- [Google Calendar](Google-calendar-tool.md) retains its own configuration and
+  supported actions; do not infer Microsoft invitation/lifecycle behavior from
+  the shared tool name or reporting contract.
 
 ## Post-Call Reporting Contract
 
@@ -395,6 +420,49 @@ AI: I'd be happy to help. Let me transfer you to support.
 
 ---
 
+## HTTP Template Safety and Compatibility
+
+The engine's pre-call lookups, in-call HTTP tools, and post-call webhooks resolve
+`${ENV_VAR}` and `{variable}` only in the original operator-authored template.
+Inserted caller data, model arguments, enrichment, transcripts, summaries, and
+environment values are never interpreted as additional placeholders. Environment
+names use uppercase letters, digits, and underscores; data names also support
+dots and hyphens. Missing environment variables become empty strings. Unknown
+data placeholders remain literal in text; a missing JSON placeholder fails the
+request before any HTTP call.
+
+**Request bodies:** operator-configured Content-Type selects the format; per-call
+placeholders cannot select Content-Type. Absent Content-Type means
+`application/json`. JSON and `application/*+json` templates must produce valid
+JSON. Inside a quoted JSON string, substitutions are escaped as text. An unquoted
+placeholder represents one complete JSON value: native numbers, booleans, null,
+arrays, and objects retain their type; serialized strings must parse as exactly
+one JSON value. For example, `{"note":"{notes}","count":{count}}` escapes notes
+and accepts a numeric count. Invalid JSON is an error, never a raw-body fallback.
+The serialized `transcript_json`, `summary_json`, `tool_calls_json`,
+`pre_call_results_json`, and `call_metadata_json` placeholders remain supported.
+A custom name ending in `_json` does not bypass validation or string escaping.
+
+Explicit `text/plain` bodies use literal single-pass substitution.
+`application/x-www-form-urlencoded` bodies are parsed into template fields before
+substitution and encoded afterward, so inserted ampersands cannot add fields.
+Other template body formats fail closed. Existing raw-text templates must declare
+`Content-Type: text/plain`; XML, multipart, and other structured formats need a
+dedicated serializer instead of arbitrary text substitution. GET and HEAD still
+send no body; POST, PUT, PATCH, DELETE, and OPTIONS retain body support.
+
+**URLs and headers:** use operator configuration or `${BASE_URL}` for the origin.
+Per-call placeholders may supply URL components, not a scheme, host, or port.
+Their slashes, query delimiters, percent signs, and fragments are encoded; dot
+path segments are rejected. Use fixed path separators in the template rather
+than a per-call value containing a whole URL or multiple path segments. Pass
+query values through `query_params` without pre-encoding them. Header CR/LF is
+replaced with spaces; legitimate environment-backed authorization remains valid.
+
+The Admin UI's HTTP **Test** endpoint is a separate operator-only implementation;
+its preview is not acceptance evidence for the engine's runtime renderer. Verify
+configured tools against these engine rules before enabling them.
+
 ## Pre-Call Tools (HTTP Lookups)
 
 **New in v4.2** — Pre-call tools run after call answer but before AI speaks, enabling CRM enrichment and caller data lookup.
@@ -606,12 +674,28 @@ contexts:
 
 ### Variable Substitution (Precedence)
 
-In-call HTTP tools have access to three types of variables:
+In-call HTTP tools have access to four sources, in this precedence order:
 
 1. **Context variables** (auto-injected): `{caller_number}`, `{called_number}`, `{call_id}`, etc.
 2. **Effective call metadata**, when selected: corrected values such as `{customer_id}`
 3. **Pre-call variables** (from pre-call HTTP lookups): `{customer_id}`, `{customer_name}`, etc.
-4. **AI parameters** (provided at runtime): Whatever the AI passes when invoking the tool
+4. **AI parameters**: only names declared in the tool's `parameters` configuration,
+   and only when the name is absent from the preceding sources
+
+Built-ins cannot be overwritten by enrichment, metadata, or model arguments.
+Existing enrichment keys remain protected even when empty; declaring a same-named
+parameter does not grant permission to replace them. Undeclared and shadowing
+arguments are ignored with a value-free warning. If the session/enrichment lookup
+fails or the session no longer exists, the HTTP request fails closed.
+
+Metadata retains its existing precedence over the corresponding pre-call value.
+Only operator-selected fields can enter this namespace, and caller corrections
+must use `update_call_metadata` with its configured correction policy. These
+values are non-authoritative: do not mark identity/authorization identifiers as
+correctable or use caller-correctable values as credentials or routing authority.
+Use separate parameter names for newly collected data instead of shadowing CRM
+fields. Renaming parameters may require updating the tool template and Agent
+instructions together.
 
 This means you can use data fetched by pre-call tools in your in-call tool requests. For example, if a pre-call lookup fetches `customer_id`, you can use `{customer_id}` in the in-call tool's body template.
 
@@ -898,6 +982,19 @@ contexts:
 ## Configuration
 
 ### Enable Tools in config/ai-agent.yaml
+
+With deferred transfers enabled, the engine lets the handoff audio drain before
+committing the transfer. During that commit it drops new full-agent provider
+audio for the same pending transfer, preventing repeated handoff turns from
+playing or extending the wait. Completion callbacks stay bound to the transfer
+that triggered them: cancelled or replaced actions cannot start committing a
+replacement before its own handoff completes. Timeout recovery clears the
+pending transfer before requesting an apology, so the apology can play.
+Local handoff playback and modular pipeline transfer prompts bypass this gate.
+
+The provider can still generate the repeated turn, so its transcript may show
+the handoff twice. With opt-in Google Developer long-response playback, repeats
+queued before the commit begins can still be heard.
 
 ```yaml
 # ============================================================================
@@ -1669,6 +1766,6 @@ Tools written once, work with any provider.
 
 ---
 
-**Last Updated**: January 2026  
-**Version**: 4.2.0  
-**Status**: ✅ Production Ready
+**Last Updated**: October 2026<br>
+**Version**: 7.6.4<br>
+**Status**: Provider-specific qualification (see setup guides)

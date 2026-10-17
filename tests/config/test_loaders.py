@@ -10,10 +10,16 @@ Tests cover:
 import os
 import pytest
 import tempfile
+import time
 import yaml
 from pathlib import Path
 
-from src.config.loaders import resolve_config_path, load_yaml_with_env_expansion, deep_merge_dicts
+from src.config.loaders import (
+    _expand_env_vars_with_defaults,
+    resolve_config_path,
+    load_yaml_with_env_expansion,
+    deep_merge_dicts,
+)
 
 
 class TestResolveConfigPath:
@@ -110,6 +116,78 @@ missing: ${NONEXISTENT_VAR}
         
         # os.expandvars leaves undefined vars unchanged (this is correct behavior)
         assert result['missing'] == '${NONEXISTENT_VAR}'
+
+    def test_mcp_header_template_remains_unexpanded_until_client(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("AVA_MCP_SECRET", "private-sentinel")
+        monkeypatch.setenv("AVA_MCP_HOST", "mcp.example")
+        config_file = tmp_path / "test.yaml"
+        config_file.write_text(
+            'mcp:\n  servers:\n    remote:\n      url: "https://${AVA_MCP_HOST}/mcp"\n'
+            '      headers:\n        Authorization: "Bearer ${AVA_MCP_SECRET}"\n'
+        )
+        result = load_yaml_with_env_expansion(str(config_file))
+        assert result["mcp"]["servers"]["remote"]["url"] == "https://mcp.example/mcp"
+        assert result["mcp"]["servers"]["remote"]["headers"] == {
+            "Authorization": "Bearer ${AVA_MCP_SECRET}"
+        }
+
+    @pytest.mark.parametrize(
+        "flow, expected",
+        [("[${AVA_FLOW_PORT}]", [8080]), ("{port: ${AVA_FLOW_PORT}}", {"port": 8080})],
+    )
+    def test_flow_env_expansion_with_mcp_does_not_require_raw_yaml(self, tmp_path, monkeypatch, flow, expected):
+        monkeypatch.setenv("AVA_FLOW_PORT", "8080")
+        config_file = tmp_path / "test.yaml"
+        config_file.write_text(
+            "ports: " + flow + "\nmcp:\n  enabled: true\n  servers:\n"
+            '    local:\n      transport: stdio\n      command: ["python", "server.py"]\n'
+        )
+        result = load_yaml_with_env_expansion(str(config_file))
+        assert result["ports"] == expected
+        assert result["mcp"]["servers"]["local"] == {
+            "transport": "stdio", "command": ["python", "server.py"]
+        }
+
+    @pytest.mark.parametrize("secret", ["private-sentinel", "${AVA_MCP_LATE}"])
+    def test_unparseable_raw_yaml_cannot_grant_header_provenance(self, tmp_path, monkeypatch, secret):
+        from src.mcp.errors import MCPError
+        from src.mcp.streamable_http_client import MCPStreamableHTTPClient
+
+        monkeypatch.setenv("AVA_FLOW_PORT", "8080")
+        monkeypatch.setenv("AVA_MCP_SECRET", secret)
+        monkeypatch.delenv("AVA_MCP_LATE", raising=False)
+        config_file = tmp_path / "test.yaml"
+        config_file.write_text(
+            'ports: [${AVA_FLOW_PORT}]\nmcp:\n  servers:\n    remote:\n'
+            '      url: "https://mcp.example/mcp"\n'
+            '      headers:\n        Authorization: "Bearer ${AVA_MCP_SECRET}"\n'
+        )
+        result = load_yaml_with_env_expansion(str(config_file))
+        assert result["ports"] == [8080]
+        remote = result["mcp"]["servers"]["remote"]
+        assert remote["headers"] == {"Authorization": ""}
+        # Even if expansion produces a new reference that later resolves, it
+        # must not acquire the original template's credential provenance.
+        monkeypatch.setenv("AVA_MCP_LATE", "another-private-sentinel")
+        client = MCPStreamableHTTPClient(server_id="remote", url=remote["url"], headers=remote["headers"])
+        with pytest.raises(MCPError, match="environment-only header"):
+            client._resolve_headers()
+
+    def test_shell_style_defaults_and_empty_value(self, monkeypatch):
+        monkeypatch.delenv("AVA_LOADER_MISSING", raising=False)
+        monkeypatch.setenv("AVA_LOADER_EMPTY", "")
+        monkeypatch.setenv("AVA_LOADER_SET", "present")
+        source = "${AVA_LOADER_MISSING:-fallback}|${AVA_LOADER_EMPTY:=other}|${AVA_LOADER_SET:-unused}"
+        assert _expand_env_vars_with_defaults(source) == "fallback|other|present"
+
+    def test_malformed_references_remain_bounded_and_do_not_hide_later_valid_one(self, monkeypatch):
+        monkeypatch.setenv("AVA_LOADER_SET", "present")
+        malformed = "${" + "A" * 60000
+        source = malformed + "${AVA_LOADER_SET}"
+        start = time.perf_counter()
+        result = _expand_env_vars_with_defaults(source)
+        assert time.perf_counter() - start < 2.0
+        assert result == malformed + "present"
     
     def test_mixed_env_and_literal(self, tmp_path, monkeypatch):
         """Should handle mix of env vars and literal values."""
