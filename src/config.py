@@ -557,6 +557,7 @@ class GoogleProviderConfig(BaseModel):
     # Gemini 3.8 Live: let its server-side VAD hear the caller during playback.
     # Disable to restore the legacy silence-gated behavior without changing 2.5.
     full_duplex_barge_in_3_8: bool = Field(default=True)
+    greeting_protection_sec: float = Field(default=1.0, ge=0.0)
 
     # Google Live response configuration
     response_modalities: str = Field(default="audio")  # "audio", "text", or "audio_text"

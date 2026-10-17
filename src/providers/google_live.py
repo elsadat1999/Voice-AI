@@ -1738,7 +1738,8 @@ class GoogleLiveProvider(AIProviderInterface):
         # so this rarely fires. Local VAD fallback is the primary barge-in mechanism.
         # When it does fire, emit ProviderBargeIn so the engine flushes playback.
         if content.get("interrupted") is True:
-            if getattr(self, "_greeting_in_progress", False) and (time.monotonic() - getattr(self, "_greeting_started_at", 0.0)) < 3.5:
+            greeting_protection_sec = float(getattr(self.config, "greeting_protection_sec", 1.0))
+            if getattr(self, "_greeting_in_progress", False) and (time.monotonic() - getattr(self, "_greeting_started_at", 0.0)) < greeting_protection_sec:
                 logger.info(
                     "Ignoring false server-side interruption during protected greeting window",
                     call_id=self._call_id,
