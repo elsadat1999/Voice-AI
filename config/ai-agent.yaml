@@ -162,7 +162,7 @@ pipelines:
 profiles:
   default: telephony_ulaw_8k
   openai_realtime_24k:
-    output_resampler: linear
+    output_resampler: bandlimited
     chunk_ms: 20
     idle_cutoff_ms: 0
     internal_rate_hz: 24000
@@ -175,7 +175,7 @@ profiles:
       encoding: slin
       sample_rate_hz: 8000
   telephony_responsive:
-    output_resampler: linear
+    output_resampler: bandlimited
     chunk_ms: auto
     idle_cutoff_ms: 600
     internal_rate_hz: 8000
@@ -188,7 +188,7 @@ profiles:
       encoding: slin
       sample_rate_hz: 8000
   telephony_ulaw_8k:
-    output_resampler: linear
+    output_resampler: bandlimited
     chunk_ms: auto
     idle_cutoff_ms: 800
     internal_rate_hz: 8000
@@ -201,7 +201,7 @@ profiles:
       encoding: ulaw
       sample_rate_hz: 8000
   telephony_enhanced_8k:
-    output_resampler: linear
+    output_resampler: bandlimited
     chunk_ms: auto
     idle_cutoff_ms: 800
     internal_rate_hz: 8000
@@ -214,7 +214,7 @@ profiles:
       encoding: ulaw
       sample_rate_hz: 8000
   wideband_pcm_16k:
-    output_resampler: linear
+    output_resampler: bandlimited
     # Wideband endpoints can expose more playback echo to Asterisk's raw DSP.
     # This live-validated profile override rejects that echo while preserving
     # intentional barge-in; 8 kHz profiles retain the global value of 256.
@@ -300,10 +300,11 @@ providers:
     ws_keepalive_enabled: false
     output_encoding: linear16
     output_sample_rate_hz: 24000
+    output_resampler: bandlimited
     provider_input_encoding: linear16
     provider_input_sample_rate_hz: 16000
     response_modalities: audio
-    target_encoding: ulaw
+    target_encoding: slin
     target_sample_rate_hz: 8000
     tts_voice_name: Aoede
     type: full
@@ -619,17 +620,17 @@ streaming:
   diag_pre_secs: 1
   empty_backoff_ticks_max: 5
   fallback_timeout_ms: 8000
-  greeting_min_start_ms: 40
+  greeting_min_start_ms: 80
   # ExternalMedia greeting reliability: wait briefly for inbound RTP to establish the remote endpoint,
   # then fall back to file playback if RTP is still not routable (Asterisk may not emit RTP until speech).
   greeting_rtp_wait_ms: 250
   jitter_buffer_ms: 950
   keepalive_interval_ms: 5000
-  low_watermark_ms: 80
-  min_start_ms: 60
+  low_watermark_ms: 100
+  min_start_ms: 120
   normalizer:
     enabled: true
-    max_gain_db: 18
+    max_gain_db: 9.0
     target_rms: 1400
   provider_grace_ms: 200
   sample_rate: 8000
