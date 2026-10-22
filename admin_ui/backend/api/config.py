@@ -2129,9 +2129,12 @@ async def test_provider_connection(request: ProviderTestRequest):
         # ELEVENLABS AGENT - check before other providers
         # ============================================================
         if 'elevenlabs' in provider_name or 'agent_id' in provider_config:
-            api_key = get_env_key('ELEVENLABS_API_KEY')
+            api_key = str(provider_config.get('api_key') or get_env_key('ELEVENLABS_API_KEY') or '').strip()
             if not api_key:
-                return {"success": False, "message": "ELEVENLABS_API_KEY not set in .env file"}
+                return {
+                    "success": False,
+                    "message": "No ElevenLabs API key configured (checked api_key_file/api_key_env and ELEVENLABS_API_KEY in .env)",
+                }
             
             async with httpx.AsyncClient() as client:
                 # Use /v1/voices endpoint for validation (works with all API key types)
@@ -2151,9 +2154,12 @@ async def test_provider_connection(request: ProviderTestRequest):
         # ============================================================
         if 'realtime_base_url' in provider_config or 'turn_detection' in provider_config:
             # OpenAI Realtime
-            api_key = get_env_key('OPENAI_API_KEY')
+            api_key = str(provider_config.get('api_key') or get_env_key('OPENAI_API_KEY') or '').strip()
             if not api_key:
-                return {"success": False, "message": "OPENAI_API_KEY not set in .env file"}
+                return {
+                    "success": False,
+                    "message": "No OpenAI API key configured (checked api_key_file/api_key_env and OPENAI_API_KEY in .env)",
+                }
             async with httpx.AsyncClient() as client:
                 response = await client.get(
                     "https://api.openai.com/v1/models",
@@ -2225,9 +2231,12 @@ async def test_provider_connection(request: ProviderTestRequest):
             # Deepgram often has 'deepgram' in name or model names like 'nova'
             if provider_config.get('model', '').startswith('nova') or 'deepgram' in provider_name.lower():
                 # Deepgram
-                api_key = get_env_key('DEEPGRAM_API_KEY')
+                api_key = str(provider_config.get('api_key') or get_env_key('DEEPGRAM_API_KEY') or '').strip()
                 if not api_key:
-                    return {"success": False, "message": "DEEPGRAM_API_KEY not set in .env file"}
+                    return {
+                        "success": False,
+                        "message": "No Deepgram API key configured (checked api_key_file/api_key_env and DEEPGRAM_API_KEY in .env)",
+                    }
                 async with httpx.AsyncClient() as client:
                     response = await client.get(
                         "https://api.deepgram.com/v1/projects",
@@ -2240,7 +2249,7 @@ async def test_provider_connection(request: ProviderTestRequest):
             else:
                 # OpenAI Standard or Generic
                 # Try OpenAI first
-                api_key = get_env_key('OPENAI_API_KEY')
+                api_key = str(provider_config.get('api_key') or get_env_key('OPENAI_API_KEY') or '').strip()
                 if api_key:
                    async with httpx.AsyncClient() as client:
                         try:
@@ -2263,9 +2272,17 @@ async def test_provider_connection(request: ProviderTestRequest):
         # AZURE SPEECH SERVICE (STT / TTS)
         # ============================================================
         if provider_config.get('type') == 'azure' or 'azure' in provider_name:
-            api_key = get_env_key('AZURE_SPEECH_KEY') or os.getenv('AZURE_SPEECH_KEY') or ''
+            api_key = str(
+                provider_config.get('api_key')
+                or get_env_key('AZURE_SPEECH_KEY')
+                or os.getenv('AZURE_SPEECH_KEY')
+                or ''
+            ).strip()
             if not api_key:
-                return {"success": False, "message": "AZURE_SPEECH_KEY not set in .env file"}
+                return {
+                    "success": False,
+                    "message": "No Azure Speech key configured (checked api_key_file/api_key_env and AZURE_SPEECH_KEY in .env)",
+                }
             region = provider_config.get('region', 'eastus')
             # Validate region to prevent SSRF via crafted region values
             import re
