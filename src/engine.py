@@ -1411,6 +1411,14 @@ class Engine:
             override = getattr(context_config, "no_input", None) if context_config else None
             if isinstance(override, dict):
                 merged.update({k: v for k, v in override.items() if v is not None})
+            if merged.get("check_in_message"):
+                merged["check_in_message"] = self._apply_prompt_template_substitution(
+                    str(merged["check_in_message"]), session
+                )
+            if merged.get("final_message"):
+                merged["final_message"] = self._apply_prompt_template_substitution(
+                    str(merged["final_message"]), session
+                )
             # Outbound protection is intentionally per-agent/context opt-in.
             # A global outbound_enabled value must never change active campaigns.
             if bool(getattr(session, "is_outbound", False)):
@@ -8147,6 +8155,27 @@ class Engine:
         for key, value in call_metadata.items():
             if key not in built_in_substitution_keys:
                 substitutions[key] = str(value) if value is not None else ""
+
+        # Lead / Cart context enrichment from outbound custom vars
+        outbound_custom_vars = getattr(session, 'outbound_custom_vars', None) or {}
+        if isinstance(outbound_custom_vars, dict):
+            for key, value in outbound_custom_vars.items():
+                if key not in built_in_substitution_keys and value is not None:
+                    substitutions[str(key).lower()] = str(value)
+                    substitutions[str(key)] = str(value)
+
+        # Smart defaults for cart recovery variables if not explicitly provided
+        if "customer_name" in substitutions and substitutions["customer_name"]:
+            if substitutions.get("caller_name") in ("there", "unknown", ""):
+                substitutions["caller_name"] = substitutions["customer_name"]
+        else:
+            substitutions.setdefault("customer_name", substitutions.get("caller_name") if substitutions.get("caller_name") not in ("there", "unknown", "") else "يا غالي")
+
+        substitutions.setdefault("store_name", "المتجر")
+        substitutions.setdefault("agent_name", "سارة")
+        substitutions.setdefault("coupon_code", "خصم خاص")
+        substitutions.setdefault("cart_items", "منتجات سلتك")
+        substitutions.setdefault("cart_total", "")
 
         # Avoid awkward optional-enrichment output such as "from ," when a
         # lookup succeeds but does not return a mapped value. This deliberately
@@ -18495,7 +18524,13 @@ class Engine:
         """
         # Read channel variables
         channel_vars = {}
-        for var_name in ['AI_PROVIDER', 'AI_AUDIO_PROFILE', 'AI_CONTEXT', 'AI_AGENT']:
+        vars_to_read = [
+            'AI_PROVIDER', 'AI_AUDIO_PROFILE', 'AI_CONTEXT', 'AI_AGENT',
+            'AAVA_CUSTOM_VARS_JSON', 'STORE_NAME', 'COUPON_CODE',
+            'CUSTOMER_NAME', 'AGENT_NAME', 'CART_ITEMS', 'CART_TOTAL',
+            'VOICE_GENDER', 'AAVA_OUTBOUND'
+        ]
+        for var_name in vars_to_read:
             try:
                 resp = await self.ari_client.send_command(
                     "GET",
@@ -18513,28 +18548,41 @@ class Engine:
                             variable=var_name,
                             value=value,
                         )
-                    else:
-                        logger.info(
-                            f"Channel variable {var_name} not set (using defaults)",
-                            channel_id=channel_id,
-                            variable=var_name,
-                        )
             except Exception as exc:
-                # 404 is expected when variable not set - log as info, not error
-                if "404" in str(exc) or "not found" in str(exc).lower():
-                    logger.info(
-                        f"Channel variable {var_name} not set (using defaults)",
-                        channel_id=channel_id,
-                        variable=var_name,
-                    )
-                else:
+                if "404" not in str(exc) and "not found" not in str(exc).lower():
                     logger.debug(
                         f"Failed to read channel variable {var_name}",
                         channel_id=channel_id,
                         variable=var_name,
                         error=str(exc),
-                        exc_info=True,
                     )
+
+        # Hydrate custom vars and call metadata for lead/cart context
+        if channel_vars.get('AAVA_CUSTOM_VARS_JSON'):
+            try:
+                cv_data = json.loads(channel_vars['AAVA_CUSTOM_VARS_JSON'])
+                if isinstance(cv_data, dict):
+                    session.outbound_custom_vars = cv_data
+            except Exception:
+                pass
+
+        metadata = dict(getattr(session, 'call_metadata', {}) or {})
+        if isinstance(getattr(session, 'outbound_custom_vars', None), dict):
+            metadata.update(session.outbound_custom_vars)
+        for var_k in ['STORE_NAME', 'COUPON_CODE', 'CUSTOMER_NAME', 'AGENT_NAME', 'CART_ITEMS', 'CART_TOTAL', 'VOICE_GENDER']:
+            if channel_vars.get(var_k):
+                metadata[var_k.lower()] = channel_vars[var_k]
+                if not getattr(session, 'outbound_custom_vars', None):
+                    session.outbound_custom_vars = {}
+                session.outbound_custom_vars[var_k.lower()] = channel_vars[var_k]
+
+        session.call_metadata = metadata
+
+        if channel_vars.get('AAVA_OUTBOUND') == '1' or getattr(session, 'outbound_custom_vars', None):
+            session.is_outbound = True
+
+        if metadata.get('customer_name') and getattr(session, 'caller_name', None) in (None, "", "there", "unknown"):
+            session.caller_name = metadata['customer_name']
         
         # CRITICAL: Store context_name FIRST, before any early returns
         # This ensures pipeline mode gets the context even if provider lookup fails
